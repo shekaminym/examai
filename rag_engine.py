@@ -1,8 +1,11 @@
+import logging
 import re
 from pathlib import Path
 from time import perf_counter
 
 from PySide6.QtCore import QThread, Signal
+
+from semantic_search import SemanticSearch
 
 
 WORD = re.compile(r"[^\W_]+", re.UNICODE)
@@ -10,14 +13,23 @@ CHUNK_SIZE = 750
 OVERLAP = 120
 SUMMARY_BUDGET = 14000
 INTERACTIVE_SQLITE_BUDGET_SECONDS = 0.05
+RETRIEVAL_BUDGET_SECONDS = 0.100
+MAX_CONTEXT_CHARS = 3200
+MAX_CANDIDATES = 16
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
-STOP_WORDS = set("що таке який яка яке які або для при про цей ця це як чим чому the and what".split())
+STOP_WORDS = set(
+    "що таке який яка яке які або для при про цей ця це як чим чому "
+    "что такое какой какая какие или это как чем почему "
+    "the and what how why does do is are of a an".split()
+)
+log = logging.getLogger("phantom.timing.rag")
 
 
 class RAGEngine:
-    def __init__(self, db_mgr):
+    def __init__(self, db_mgr, *, semantic=None):
         self.db_mgr = db_mgr
+        self.semantic = semantic if semantic is not None else SemanticSearch(db_mgr)
 
     def index_file_sync(self, filepath):
         path = Path(filepath)
@@ -78,21 +90,44 @@ class RAGEngine:
             raise ValueError("Підтримуються TXT, PDF та DOCX.")
 
     def retrieve_relevant_context(self, query, *, limit=4):
-        words = dict.fromkeys(WORD.findall(query[:4000].casefold()))
+        started = perf_counter()
+        query = query[:4000].strip()
+        words = dict.fromkeys(WORD.findall(query.casefold()))
         terms = [word for word in words if len(word) >= 2 and word not in STOP_WORDS][:24]
-        if not terms:
+        if not terms or limit <= 0:
             return ""
+        lexical = self._lexical_rows(terms)
+        lexical_done = perf_counter()
+        semantic, status = self.semantic.search(query, MAX_CANDIDATES, started + RETRIEVAL_BUDGET_SECONDS)
+
+        # Reciprocal rank fusion avoids comparing raw BM25 and cosine scores.
+        scores = {}
+        rows = {}
+        for ranking in (lexical, semantic):
+            for rank, row in enumerate(ranking, start=1):
+                doc_id = row[0]
+                scores[doc_id] = scores.get(doc_id, 0) + 1 / (60 + rank)
+                rows[doc_id] = row
+        ordered = sorted(scores, key=scores.__getitem__, reverse=True)[:limit]
+        context = "\n\n".join(f"[{rows[doc_id][1]}]\n{rows[doc_id][2]}" for doc_id in ordered)
+        context = context[:min(MAX_CONTEXT_CHARS, limit * (CHUNK_SIZE + 50))]
+        log.info("lexical_ms=%.1f semantic_ms=%.1f semantic_status=%s lexical_hits=%d "
+                 "semantic_hits=%d context_chars=%d",
+                 (lexical_done - started) * 1000, (perf_counter() - lexical_done) * 1000,
+                 status, len(lexical), len(semantic), len(context))
+        return context
+
+    def _lexical_rows(self, terms):
         expression = " OR ".join(f'"{term}"*' for term in terms)
         deadline = perf_counter() + INTERACTIVE_SQLITE_BUDGET_SECONDS
         with self.db_mgr.connection(timeout=INTERACTIVE_SQLITE_BUDGET_SECONDS) as conn:
             conn.set_progress_handler(lambda: int(perf_counter() >= deadline), 1000)
-            rows = conn.execute("""
-                SELECT d.source, d.content FROM documents_fts
+            return conn.execute("""
+                SELECT d.id, d.source, d.content FROM documents_fts
                 JOIN documents d ON d.id = documents_fts.rowid
                 WHERE documents_fts MATCH ?
                 ORDER BY bm25(documents_fts), d.id LIMIT ?
-            """, (expression, limit))
-            return "\n\n".join(f"[{source}]\n{content}" for source, content in rows)
+            """, (expression, MAX_CANDIDATES)).fetchall()
 
     def get_summary_context(self, source):
         with self.db_mgr.connection() as conn:
