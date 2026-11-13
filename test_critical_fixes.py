@@ -286,7 +286,7 @@ class ImageAndHistoryTests(unittest.TestCase):
             self.assertIs(ui.tabs.currentWidget(), page)
             if name == "about":
                 labels = [label.text() for label in page.findChildren(QLabel)]
-                self.assertTrue(any("Oleksandr Avramenko" in text for text in labels))
+                self.assertTrue("nega71ve · shibuya" in labels)
             else:
                 self.assertEqual(page.findChildren(QLabel), [])
 

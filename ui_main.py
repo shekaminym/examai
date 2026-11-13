@@ -1045,7 +1045,7 @@ class MainWindow(QMainWindow):
         for heading, text in (
             ("Можливості", "Голосові питання, потокові відповіді FAST / SMART, Compact Dock "
                            "з Live Cards, пошук у конспектах, аналіз виділеної області екрана."),
-            ("Розробники", "Oleksandr Avramenko · Arseniy Pishniak"),
+            ("Розробники", "nega71ve · shibuya"),
             ("Технології", "Python · PySide6 · WASAPI · Google Gemini API · faster-whisper · SQLite · E5 / BM25"),
             ("Версія", VERSION),
             ("GitHub", REPOSITORY),
