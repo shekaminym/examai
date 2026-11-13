@@ -24,6 +24,7 @@ from rag_engine import FileIndexerThread, RAGEngine
 from stt_engine import STTEngine
 from speech_correction import SpeechCorrector, has_non_ukrainian_cyrillic
 from ui_main import MainWindow
+from screen_selection import ScreenSelection, encode_image
 
 
 timing = logging.getLogger("phantom.timing")
@@ -541,6 +542,8 @@ class MainController(QObject):
         self.llm = self.llm_settings = None
         self.pending_question = None
         self._pending_options = {}
+        self._selecting_screen = False
+        self._screen_overlays = []
         self._retired_answers = {}
         self._answer_hint_timer = QTimer(self)
         self._voice_timer = QTimer(self)
@@ -575,6 +578,7 @@ class MainController(QObject):
         self.ui.search_keyword_signal.connect(self.handle_search_keyword)
         self.ui.auto_summary_signal.connect(self.handle_auto_summary)
         self.ui.question_submitted.connect(self.submit_manual_question)
+        self.ui.screen_select_signal.connect(self.start_screen_selection)
         self.ui.clear_all_signal.connect(self.on_clear_all)
         self.ui.close_requested.connect(self.request_close)
         self.hotkey.connect(self.ui.on_toggle_listen)
@@ -685,7 +689,8 @@ class MainController(QObject):
     @Slot(str)
     def on_live_text(self, text):
         if (self.audio and not self.audio.isInterruptionRequested()
-                and not self.closing and not self.ui.txt_question.hasFocus()):
+                and not self.closing and not self._selecting_screen
+                and not self.ui.txt_question.hasFocus()):
             self.ui.txt_question.setPlainText(text)
 
     @Slot()
@@ -713,9 +718,69 @@ class MainController(QObject):
         self.llm.gemini_model = model
         return self.llm
 
+    @Slot()
+    def start_screen_selection(self):
+        if self.closing or self._selecting_screen:
+            return
+        if not self.config.get("gemini_api_key"):
+            self.ui.lbl_status.setText("Додайте ключ Gemini у налаштуваннях.")
+            return
+        self._selecting_screen = True
+        self._voice_timer.stop()
+        self._voice_wait_at = None
+        self.ui.btn_select_screen.setEnabled(False)
+        self.ui.hide()
+        # Let Windows repaint the desktop without this window before grabbing it.
+        QTimer.singleShot(180, self._show_screen_selection)
+
+    def _show_screen_selection(self):
+        if not self._selecting_screen or self.closing:
+            return
+        try:
+            shots = [(screen, screen.grabWindow(0)) for screen in self.app.screens()]
+            if not shots or any(pixmap.isNull() for _, pixmap in shots):
+                raise RuntimeError("screen capture unavailable")
+            # Capture every monitor before drawing any selection window.
+            self._screen_overlays = [ScreenSelection(screen, pixmap) for screen, pixmap in shots]
+            for overlay in self._screen_overlays:
+                overlay.selected.connect(self._on_screen_selected)
+                overlay.cancelled.connect(self._cancel_screen_selection)
+                overlay.show()
+            self._screen_overlays[0].activateWindow()
+        except Exception:
+            self._finish_screen_selection()
+            self.ui.lbl_status.setText("Не вдалося захопити екран. Спробуйте ще раз.")
+
+    def _finish_screen_selection(self):
+        for overlay in self._screen_overlays:
+            overlay.close()
+            overlay.deleteLater()
+        self._screen_overlays = []
+        self._selecting_screen = False
+        self.ui.btn_select_screen.setEnabled(True)
+        if not self.closing:
+            self.ui.show()
+            self.ui.raise_()
+            self.ui.activateWindow()
+
+    @Slot()
+    def _cancel_screen_selection(self):
+        if self._selecting_screen:
+            self._finish_screen_selection()
+            self.ui.lbl_status.setText("Виділення скасовано.")
+
+    @Slot(object)
+    def _on_screen_selected(self, image):
+        if not self._selecting_screen:
+            return
+        self._finish_screen_selection()
+        label = f"Зображення з екрана ({image.width()} × {image.height()})"
+        self.ui.txt_question.setPlainText(label)
+        self.submit_question(label, manual=True, image=image)
+
     @Slot(float)
     def _watch_voice_endpoint(self, speech_ended_at):
-        if (self.closing or not self.audio or self.audio.isInterruptionRequested()
+        if (self.closing or self._selecting_screen or not self.audio or self.audio.isInterruptionRequested()
                 or not self.ui.auto_send.isChecked() or self.ui.txt_question.hasFocus()):
             return
         self._voice_wait_at = speech_ended_at
@@ -734,7 +799,8 @@ class MainController(QObject):
             self._voice_timer.stop()
             self._voice_wait_at = None
         if (not self.audio or self.audio.isInterruptionRequested()
-                or not self.ui.auto_send.isChecked() or self.ui.txt_question.hasFocus()):
+                or self._selecting_screen or not self.ui.auto_send.isChecked()
+                or self.ui.txt_question.hasFocus()):
             return
         if self.config.get('whisper_language', 'uk') == 'uk' and has_non_ukrainian_cyrillic(question):
             self.ui.lbl_status.setText("Нерозбірливо українською. Повторіть або виправте текст.")
@@ -756,7 +822,7 @@ class MainController(QObject):
         self.submit_question(question, manual=True)
 
     def submit_question(self, question, manual, speech_ended_at=None, *, request_id=None,
-                        mode=None, enqueued_at=None):
+                        mode=None, enqueued_at=None, image=None, image_bytes=None, image_mime=None):
         question = question.strip()
         if self.closing or not question:
             return
@@ -764,13 +830,15 @@ class MainController(QObject):
         request_id = request_id or uuid4().hex[:12]
         mode = mode or self.config.get("answer_mode", "fast")
         enqueued_at = submitted if enqueued_at is None else enqueued_at
+        has_image = image is not None or image_bytes is not None
         if self.api is not None:
             if manual or not (self.pending_question and self.pending_question[1]):
                 self.pending_question = ((question, manual, speech_ended_at)
                                          if speech_ended_at is not None else (question, manual))
                 if self._pending_options:
                     timing.info("request_id=%s queue_replaced=1", self._pending_options["request_id"])
-                self._pending_options = dict(request_id=request_id, mode=mode, enqueued_at=enqueued_at)
+                self._pending_options = dict(request_id=request_id, mode=mode, enqueued_at=enqueued_at,
+                                             image=image, image_bytes=image_bytes, image_mime=image_mime)
                 timing.info("request_id=%s answer_queued=1", request_id)
             self.ui.lbl_status.setText("Наступне питання в черзі…")
             return
@@ -797,10 +865,12 @@ class MainController(QObject):
 
         def task():
             rag_started = perf_counter()
-            try:
-                context = self.rag.retrieve_relevant_context(question, limit=4 if mode == 'smart' else 2)
-            except sqlite3.Error:
-                context = ""
+            context = ""
+            if not has_image:
+                try:
+                    context = self.rag.retrieve_relevant_context(question, limit=4 if mode == 'smart' else 2)
+                except sqlite3.Error:
+                    context = ""
             requested = perf_counter()
             last_update = None
             latest_text = ""
@@ -825,7 +895,17 @@ class MainController(QObject):
                 timing.info("request_id=%s llm_start_from_speech_end_ms=%.1f", request_id,
                             (perf_counter() - speech_ended_at) * 1000)
             try:
-                answer = llm.generate_answer(question, context, on_text=on_text, mode=mode, request_id=request_id)
+                if not has_image:
+                    answer = llm.generate_answer(question, context, on_text=on_text,
+                                                 mode=mode, request_id=request_id)
+                else:
+                    try:
+                        prepared_bytes, prepared_mime = (encode_image(image) if image is not None
+                                                         else (image_bytes, image_mime))
+                    except ValueError as exc:
+                        raise GenerationError(str(exc)) from None
+                    answer = llm.generate_image_answer(prepared_bytes, prepared_mime, on_text=on_text,
+                                                       mode=mode, request_id=request_id)
             except GenerationError:
                 if latest_text and not cancelled.is_set():
                     worker.progress.emit(latest_text, perf_counter())
@@ -834,7 +914,7 @@ class MainController(QObject):
             if cancelled.is_set():
                 raise GenerationError("Запит скасовано.")
             worker.answer_ready.emit(answer)
-            if not save_history:
+            if not save_history or has_image:
                 return answer, "Готово"
             try:
                 self.db.save_qa(question, answer, llm.used_model)
@@ -885,7 +965,7 @@ class MainController(QObject):
         self._answer_hint_timer.stop()
         first = not self.answer_started
         self.answer_started = True
-        self.ui.txt_answer.setPlainText(text)
+        self.ui.txt_answer.show_streaming_response(text)
         if first:
             now = perf_counter()
             timing.info("request_id=%s ui_update_ms=%.1f voice first_ui_text_ms=%.1f",
@@ -1036,6 +1116,8 @@ class MainController(QObject):
     @Slot()
     def request_close(self):
         self.closing = True
+        if self._selecting_screen:
+            self._finish_screen_selection()
         self._voice_timer.stop()
         self.pending_question = None
         if self.audio:

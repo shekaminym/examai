@@ -28,7 +28,7 @@ from database import DatabaseManager
 from llm_engine import GenerationError, LLMEngine, PartialGenerationError
 from main import AudioWorker, MainController, TaskWorker
 from rag_engine import RAGEngine
-from response_view import ResponseView
+from response_view import ResponseView, render_formula
 from stt_engine import STTEngine
 
 
@@ -419,6 +419,7 @@ class APITests(unittest.TestCase):
             system = payload["systemInstruction"]["parts"][0]["text"]
             self.assertIn("Формола, радіус-вектор", system)
             self.assertIn("познач своє припущення", system)
+            self.assertIn("застосування називай прикладами", system)
             text = payload["contents"][0]["parts"][0]["text"]
             self.assertEqual(text, "Запитання:\nФормола, радіус-вектор.")
         engine.generate_answer("Що таке матриця?", "")
@@ -574,6 +575,52 @@ class QtTests(unittest.TestCase):
         self.assertIn(r"$\unknowncommand{x}$", view.toPlainText())
         self.assertIn("$x$", view.toPlainText())
         self.assertNotIn("formula:", view.document().toHtml())
+
+    def test_response_renders_equation_with_implies_from_screen_answer(self):
+        app = QApplication.instance() or QApplication([])
+        view = ResponseView()
+        source = ("Підставимо:\n\n"
+                  r"$$t^2 = \frac{2y}{a_y} \implies t^4 = \frac{4y^2}{a_y^2}$$")
+        view.show_response(source)
+        self.assertIn('src="formula:', view.document().toHtml())
+        self.assertNotIn(r"\implies", view.toPlainText())
+        self.assertEqual(view.copyable_text(), source)
+
+    def test_complete_formulas_render_during_stream_without_repeated_math_work(self):
+        app = QApplication.instance() or QApplication([])
+        view = ResponseView()
+        prefix = "Формула кон’юнкції:\n"
+        source = prefix + r"$$L = A \land B$$ (або $L = A \cdot B$)"
+        with patch("response_view.render_formula", wraps=render_formula) as renderer:
+            view.show_streaming_response(prefix + r"$$L = A \land")
+            self.assertNotIn('src="formula:', view.document().toHtml())
+            view.show_streaming_response(source)
+            self.assertEqual(view.document().toHtml().count('src="formula:'), 2)
+            view.show_streaming_response(source + "\nПозначення: A, B.")
+            view.show_response(source + "\nПозначення: A, B.")
+            self.assertEqual(renderer.call_count, 2)
+        self.assertEqual(view.copyable_text(), source + "\nПозначення: A, B.")
+
+    @patch("main.keyboard.add_hotkey", return_value=None)
+    @patch("ui_main.AudioCapturer.get_available_devices", return_value=[])
+    def test_controller_shows_conjunction_formula_before_answer_finishes(self, devices, hotkey):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder:
+            with (patch("main.ConfigManager", return_value=ConfigManager(Path(folder) / "config.json")),
+                  patch("main.DatabaseManager", return_value=DatabaseManager(Path(folder) / "db.sqlite"))):
+                controller = MainController(app)
+            controller._answer_request_id = "formula-test"
+            controller.on_answer_progress(r"Формула: $$L = A \land B$$")
+            self.assertIn('src="formula:', controller.ui.txt_answer.document().toHtml())
+            self.assertEqual(controller.ui.txt_answer.copyable_text(),
+                             r"Формула: $$L = A \land B$$")
+            app.aboutToQuit.disconnect(controller.shutdown)
+
+    def test_common_logic_aliases_render_without_changing_the_source(self):
+        for expression in (r"A \land B", r"A \lor B", r"\lnot A",
+                           r"A \le B", r"A \ge B", r"A \implies B"):
+            with self.subTest(expression=expression):
+                self.assertIsNotNone(render_formula(expression, False))
 
     @patch("main.keyboard.add_hotkey", return_value=None)
     @patch("ui_main.AudioCapturer.get_available_devices", return_value=[])

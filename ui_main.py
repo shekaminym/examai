@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy
 )
 from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QFont, QGuiApplication, QPainter, QColor, QPen
+from PySide6.QtGui import QFont, QPainter, QColor, QPen
 from audio_capturer import AudioCapturer
 from response_view import ResponseView
 from translator import Translator
@@ -75,6 +75,7 @@ class AudioVisualizer(QWidget):
 class MainWindow(QMainWindow):
     close_requested = Signal()
     question_submitted = Signal(str)
+    screen_select_signal = Signal()
     clear_all_signal = Signal()
     start_listening_signal = Signal()
     stop_listening_signal = Signal()
@@ -283,7 +284,7 @@ class MainWindow(QMainWindow):
         
         is_listening = self.btn_toggle_listen.text() in ["СТОП", "STOP"]
         self.btn_toggle_listen.setText(self.tr.get("btn_stop") if is_listening else self.tr.get("btn_listen"))
-        self.btn_copy_ans.setText(self.tr.get("btn_copy"))
+        self.btn_select_screen.setText(self.tr.get("btn_select_screen"))
         self.lbl_q_title.setText(self.tr.get("lbl_question"))
         self.btn_clear_all.setText(self.tr.get("btn_clear_all"))
         self.auto_send.setText(self.tr.get("auto_send"))
@@ -327,13 +328,13 @@ class MainWindow(QMainWindow):
         self.btn_toggle_listen.setObjectName("BtnListenStart")
         self.btn_toggle_listen.clicked.connect(self.on_toggle_listen)
 
-        self.btn_copy_ans = QPushButton("КОПІЮВАТИ")
-        self.btn_copy_ans.setFixedHeight(42)
-        self.btn_copy_ans.setObjectName("BtnSecondary")
-        self.btn_copy_ans.clicked.connect(self.copy_answer)
+        self.btn_select_screen = QPushButton(self.tr.get("btn_select_screen"))
+        self.btn_select_screen.setFixedHeight(42)
+        self.btn_select_screen.setObjectName("BtnPrimary")
+        self.btn_select_screen.clicked.connect(self.screen_select_signal.emit)
 
         ctrl_box.addWidget(self.btn_toggle_listen, stretch=3)
-        ctrl_box.addWidget(self.btn_copy_ans, stretch=2)
+        ctrl_box.addWidget(self.btn_select_screen, stretch=2)
         layout.addLayout(ctrl_box)
 
         q_header = QHBoxLayout()
@@ -474,28 +475,31 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_upload)
 
         tools_layout = QHBoxLayout()
+        tools_layout.setSpacing(8)
         self.input_search = QLineEdit()
         self.input_search.setPlaceholderText("Введи термін для пошуку...")
         self.input_search.setFixedHeight(34)
+        self.input_search.setMinimumWidth(0)
         
         self.btn_search = QPushButton("ЗНАЙТИ")
         self.btn_search.setFixedHeight(34)
+        self.btn_search.setFixedWidth(88)
         self.btn_search.setObjectName("BtnPrimary")
         self.btn_search.clicked.connect(lambda: self.search_keyword_signal.emit(self.input_search.text()))
 
         self.btn_summary = QPushButton("АВТОКОНСПЕКТ")
         self.btn_summary.setFixedHeight(34)
-        self.btn_summary.setObjectName("BtnPrimary")
+        self.btn_summary.setObjectName("BtnSecondary")
         self.btn_summary.clicked.connect(lambda: self.auto_summary_signal.emit(self.list_docs.currentItem().text() if self.list_docs.currentItem() else ""))
 
-        tools_layout.addWidget(self.input_search)
+        tools_layout.addWidget(self.input_search, stretch=1)
         tools_layout.addWidget(self.btn_search)
-        tools_layout.addWidget(self.btn_summary)
         layout.addLayout(tools_layout)
 
         self.list_docs = QListWidget()
         self.list_docs.setMaximumHeight(80)
         layout.addWidget(self.list_docs)
+        layout.addWidget(self.btn_summary)
 
         self.btn_delete_doc = QPushButton("✕ ВИДАЛИТИ ВИБРАНИЙ ФАЙЛ")
         self.btn_delete_doc.setFixedHeight(30)
@@ -757,13 +761,6 @@ class MainWindow(QMainWindow):
         self.btn_toggle_listen.style().polish(self.btn_toggle_listen)
         self.btn_toggle_listen.setEnabled(True)
 
-    def copy_answer(self):
-        text = self.txt_answer.copyable_text()
-        if text:
-            QGuiApplication.clipboard().setText(text)
-            copied_txt = "Скопійовано!" if self.tr.current_lang == "UA" else "Copied!"
-            self.lbl_status.setText(copied_txt)
-
     def clear_both(self):
         self.txt_question.clear()
         self.txt_answer.clear()
@@ -777,7 +774,6 @@ class MainWindow(QMainWindow):
         title = "Виберіть конспект" if self.tr.current_lang == "UA" else "Select note"
         file_path, _ = QFileDialog.getOpenFileName(
             self, title, "", "Documents (*.pdf *.docx *.txt)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if file_path:
             self.file_uploaded_signal.emit(file_path)
