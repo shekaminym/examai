@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QTabWidget, QFileDialog, QProgressBar, QLineEdit,
     QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QApplication, QColorDialog, QSpinBox
 )
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSize, QUrl
+from PySide6.QtCore import QEvent, Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSize, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication, QPainter, QColor, QPen, QPixmap, QIcon, QLinearGradient, QPainterPath
 from audio_capturer import AudioCapturer
 from response_view import ResponseView
@@ -228,6 +228,14 @@ class AudioVisualizer(QWidget):
             painter.drawRoundedRect(4 + index * 8, (19 - height) // 2, 4, height, 2, 2)
 
 
+class StatusLabel(QLabel):
+    text_changed = Signal(str)
+
+    def setText(self, text):
+        super().setText(text)
+        self.text_changed.emit(text)
+
+
 class MainWindow(QMainWindow):
     close_requested = Signal()
     question_submitted = Signal(str)
@@ -291,6 +299,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.central_container)
 
         main_layout = QVBoxLayout(self.central_container)
+        self.main_layout = main_layout
         main_layout.setContentsMargins(18, 16, 18, 16)
         main_layout.setSpacing(15)
 
@@ -302,9 +311,6 @@ class MainWindow(QMainWindow):
         self.lbl_brand_icon.setObjectName("BrandIcon")
         self.lbl_brand_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_brand_icon.setFixedSize(38, 38)
-        self.lbl_title = QLabel("EXAM AI")
-        self.lbl_title.setObjectName("BrandTitle")
-        self.lbl_title.setFont(QFont("Segoe UI", 13, QFont.Bold))
 
         lang_container = QWidget()
         lang_container.setObjectName("LangContainer")
@@ -351,7 +357,6 @@ class MainWindow(QMainWindow):
         self.lbl_ai_provider.setObjectName("HeaderPill")
         self.lbl_ai_provider.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_ai_provider.setFixedHeight(32)
-        self.lbl_title.hide()
         self.answer_mode = MinimalComboBox()
         self.answer_mode.setObjectName("HeaderMode")
         self.answer_mode.addItem("FAST", "fast")
@@ -359,13 +364,30 @@ class MainWindow(QMainWindow):
         self.answer_mode.setCurrentIndex(1 if self.config_mgr.get("answer_mode") == "smart" else 0)
         self.answer_mode.currentIndexChanged.connect(self.save_answer_mode)
 
+        self.expanded_header_widgets = (self.lbl_brand_icon, lang_container, self.btn_ghost,
+                                        self.btn_ghost_lock, btn_min, btn_close)
         top_bar.addWidget(self.lbl_brand_icon)
         top_bar.addSpacing(8)
-        top_bar.addWidget(self.lbl_title)
         top_bar.addSpacing(24)
         top_bar.addWidget(lang_container)
+        self.header_stretch = top_bar.count()
         top_bar.addStretch()
+        self.header_spacer = top_bar.itemAt(self.header_stretch).spacerItem()
         top_bar.addWidget(self.lbl_ai_provider)
+        self.compact_status = QLabel()
+        self.compact_status.setObjectName("StatusLabel")
+        self.compact_status.installEventFilter(self)
+        self.compact_status.setMinimumWidth(96)
+        self.compact_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        top_bar.addWidget(self.compact_status, 1)
+        self.compact_listen = QPushButton()
+        self.compact_listen.clicked.connect(self.on_toggle_listen)
+        self.compact_screen = QPushButton()
+        self.compact_screen.clicked.connect(self.screen_select_signal.emit)
+        self.compact_widgets = (self.compact_status, self.compact_listen, self.compact_screen)
+        for button in (self.compact_listen, self.compact_screen):
+            button.setMinimumHeight(32)
+            top_bar.addWidget(button)
         top_bar.addSpacing(7)
         top_bar.addWidget(self.answer_mode)
         top_bar.addSpacing(8)
@@ -381,7 +403,10 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.btn_island)
         top_bar.addWidget(btn_min)
         top_bar.addWidget(btn_close)
-        main_layout.addLayout(top_bar)
+        self.header_widget = QWidget()
+        self.header_widget.setLayout(top_bar)
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self.header_widget)
 
         # Navigation and pages
         body = QHBoxLayout()
@@ -434,6 +459,8 @@ class MainWindow(QMainWindow):
 
         self.tab_live = QWidget()
         self.init_live_tab()
+        self.btn_toggle_listen.installEventFilter(self)
+        self.btn_select_screen.installEventFilter(self)
         self.tabs.addTab(self.tab_live, "AI")
 
         self.tab_settings = QWidget()
@@ -474,7 +501,8 @@ class MainWindow(QMainWindow):
         status_bar.setContentsMargins(0, 0, 0, 0)
         self.footer = status_bar
         status_bar.setSpacing(8)
-        self.lbl_status = QLabel("Готовий")
+        self.lbl_status = StatusLabel("Готовий")
+        self.lbl_status.text_changed.connect(self.set_compact_status)
         self.lbl_status.setObjectName("StatusLabel")
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setMinimumHeight(32)
@@ -573,6 +601,9 @@ class MainWindow(QMainWindow):
         
         is_listening = self.btn_toggle_listen.text() in ["СТОП", "STOP"]
         self.btn_toggle_listen.setText(self.tr.get("btn_stop") if is_listening else self.tr.get("btn_listen"))
+        self.compact_listen.setText(self.btn_toggle_listen.text())
+        self.compact_screen.setText("Екран" if self.tr.current_lang == "UA" else "Screen")
+        self.compact_screen.setToolTip(self.tr.get("btn_select_screen"))
         self.btn_select_screen.setText(self.tr.get("btn_select_screen"))
         self.btn_toggle_listen.setMinimumWidth(0)
         self.btn_select_screen.setMinimumWidth(
@@ -877,7 +908,7 @@ class MainWindow(QMainWindow):
             lambda: self.save_appearance("window_opacity", opacity.value() / 100)
         )
         layout.addWidget(opacity)
-        for label, key in (("Системне розмиття", "system_blur"),
+        for label, key in (("Системне розмиття (якщо сумісне)", "system_blur"),
                            ("Зменшити рух", "reduce_motion")):
             checkbox = QCheckBox(label)
             checkbox.setChecked(self.config_mgr.get(key))
@@ -926,7 +957,7 @@ class MainWindow(QMainWindow):
         )
         description.setWordWrap(True)
         layout.addWidget(description)
-        layout.addWidget(QLabel("Oleksandr Avramenko · Arseniy Pishnyi"))
+        layout.addWidget(QLabel("Oleksandr Avramenko · Arseniy Pishniak"))
         layout.addWidget(QLabel("Версія " + VERSION))
         details = QLabel(
             "Python · PySide6 · WASAPI · Google Gemini · faster-whisper · SQLite · E5 / BM25"
@@ -1122,6 +1153,7 @@ class MainWindow(QMainWindow):
                 stop:0 #5d70e8, stop:1 #9b62ea);
             border: 1px solid #a1acff; border-radius: 13px;
         }
+        #CompactHeader QPushButton { padding: 0 9px; }
         #LangContainer, #HeaderPill, #HeaderMode {
             background-color: #263a70; border: 1px solid #526b9e;
             border-radius: 15px; color: #e5ebff;
@@ -1267,6 +1299,25 @@ class MainWindow(QMainWindow):
         self.txt_answer.setFont(QFont("Segoe UI", 11))
         self.txt_question.setFont(QFont("Segoe UI", 11))
 
+    def set_compact_status(self, text):
+        self.compact_status.setToolTip(text)
+        self.refresh_compact_status()
+
+    def refresh_compact_status(self):
+        label = self.compact_status
+        label.setText(label.fontMetrics().elidedText(label.toolTip(), Qt.TextElideMode.ElideRight,
+                                                      max(0, label.contentsRect().width() - 12)))
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "compact_status", None) and event.type() == QEvent.Type.Resize:
+            self.refresh_compact_status()
+        if event.type() == QEvent.Type.EnabledChange and hasattr(self, "btn_select_screen"):
+            if watched is self.btn_toggle_listen:
+                self.compact_listen.setEnabled(watched.isEnabled())
+            elif watched is self.btn_select_screen:
+                self.compact_screen.setEnabled(watched.isEnabled())
+        return super().eventFilter(watched, event)
+
     def on_toggle_listen(self):
         if self.btn_toggle_listen.isEnabled():
             is_listening = self.btn_toggle_listen.text() in ["СТОП", "STOP"]
@@ -1282,6 +1333,7 @@ class MainWindow(QMainWindow):
         listen_txt = "СЛУХАТИ" if self.tr.current_lang == "UA" else "LISTEN"
         
         self.btn_toggle_listen.setText(stop_txt if enabled else listen_txt)
+        self.compact_listen.setText(self.btn_toggle_listen.text())
         self.btn_toggle_listen.set_recording(enabled)
         self.audio_visualizer.set_active(enabled)
         self.btn_toggle_listen.setObjectName("BtnListenStop" if enabled else "BtnListenStart")

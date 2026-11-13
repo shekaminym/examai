@@ -273,6 +273,8 @@ class ImageAndHistoryTests(unittest.TestCase):
     def test_polished_controls_and_settings_fit_window(self):
         controller = self._controller()
         ui = controller.ui
+        ui.config_mgr.set("reduce_motion", True)
+        ui.window_mode.expand_toggle()
         ui.show()
         ui.tabs.setCurrentWidget(ui.tab_settings)
         self.app.processEvents()

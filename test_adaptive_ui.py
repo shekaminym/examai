@@ -1,4 +1,6 @@
 import os
+import ctypes
+from types import SimpleNamespace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -8,6 +10,7 @@ from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication
 from unittest.mock import patch
 
+from appearance import set_windows_backdrop
 from config import ConfigManager
 from database import DatabaseManager
 from performance import Hardware, RuntimePolicy, recommend
@@ -72,6 +75,29 @@ def test_config_and_ui_controls(tmp_path: Path):
          patch("ui_main.set_windows_backdrop", return_value=False):
         window = MainWindow(config, DatabaseManager(tmp_path / "notes.db"))
         window.show()
+        assert window.window_mode.collapsed
+        assert window.height() <= 60
+        assert window.compact_listen.isVisible() and window.compact_screen.isVisible()
+        assert not window.tabs.isVisible()
+        start, stop, screen = [], [], []
+        window.start_listening_signal.connect(lambda: start.append(True))
+        window.stop_listening_signal.connect(lambda: stop.append(True))
+        window.screen_select_signal.connect(lambda: screen.append(True))
+        window.compact_listen.click()
+        window.set_listening(True)
+        window.compact_listen.click()
+        window.compact_screen.click()
+        assert start == stop == screen == [True]
+        window.btn_toggle_listen.setEnabled(False)
+        assert not window.compact_listen.isEnabled()
+        window.set_listening(False)
+        window.lbl_status.setText("Ready")
+        app.processEvents()
+        assert window.compact_status.text() == "Ready", (window.geometry(), window.compact_status.geometry(), window.compact_status.toolTip())
+        dock_top = window.y()
+        window.save_appearance("reduce_motion", True)
+        window.window_mode.expand_toggle()
+        assert window.y() == dock_top and window.height() >= 440
         window.tabs.setCurrentWidget(window.tab_settings)
         app.processEvents()
         combo = window.combo_speech_pace
@@ -100,9 +126,25 @@ def test_config_and_ui_controls(tmp_path: Path):
         assert not window.window_mode.docked
         window.move(15, 25)
         window.window_mode.toggle()
-        assert window.window_mode.docked
+        assert window.window_mode.docked and window.window_mode.collapsed
         assert config.get("floating_geometry")[:2] == [15, 25]
         window.window_mode.recover()
         assert config.get("dock_screen") == app.primaryScreen().name()
         window.deleteLater()
         app.processEvents()
+
+
+def test_masked_window_disables_acrylic_and_native_edge():
+    calls = []
+
+    def set_attribute(_hwnd, attribute, pointer, _size):
+        calls.append((attribute, ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint)).contents.value))
+        return 0
+
+    native = SimpleNamespace(dwmapi=SimpleNamespace(DwmSetWindowAttribute=set_attribute))
+    window = SimpleNamespace(winId=lambda: 1, mask=lambda: SimpleNamespace(isEmpty=lambda: False))
+    with patch("appearance.sys.platform", "win32"), \
+         patch("appearance.sys.getwindowsversion", return_value=SimpleNamespace(build=22621), create=True), \
+         patch("appearance.ctypes.windll", native, create=True):
+        assert not set_windows_backdrop(window, True)
+    assert calls == [(33, 1), (34, 0xFFFFFFFE), (38, 1)]

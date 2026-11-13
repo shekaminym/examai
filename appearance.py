@@ -56,13 +56,24 @@ def stylesheet(template, theme, custom):
 
 
 def set_windows_backdrop(window, enabled):
-    """Use the native DWM transient-window backdrop when Windows exposes it."""
+    """Keep DWM decoration outside Qt-masked windows from painting a second edge."""
     if sys.platform != "win32" or sys.getwindowsversion().build < 22621:
         return False
     try:
         dwm = ctypes.windll.dwmapi
+        hwnd = ctypes.c_void_p(int(window.winId()))
+        # A Qt region owns the complete silhouette. The acrylic backdrop is
+        # behind opaque Qt content and can still show around its clipped edge.
+        masked = not window.mask().isEmpty()
+        enabled = enabled and not masked
+        if masked:
+            square_native_frame = ctypes.c_int(1)  # DWMWCP_DONOTROUND
+            dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(square_native_frame),
+                                      ctypes.sizeof(square_native_frame))
+            no_border = ctypes.c_uint(0xFFFFFFFE)  # DWMWA_COLOR_NONE
+            dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(no_border), ctypes.sizeof(no_border))
         backdrop = ctypes.c_int(3 if enabled else 1)
-        return dwm.DwmSetWindowAttribute(ctypes.c_void_p(int(window.winId())), 38,
+        return dwm.DwmSetWindowAttribute(hwnd, 38,
                                          ctypes.byref(backdrop), ctypes.sizeof(backdrop)) == 0 and enabled
     except (AttributeError, OSError):
         return False

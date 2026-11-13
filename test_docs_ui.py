@@ -28,6 +28,8 @@ class DocsUITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             window = self.make_window(folder)
             window.resize(520, 700)
+            window.config_mgr.set("reduce_motion", True)
+            window.window_mode.expand_toggle()
             window.show()
             window.tabs.setCurrentWidget(window.tab_docs)
             self.app.processEvents()

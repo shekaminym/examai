@@ -4,7 +4,7 @@ from performance import timing
 
 from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QRect, Qt
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
-from PySide6.QtWidgets import QSizeGrip
+from PySide6.QtWidgets import QSizeGrip, QSizePolicy
 
 
 def dock_geometry(area, anchor, width, height):
@@ -22,7 +22,7 @@ class WindowMode(QObject):
         self.window = window
         self.config = window.config_mgr
         self.docked = self.config.get("window_mode") != "floating"
-        self.collapsed = False
+        self.collapsed = self.docked
         self.animation = QPropertyAnimation(window, b"geometry", self)
         self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.animation.finished.connect(self.animation_finished)
@@ -55,10 +55,12 @@ class WindowMode(QObject):
             self.config.set("dock_screen", self.window.screen().name())
         self.docked = not self.docked
         self.config.set("window_mode", "docked" if self.docked else "floating")
-        self.collapsed = False
+        self.collapsed = self.docked
         self.apply()
 
     def expand_toggle(self):
+        if not self.docked:
+            return
         self.collapsed = not self.collapsed
         self.apply(animate=True)
 
@@ -68,7 +70,7 @@ class WindowMode(QObject):
             return
         self.config.save_config({"window_mode": "docked", "dock_screen": screen.name()})
         self.docked = True
-        self.collapsed = False
+        self.collapsed = True
         self.window.showNormal()
         self.apply()
         self.window.raise_()
@@ -82,10 +84,25 @@ class WindowMode(QObject):
         w.btn_pin.setText("Відкріпити" if self.docked else "Закріпити")
         w.btn_island.setVisible(self.docked)
         w.btn_island.setText("▾" if self.collapsed else "▴")
-        for widget in (w.sidebar, w.tabs, w.footer_widget):
+        for widget in w.expanded_header_widgets:
             widget.setVisible(not self.collapsed)
+        for widget in w.compact_widgets:
+            widget.setVisible(self.collapsed)
+        header = w.header_widget
+        header.setObjectName("CompactHeader" if self.collapsed else "")
+        for button in (w.btn_pin, w.btn_island, w.compact_listen, w.compact_screen):
+            button.style().unpolish(button)
+            button.style().polish(button)
+        w.header_spacer.changeSize(0, 0, QSizePolicy.Policy.Fixed if self.collapsed
+                                   else QSizePolicy.Policy.Expanding)
+        header.layout().invalidate()
+        header.layout().setStretch(w.header_stretch, 0 if self.collapsed else 1)
+        margins = (12, 7, 12, 7) if self.collapsed else (18, 16, 18, 16)
+        w.main_layout.setContentsMargins(*margins)
+        for widget in (w.sidebar, w.tabs, w.footer_widget):
+            widget.hide()
+        w.setMinimumSize(0, 0)
         self.grip.setVisible(not self.docked)
-        w.setMinimumSize(0, 0) if self.collapsed else w.setMinimumSize(640, 440)
         topmost = self.docked or self.config.get("always_on_top", True)
         if bool(w.windowFlags() & Qt.WindowType.WindowStaysOnTopHint) != topmost:
             visible = w.isVisible()
@@ -95,9 +112,10 @@ class WindowMode(QObject):
 
         screen = self.screen()
         if screen is None:
+            self.finish_layout()
             return
         area = screen.availableGeometry()
-        target = dock_geometry(area, self.config.get("dock_anchor"), 940, 76 if self.collapsed else 620)
+        target = dock_geometry(area, self.config.get("dock_anchor"), 940, 54 if self.collapsed else 620)
         if not self.docked:
             saved = self.config.get("floating_geometry", [])
             if len(saved) == 4 and all(type(value) is int for value in saved):
@@ -117,11 +135,22 @@ class WindowMode(QObject):
             self.animation.start()
         else:
             w.setGeometry(target)
+            self.finish_layout()
+
+    def finish_layout(self):
+        w = self.window
+        if not self.collapsed:
+            w.setMinimumSize(640, 440)
+            for widget in (w.sidebar, w.tabs, w.footer_widget):
+                widget.show()
+        w.main_layout.activate()
+        w.refresh_compact_status()
 
     def frame(self, _geometry):
         self.frames += 1
 
     def animation_finished(self):
+        self.finish_layout()
         duration = perf_counter() - self.started
         self.transition_ms = duration * 1000
         if hasattr(self.window, "performance_monitor") and duration:

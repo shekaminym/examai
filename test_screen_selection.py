@@ -164,6 +164,8 @@ class ScreenSelectionTests(unittest.TestCase):
             with patch("ui_main.AudioCapturer.get_available_devices", return_value=[]):
                 window = MainWindow(config, database)
             window.resize(520, 700)
+            window.config_mgr.set("reduce_motion", True)
+            window.window_mode.expand_toggle()
             window.show()
             self.app.processEvents()
             clicks = []

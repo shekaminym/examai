@@ -27,6 +27,8 @@ class RedesignTests(unittest.TestCase):
         with patch("ui_main.AudioCapturer.get_available_devices", return_value=[]):
             self.window = MainWindow(self.config, DatabaseManager(Path(self.folder.name) / "db.sqlite"))
         self.addCleanup(self.window.deleteLater)
+        self.window.config_mgr.set("reduce_motion", True)
+        self.window.window_mode.expand_toggle()
         self.window.show()
         self.app.processEvents()
 
