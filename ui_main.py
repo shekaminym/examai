@@ -3,19 +3,19 @@ import math
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
     QPushButton, QComboBox, QTabWidget, QFileDialog, QProgressBar, QLineEdit,
-    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QDialog, QStackedWidget, QApplication, QColorDialog, QSpinBox
+    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QDialog, QStackedWidget, QApplication, QColorDialog, QSlider
 )
-from PySide6.QtCore import QEvent, Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSize, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication, QPainter, QColor, QPen, QPixmap, QIcon, QLinearGradient, QPainterPath
+from PySide6.QtCore import QEvent, Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSize
+from PySide6.QtGui import QFont, QGuiApplication, QPainter, QColor, QPen, QPixmap, QIcon, QLinearGradient, QPainterPath
 from audio_capturer import AudioCapturer
 from response_view import ResponseView
-from translator import Translator
+from translator import LABELS, Translator
 from appearance import THEMES, blend, set_windows_backdrop, stylesheet
 from performance import LEGACY, PROFILES, PerformanceMonitor, RuntimePolicy, detect_hardware, recommend
 from window_mode import WindowMode
 from live_cards import LiveCards
 
-from branding import VERSION, REPOSITORY
+from branding import VERSION
 
 from rounded_window import configure_rounded_window
 from ghost_controls import GhostToggle, GhostLockButton
@@ -40,14 +40,15 @@ def navigation_icon(name):
         for y in (8, 12, 16):
             painter.drawLine(7, y, 15, y)
     elif name == "settings":
-        painter.drawEllipse(5, 5, 12, 12)
-        painter.drawEllipse(9, 9, 4, 4)
-        for index in range(8):
-            angle = index * math.pi / 4
-            painter.drawLine(int(11 + 7 * math.cos(angle)),
-                             int(11 + 7 * math.sin(angle)),
-                             int(11 + 10 * math.cos(angle)),
-                             int(11 + 10 * math.sin(angle)))
+        gear = QPainterPath()
+        for step in range(32):
+            angle = step * math.tau / 32
+            radius = 9 if step % 4 in (1, 2) else 6.8
+            x, y = 11 + radius * math.cos(angle), 11 + radius * math.sin(angle)
+            (gear.moveTo if step == 0 else gear.lineTo)(x, y)
+        gear.closeSubpath()
+        painter.drawPath(gear)
+        painter.drawEllipse(8, 8, 6, 6)
     elif name == "about":
         painter.drawEllipse(3, 3, 16, 16)
         painter.drawPoint(11, 7)
@@ -229,11 +230,15 @@ class AudioVisualizer(QWidget):
 
 
 class StatusLabel(QLabel):
+    original_text = ""
+    translate = staticmethod(lambda text: text)
     text_changed = Signal(str)
 
     def setText(self, text):
-        super().setText(text)
-        self.text_changed.emit(text)
+        self.original_text = text
+        shown = self.translate(text)
+        super().setText(shown)
+        self.text_changed.emit(shown)
 
 
 class MainWindow(QMainWindow):
@@ -251,6 +256,7 @@ class MainWindow(QMainWindow):
     history_step_signal = Signal(int)
     history_selected_signal = Signal(int)
     developer_timing_signal = Signal()
+    taskbar_preference_changed = Signal()
 
     def __init__(self, config_mgr, db_mgr):
         super().__init__()
@@ -387,18 +393,19 @@ class MainWindow(QMainWindow):
         self.compact_listen.clicked.connect(self.on_toggle_listen)
         self.compact_screen = QPushButton()
         self.compact_screen.clicked.connect(self.screen_select_signal.emit)
-        self.compact_settings = QPushButton("⚙")
+        self.compact_settings = QPushButton()
+        self.compact_settings.setIcon(navigation_icon("settings"))
         self.compact_settings.setToolTip("Налаштування")
         self.compact_settings.setAccessibleName("Налаштування")
         self.compact_settings.setFixedSize(29, 30)
         self.compact_settings.clicked.connect(self.open_settings)
         self.compact_widgets = (self.compact_status, self.compact_listen, self.compact_screen,
                                 self.compact_settings)
+        top_bar.addWidget(self.answer_mode)
         for button in (self.compact_listen, self.compact_screen):
             button.setMinimumHeight(32)
             top_bar.addWidget(button)
         top_bar.addSpacing(7)
-        top_bar.addWidget(self.answer_mode)
         top_bar.addWidget(self.compact_settings)
         top_bar.addSpacing(8)
         top_bar.addWidget(self.btn_ghost)
@@ -463,6 +470,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(body, 1)
 
         self.fade_effect = QGraphicsOpacityEffect(self.tabs)
+        self.fade_effect.setEnabled(False)
         self.tabs.setGraphicsEffect(self.fade_effect)
         self.fade_anim = QPropertyAnimation(self.fade_effect, b"opacity")
         self.fade_anim.setDuration(220)
@@ -486,7 +494,8 @@ class MainWindow(QMainWindow):
         self.tab_history = QWidget()
         history_layout = QVBoxLayout(self.tab_history)
         history_layout.setContentsMargins(0, 8, 0, 0)
-        history_layout.addWidget(QLabel("ІСТОРІЯ ВІДПОВІДЕЙ"))
+        self.history_title = QLabel("ІСТОРІЯ ВІДПОВІДЕЙ")
+        history_layout.addWidget(self.history_title)
         self.history_list = QListWidget()
         self.history_list.setObjectName("HistoryList")
         self.history_list.itemClicked.connect(
@@ -514,6 +523,7 @@ class MainWindow(QMainWindow):
         self.footer = status_bar
         status_bar.setSpacing(8)
         self.lbl_status = StatusLabel("Готовий")
+        self.lbl_status.translate = self.tr.local
         self.lbl_status.text_changed.connect(self.set_compact_status)
         self.lbl_status.setObjectName("StatusLabel")
         self.lbl_status.setWordWrap(True)
@@ -568,6 +578,9 @@ class MainWindow(QMainWindow):
         self.lbl_toast.setText(message)
         self.lbl_toast.adjustSize()
         
+        if self.height() < 100:
+            self.lbl_status.setText(message)
+            return
         w = min(self.width() - 28, max(200, self.lbl_toast.width() + 30))
         h = 36
         self.lbl_toast.setGeometry((self.width() - w) // 2, self.height() - 75, w, h)
@@ -594,6 +607,13 @@ class MainWindow(QMainWindow):
         self.toast_anim_out.start()
 
     def retranslate_ui(self):
+        self.retranslate_panels()
+        self.live_cards.retranslate()
+        self.compact_settings.setToolTip(self.tr.get("tab_settings"))
+        self.compact_settings.setAccessibleName(self.tr.get("tab_settings"))
+        self.btn_island.setToolTip(self.tr.local("Згорнути або розгорнути панель"))
+        if hasattr(self, "window_mode"):
+            self.window_mode.update_pin_label()
         self.tabs.setTabText(0, self.tr.get("tab_ai"))
         self.tabs.setTabText(1, self.tr.get("tab_docs"))
         self.tabs.setTabText(2, "Історія" if self.tr.current_lang == "UA" else "History")
@@ -628,7 +648,7 @@ class MainWindow(QMainWindow):
             "Поставити питання…" if self.tr.current_lang == "UA" else "Ask a question…"
         )
         self.lbl_a_title.setText(self.tr.get("lbl_answer"))
-        self.lbl_status.setText(self.tr.get("status_ready"))
+        self.lbl_status.setText(self.lbl_status.original_text or "Готовий")
         
         self.lbl_set_gemini.setText(self.tr.get("set_gemini"))
         self.lbl_set_hint.setText(self.tr.get("set_keys_hint"))
@@ -637,7 +657,7 @@ class MainWindow(QMainWindow):
         self.lbl_set_source.setText(self.tr.get("set_audio_source"))
         self.lbl_set_device.setText(self.tr.get("set_audio_device"))
         self.btn_save_cfg.setText("Зберегти" if self.tr.current_lang == "UA" else "Save")
-        self.btn_open_timing.setText("ВІКНО ЗАМІРІВ" if self.tr.current_lang == "UA" else "TIMING WINDOW")
+        self.btn_open_timing.setText(self.tr.local("ВІКНО ЗАМІРІВ"))
         
         self.btn_upload.setText(self.tr.get("btn_add_doc"))
         self.input_search.setPlaceholderText(self.tr.get("search_placeholder"))
@@ -651,14 +671,12 @@ class MainWindow(QMainWindow):
         )
 
     def animate_tab_change(self, index):
-        if not self.motion_ms(160):
-            self.fade_effect.setOpacity(1.0)
-            return
+        # A graphics effect on the entire tab stack can retain the previous
+        # page in its cached backing pixmap during a first paint.
         self.fade_anim.stop()
-        self.fade_anim.setStartValue(0.65)
-        self.fade_anim.setEndValue(1.0)
-        self.fade_effect.setEnabled(True)
-        self.fade_anim.start()
+        self.fade_effect.setEnabled(False)
+        if hasattr(self, "tab_about") and self.tabs.currentWidget() is self.tab_about:
+            self.about_scroll.verticalScrollBar().setValue(0)
 
     def update_nav_selection(self, _index):
         current = self.tabs.currentWidget()
@@ -673,7 +691,7 @@ class MainWindow(QMainWindow):
     def set_history_items(self, history):
         self.history_list.clear()
         for _request_id, question, _answer in history:
-            self.history_list.addItem(question[:120] or "Питання без тексту")
+            self.history_list.addItem(question[:120] or self.tr.local("Питання без тексту"))
 
     def init_live_tab(self):
         layout = QVBoxLayout(self.tab_live)
@@ -718,6 +736,7 @@ class MainWindow(QMainWindow):
         self.auto_send = QCheckBox("Автоматично надсилати з аудіо")
         self.auto_send.setChecked(self.config_mgr.get("auto_send", True))
         self.auto_send.toggled.connect(self.save_auto_send)
+        self.auto_send.toggled.connect(lambda checked: self.settings_auto_send.setChecked(checked))
         question_controls.addWidget(self.auto_send)
         question_controls.addStretch()
         
@@ -770,11 +789,39 @@ class MainWindow(QMainWindow):
             self.input_manual_question.clear()
 
     def open_settings(self):
+        first_show = not self.settings_window.isVisible()
         self.settings_window.show()
+        if first_show:
+            self.position_settings()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
 
+    def position_settings(self):
+        if not self.config_mgr.get("settings_docked"):
+            return
+        screen = self.window_mode.screen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        window = self.settings_window
+        frame = window.frameGeometry()
+        width = min(window.frameGeometry().width() if self._settings_positioned else 630, area.width())
+        self._settings_positioned = True
+        window.resize(max(1, width - (frame.width() - window.width())),
+                      max(1, area.height() - (frame.height() - window.height())))
+        window.move(area.right() - window.frameGeometry().width() + 1, area.top())
+
+    def set_settings_docked(self, docked):
+        try:
+            self.config_mgr.set("settings_docked", docked)
+        except OSError:
+            self.settings_feedback.setText(self.tr.get("save_error"))
+            return
+        if docked:
+            self.position_settings()
+
     def init_settings_window(self):
+        self._settings_positioned = False
         window = self.settings_window = QDialog(self)
         window.setWindowTitle("EXAM AI · Налаштування")
         window.setObjectName("SettingsWindow")
@@ -783,11 +830,22 @@ class MainWindow(QMainWindow):
         window.setSizeGripEnabled(True)
         window.setMinimumSize(410, 300)
         root = QVBoxLayout(window)
+        header = QHBoxLayout()
+        title = QLabel("EXAM AI")
+        title.setObjectName("BrandTitle")
+        header.addWidget(title, 1)
+        self.settings_docked = QCheckBox("Закріпити праворуч")
+        self.settings_docked.setChecked(self.config_mgr.get("settings_docked"))
+        self.settings_docked.toggled.connect(self.set_settings_docked)
+        header.addWidget(self.settings_docked)
+        root.addLayout(header)
         body = QHBoxLayout()
         root.addLayout(body, 1)
         self.settings_navigation = QListWidget()
         self.settings_navigation.setFixedWidth(156)
+        self.settings_navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.settings_navigation.setWordWrap(True)
+        self.settings_navigation.setObjectName("SettingsNavigation")
         body.addWidget(self.settings_navigation)
         pages = QStackedWidget()
         body.addWidget(pages, 1)
@@ -810,6 +868,8 @@ class MainWindow(QMainWindow):
             layout.setSpacing(10)
             groups[key] = layout
             pages.addWidget(scroll)
+        self.settings_categories = [self.settings_navigation.item(i).text()
+                                    for i in range(self.settings_navigation.count())]
         self.settings_navigation.currentRowChanged.connect(pages.setCurrentIndex)
         self.settings_navigation.setCurrentRow(0)
         layout = groups["models"]
@@ -830,11 +890,16 @@ class MainWindow(QMainWindow):
         self.save_history = QCheckBox("Зберігати питання та відповіді локально")
         self.save_history.setChecked(self.config_mgr.get("save_answer_history", False))
         groups["general"].addWidget(self.save_history)
-        auto_send = QCheckBox("Автоматично надсилати голосові питання")
+        auto_send = self.settings_auto_send = QCheckBox("Автоматично надсилати голосові питання")
         auto_send.setChecked(self.auto_send.isChecked())
-        auto_send.toggled.connect(self.auto_send.setChecked)
-        self.auto_send.toggled.connect(auto_send.setChecked)
+
         groups["general"].addWidget(auto_send)
+        self.hide_taskbar = QCheckBox("Приховати з панелі завдань у Ghost Mode")
+        self.hide_taskbar.setChecked(self.config_mgr.get("ghost_hide_taskbar"))
+        groups["general"].addWidget(self.hide_taskbar)
+        help_label = QLabel("Також прибирає вікно з Alt+Tab. Повернення: Ctrl+Shift+F12.")
+        help_label.setWordWrap(True)
+        groups["general"].addWidget(help_label)
 
         self.lbl_stt_plan = QLabel("Мова: Gemini Live → локальний Whisper при збої")
         self.lbl_stt_plan.setWordWrap(True)
@@ -932,9 +997,10 @@ class MainWindow(QMainWindow):
         self.settings_feedback.setWordWrap(True)
         actions.addWidget(self.settings_feedback, 1)
         actions.addWidget(self.btn_save_cfg)
-        back = QPushButton("Повернутися")
+        back = self.settings_back = QPushButton("Повернутися")
         back.setMinimumSize(104, 38)
-        back.clicked.connect(window.close)
+        back.clicked.connect(window.reject)
+        window.rejected.connect(self.reset_settings_form)
         actions.addWidget(back)
         root.addLayout(actions)
         layout = groups["diagnostics"]
@@ -956,6 +1022,29 @@ class MainWindow(QMainWindow):
         for group in groups.values():
             group.addStretch()
 
+    def retranslate_panels(self):
+        for root in (self.settings_window, self.tab_about):
+            widgets = [w for kind in (QLabel, QPushButton, QCheckBox) for w in root.findChildren(kind)]
+            for widget in widgets:
+                source = widget.property("translation_source")
+                if source is None:
+                    source = widget.text()
+                    if self.tr.local(source) == source and source not in LABELS:
+                        continue
+                    widget.setProperty("translation_source", source)
+                widget.setText(self.tr.local(source))
+        for combo in self.settings_window.findChildren(MinimalComboBox):
+            for index in range(combo.count()):
+                name = combo.itemData(index, Qt.ItemDataRole.UserRole + 1)
+                if name is None:
+                    name = combo.itemText(index)
+                    combo.setItemData(index, name, Qt.ItemDataRole.UserRole + 1)
+                combo.setItemText(index, self.tr.local(name))
+        for i, text in enumerate(self.settings_categories):
+            self.settings_navigation.item(i).setText(self.tr.local(text))
+        self.settings_window.setWindowTitle("EXAM AI · " + self.tr.get("tab_settings"))
+        self.history_title.setText(self.tr.local("ІСТОРІЯ ВІДПОВІДЕЙ"))
+
     def init_appearance_controls(self, layout):
         def choice(label, options, key, default):
             layout.addWidget(QLabel(label))
@@ -972,14 +1061,34 @@ class MainWindow(QMainWindow):
         accent = QPushButton("Вибрати колір Custom Accent")
         accent.clicked.connect(self.pick_accent)
         layout.addWidget(accent)
-        layout.addWidget(QLabel("Щільність тонування скла (%)"))
-        opacity = QSpinBox()
-        opacity.setRange(75, 100)
-        opacity.setValue(round(100 * self.config_mgr.get("window_opacity", .98)))
-        opacity.editingFinished.connect(
-            lambda: self.save_appearance("window_opacity", opacity.value() / 100)
+        layout.addWidget(QLabel("Прозорість вікна"))
+        row = QHBoxLayout()
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 8)
+        slider.setValue(self.config_mgr.get("window_transparency"))
+        percent = QLabel(f"{slider.value()}%")
+        reset = QPushButton("Скинути")
+        reset.clicked.connect(lambda: slider.setValue(0))
+        slider.valueChanged.connect(lambda value: percent.setText(f"{value}%"))
+        slider.valueChanged.connect(self.preview_transparency)
+        slider.sliderReleased.connect(
+            lambda: self.save_appearance("window_transparency", slider.value())
         )
-        layout.addWidget(opacity)
+        # Keyboard changes and Reset also persist.
+        slider.valueChanged.connect(lambda value: self.queue_transparency_save(value, slider))
+        row.addWidget(slider, 1)
+        row.addWidget(percent)
+        row.addWidget(reset)
+        layout.addLayout(row)
+        tip = QLabel("0% — непрозоре вікно. Вища прозорість зменшує контраст.")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        layout.addWidget(QLabel("Інтенсивність тонування"))
+        tint = QSlider(Qt.Orientation.Horizontal)
+        tint.setRange(75, 100)
+        tint.setValue(round(100 * self.config_mgr.get("window_opacity", .98)))
+        tint.valueChanged.connect(lambda value: self.save_appearance("window_opacity", value / 100))
+        layout.addWidget(tint)
         for label, key in (("Системне розмиття (якщо сумісне)", "system_blur"),
                            ("Зменшити рух", "reduce_motion")):
             checkbox = QCheckBox(label)
@@ -997,6 +1106,28 @@ class MainWindow(QMainWindow):
         recovery.setWordWrap(True)
         layout.addWidget(recovery)
 
+    def preview_transparency(self, value):
+        self.setWindowOpacity(1.0 if self._privacy_requested else 1 - min(8, max(0, value)) / 100)
+
+    def queue_transparency_save(self, value, slider):
+        if not slider.isSliderDown():
+            self.save_appearance("window_transparency", value)
+
+    def reset_settings_form(self):
+        self.input_gemini_key.setText(self.config_mgr.get("gemini_api_key", ""))
+        self.combo_gemini.setCurrentText(self.config_mgr.get("gemini_model"))
+        self.save_history.setChecked(self.config_mgr.get("save_answer_history"))
+        self.settings_auto_send.setChecked(self.auto_send.isChecked())
+        self.hide_taskbar.setChecked(self.config_mgr.get("ghost_hide_taskbar"))
+        for combo, key in (
+            (self.combo_whisper, "whisper_model_size"), (self.combo_stt_language, "whisper_language"),
+            (self.combo_speech_pace, "speech_pace_mode"),
+        ):
+            combo.setCurrentIndex(max(0, combo.findData(self.config_mgr.get(key))))
+        self.combo_audio_source.setCurrentIndex(0 if self.config_mgr.get("audio_mode") == "loopback" else 1)
+        self.refresh_audio_devices()
+        self.settings_feedback.clear()
+
     def pick_accent(self):
         current = self.config_mgr.get("accent")
         color = QColorDialog.getColor(QColor(current), self.settings_window, "Custom Accent")
@@ -1007,9 +1138,12 @@ class MainWindow(QMainWindow):
         try:
             self.config_mgr.set(key, value)
         except OSError:
-            self.settings_feedback.setText("Помилка збереження / Save error")
+            self.settings_feedback.setText(self.tr.get("save_error"))
             return
         self.settings_feedback.clear()
+        if key == "window_transparency":
+            self.preview_transparency(value)
+            return
         if key in {"dock_anchor", "dock_screen"}:
             if self.window_mode.docked:
                 self.window_mode.apply()
@@ -1022,7 +1156,8 @@ class MainWindow(QMainWindow):
     def init_about_tab(self):
         outer = QVBoxLayout(self.tab_about)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
+        scroll = self.about_scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         outer.addWidget(scroll)
@@ -1046,10 +1181,7 @@ class MainWindow(QMainWindow):
             ("Можливості", "Голосові питання, потокові відповіді FAST / SMART, Compact Dock "
                            "з Live Cards, пошук у конспектах, аналіз виділеної області екрана."),
             ("Розробники", "nega71ve · shibuya"),
-            ("Технології", "Python · PySide6 · WASAPI · Google Gemini API · faster-whisper · SQLite · E5 / BM25"),
             ("Версія", VERSION),
-            ("GitHub", REPOSITORY),
-            ("Ліцензії", "PySide6 Essentials — LGPL-3.0-only / GPL-2.0-only / GPL-3.0-only. faster-whisper — MIT."),
             ("Подяки", "Дякуємо спільнотам відкритого ПЗ за інструменти, на яких працює EXAM AI."),
         ):
             card = QFrame()
@@ -1064,13 +1196,10 @@ class MainWindow(QMainWindow):
             section.addWidget(detail)
             layout.addWidget(card)
         buttons = QHBoxLayout()
-        repository = QPushButton("Відкрити репозиторій")
-        repository.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(REPOSITORY)))
         version = QPushButton("Скопіювати версію")
         version.clicked.connect(lambda: QApplication.clipboard().setText(VERSION))
-        for button in (repository, version):
-            button.setMinimumHeight(36)
-            buttons.addWidget(button)
+        version.setMinimumHeight(36)
+        buttons.addWidget(version)
         layout.addLayout(buttons)
         layout.addStretch()
 
@@ -1080,6 +1209,8 @@ class MainWindow(QMainWindow):
     def on_screen_geometry_changed(self, _area):
         if self.window_mode.docked:
             self.window_mode.apply()
+        if self.settings_window.isVisible():
+            self.position_settings()
 
     def on_screen_removed(self, _screen):
         if self.window_mode.docked:
@@ -1156,7 +1287,8 @@ class MainWindow(QMainWindow):
         is_loopback = self.combo_audio_source.currentIndex() == 0
         default_label = ("Пристрій відтворення Windows за замовчуванням"
                          if is_loopback else "Мікрофон за замовчуванням")
-        self.combo_device_select.addItem(default_label, -1)
+        self.combo_device_select.addItem(self.tr.local(default_label), -1)
+        self.combo_device_select.setItemData(0, default_label, Qt.ItemDataRole.UserRole + 1)
         try:
             devices = AudioCapturer.get_available_devices()
         except Exception:
@@ -1233,9 +1365,8 @@ class MainWindow(QMainWindow):
     def apply_backdrop(self):
         enabled = self.config_mgr.get("system_blur") and self.profile != "eco"
         self.backdrop_active = set_windows_backdrop(self, enabled)
-        # The native window stays opaque for legible text and display affinity.
-        # The glass setting controls the tint of the painted shell.
-        self.setWindowOpacity(1.0)
+        # Keep capture-affinity windows opaque, even if transparency is configured.
+        self.preview_transparency(self.config_mgr.get("window_transparency", 0))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1341,6 +1472,20 @@ class MainWindow(QMainWindow):
             border: 1px solid #5b75a8; border-radius: 13px;
             font-weight: 700;
         }
+        QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox { outline: 0; }
+        QPushButton:focus, QToolButton:focus, QComboBox:focus, QLineEdit:focus, QSpinBox:focus {
+            border: 2px solid #96b7ff;
+        }
+        QPushButton:pressed, QToolButton:pressed { background-color: #203766; }
+        QPushButton:disabled { color: #b9c8eb; border-color: #39558f; }
+        #SettingsWindow QSlider::groove:horizontal { height: 5px; border-radius: 2px; background: #39558f; }
+        #SettingsWindow QSlider::sub-page:horizontal { background: #96b7ff; border-radius: 2px; }
+        #SettingsWindow QSlider::handle:horizontal { width: 14px; margin: -5px 0;
+            border: 1px solid #526fa8; border-radius: 7px; background: #96b7ff; }
+        #SettingsWindow QSlider:focus { outline: 1px solid #96b7ff; }
+        #SettingsNavigation::item { padding: 8px 5px; border-radius: 7px; }
+        #SettingsNavigation::item:selected { background-color: #3c5cb6; color: white; }
+        #SettingsWindow QPushButton { min-height: 30px; padding: 0 7px; }
         QPushButton:hover { background-color: #35518b; border-color: #8eacf0; }
         #BtnListenStart {
             color: white; font-size: 16px; border: none;
@@ -1358,10 +1503,11 @@ class MainWindow(QMainWindow):
                 stop:0 #9b3f7a, stop:1 #6747a1); border: none;
         }
         #BtnPrimary {
-            color: white; font-size: 15px; border-radius: 27px;
+            color: white; font-size: 14px; border-radius: 13px;
             background-color: qlineargradient(x1:0,y1:0,x2:1,y2:0,
                 stop:0 #2e5b9f, stop:1 #425b9b); border: none;
         }
+        #BtnPrimary:focus, #BtnListenStart:focus, #BtnListenStop:focus { border: 2px solid #96b7ff; }
         #BtnSecondary { background-color: #2a447c; }
         #BtnDanger { color: #ffb8c9; background-color: #4c2949; }
         #SmallBtn {
@@ -1402,7 +1548,8 @@ class MainWindow(QMainWindow):
                   "stop:0 " + glass, 1))
         self.settings_window.setStyleSheet(self.styleSheet())
         foreground = "#192337" if theme == "frosted_light" else "#f4f4f4"
-        for view in (self.txt_answer, self.txt_docs_result):
+        self.live_cards.update_icons(QColor(foreground))
+        for view in (self.txt_answer, self.txt_docs_result, self.live_cards.answer_text):
             view.set_formula_color(foreground)
         self.txt_answer.setFont(QFont("Segoe UI", 11))
         self.txt_question.setFont(QFont("Segoe UI", 11))
@@ -1500,19 +1647,30 @@ class MainWindow(QMainWindow):
                 "gemini_api_key": self.input_gemini_key.text().strip(),
                 "gemini_model": self.combo_gemini.currentText(),
                 "save_answer_history": self.save_history.isChecked(),
+                "auto_send": self.settings_auto_send.isChecked(),
+                "ghost_hide_taskbar": self.hide_taskbar.isChecked(),
                 "whisper_model_size": self.combo_whisper.currentData(),
                 "whisper_language": self.combo_stt_language.currentData(),
                 "speech_pace_mode": self.combo_speech_pace.currentData(),
                 "ui_performance_mode": self.combo_ui_performance.currentData(),
                 "audio_mode": selected_mode,
-                "audio_device_index": self.combo_device_select.currentData(),
+                "audio_device_index": self.combo_device_select.currentData() if self.combo_device_select.count() else -1,
                 "language": self.tr.current_lang,
             })
         except OSError:
-            self.settings_feedback.setText("Помилка збереження / Save error")
+            self.settings_feedback.setText(self.tr.get("save_error"))
         else:
             self.apply_performance_mode(self.combo_ui_performance.currentData())
-            self.settings_feedback.setText(self.tr.get("toast_saved"))
+            blocked = self.auto_send.blockSignals(True)
+            self.auto_send.setChecked(self.settings_auto_send.isChecked())
+            self.auto_send.blockSignals(blocked)
+            self.settings_window.accept()
+            self.taskbar_preference_changed.emit()
+            self.settings_feedback.clear()
+            if self.isVisible():
+                self.raise_()
+                self.activateWindow()
+                self.show_toast(self.tr.get("toast_saved"))
 
     @Slot(float)
     def update_audio_indicator(self, rms_val: float):

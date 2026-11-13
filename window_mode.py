@@ -79,6 +79,9 @@ class WindowMode(QObject):
         self.window.raise_()
         self.window.activateWindow()
 
+    def update_pin_label(self):
+        self.window.btn_pin.setText(self.window.tr.local("Відкріпити" if self.docked else "Закріпити"))
+
     def apply(self, animate=False):
         w = self.window
         self.animation.stop()
@@ -89,7 +92,7 @@ class WindowMode(QObject):
         w.main_layout.setSpacing(15)
         if not self.docked:
             self.collapsed = False
-        w.btn_pin.setText("Відкріпити" if self.docked else "Закріпити")
+        self.update_pin_label()
         w.btn_island.setVisible(self.docked)
         w.btn_island.setText("▾" if self.collapsed else "▴")
         for widget in w.expanded_header_widgets:
@@ -123,7 +126,7 @@ class WindowMode(QObject):
             self.finish_layout()
             return
         area = screen.availableGeometry()
-        w.answer_mode.setMaximumWidth(110 if self.collapsed and area.width() < 850 else 16777215)
+        w.answer_mode.setMaximumWidth(82 if self.collapsed and area.width() < 850 else 16777215)
         target = dock_geometry(area, self.config.get("dock_anchor"), 940, 54 if self.collapsed else 620)
         if not self.docked:
             saved = self.config.get("floating_geometry", [])

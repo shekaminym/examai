@@ -8,10 +8,10 @@ from PySide6.QtWidgets import QTextEdit
 
 MARKUP = re.compile(
     r"(?P<code>^[ \t]*(?:\x60{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?:\x60{3,}|~{3,})[ \t]*$"
-    r"|\x60+[^\n]*?\x60+)"
+    r"|\x60+[^\n]*?\x60+|^[ \t]*(?:\x60{3,}|~{3,})[^\n]*\n.*\Z)"
     r"|(?P<display>(?<!\\)\$\$(?P<dollar_block>.+?)\$\$"
     r"|\\\[(?P<bracket_block>.+?)\\\])"
-    r"|(?<![\\$])\$(?![\s$])(?P<dollar_inline>[^\n$]+?)(?<!\s)\$(?!\$|\d)"
+    r"|(?<![\\$])\$(?![\s$]|\d[\d,.]*(?:\s|$))(?P<dollar_inline>[^\n$]+?)(?<!\s)\$(?!\$|\d)"
     r"|\\\((?P<paren_inline>[^\n]+?)\\\)",
     re.MULTILINE | re.DOTALL,
 )
@@ -27,6 +27,20 @@ MATH_ALIASES = {
     "ge": "geq",
 }
 MATH_ALIAS = re.compile(r"\\(" + "|".join(MATH_ALIASES) + r")(?![A-Za-z])")
+
+
+def streaming_prefix(source):
+    """Hold a trailing, incomplete math span while leaving code and money alone."""
+    end = 0
+    for match in MARKUP.finditer(source):
+        end = match.end()
+    tail = source[end:]
+    for match in re.finditer(r"(?<!\\)(?:\$\$|\\[([]|\$(?![\s$\d]))", tail):
+        if "`" not in tail[:match.start()] and (
+            match[0] != "$" or "\n" not in tail[match.end():]
+        ):
+            return source[:end + match.start()]
+    return source
 
 
 class ResponseDocument(QTextDocument):
@@ -58,16 +72,22 @@ class ResponseView(QTextEdit):
         super().setPlainText(text)
 
     def show_streaming_response(self, source):
-        # Plain text is cheap while a formula is still incomplete. Once a
-        # closing delimiter arrives, render it without waiting for the model.
-        has_complete_formula = any(
-            match["display"] is not None or any(match[group] is not None for group in MATH_GROUPS[2:])
-            for match in MARKUP.finditer(source)
-        )
-        if has_complete_formula:
-            self.show_response(source, streaming=True)
+        visible = streaming_prefix(source)
+        if any(match["code"] is None for match in MARKUP.finditer(visible)):
+            self.show_response(visible, streaming=True)
+        elif visible.startswith(self.toPlainText()):
+            old_length = len(self.toPlainText())
+            if len(visible) > old_length:
+                scrollbar = self.verticalScrollBar()
+                follow_end = scrollbar.value() >= scrollbar.maximum() - 12
+                cursor = self.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                cursor.insertText(visible[old_length:])
+                if follow_end:
+                    scrollbar.setValue(scrollbar.maximum())
         else:
-            self.setPlainText(source)
+            self.setPlainText(visible)
+        self.source = source
 
     def show_response(self, source, *, streaming=False):
         self.source = source

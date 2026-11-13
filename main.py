@@ -21,7 +21,7 @@ from database import DatabaseManager
 from llm_engine import GenerationError, LLMEngine
 from privacy_qt import CapturePrivacy
 from rounded_window import configure_rounded_window
-from rag_engine import FileIndexerThread, RAGEngine
+from rag_engine import FILE_REFERENCE, FileIndexerThread, RAGEngine
 from rag_engine import ReferenceLookupError
 from branding import brand_answer
 from question_aggregator import is_noise, QuestionAggregator, is_continuation_fragment, is_unreliable_transcript
@@ -619,6 +619,7 @@ class MainController(QObject):
         self.ui.file_uploaded_signal.connect(self.handle_file_upload)
         self.ui.file_deleted_signal.connect(self.handle_file_deletion)
         self.ui.ghost_toggled_signal.connect(self.apply_privacy)
+        self.ui.taskbar_preference_changed.connect(self.apply_taskbar_preference)
         self.ui.search_keyword_signal.connect(self.handle_search_keyword)
         self.ui.auto_summary_signal.connect(self.handle_auto_summary)
         self.ui.question_submitted.connect(self.submit_manual_question)
@@ -648,13 +649,36 @@ class MainController(QObject):
     def update_meter(self):
         self.ui.update_audio_indicator(self.audio.capturer.current_rms if self.audio else 0.0)
 
+    @Slot()
+    def apply_taskbar_preference(self):
+        if sys.platform != "win32":
+            return
+        # A tool window is opt-in and requires a successfully registered
+        # global recovery shortcut before it can be removed from the switcher.
+        hide = (self.capture_privacy.requested and self.config.get("ghost_hide_taskbar")
+                and self.capture_privacy.verified and self.recover_hotkey_handle is not None)
+        window_type = Qt.WindowType.Tool if hide else Qt.WindowType.Window
+        if self.ui.windowType() == window_type:
+            return
+        visible = self.ui.isVisible()
+        geometry = self.ui.geometry()
+        hints = self.ui.windowFlags() & ~Qt.WindowType.WindowType_Mask
+        self.ui.setWindowFlags(hints | window_type)
+        self.ui.setGeometry(geometry)
+        if visible:
+            self.ui.show()
+
     @Slot(bool)
     def apply_privacy(self, enabled, persist=True):
         if persist and self.ui.btn_ghost.locked:
             self.on_privacy_state(self.capture_privacy.verified, self.capture_privacy.message)
             return
         previous = self.capture_privacy.requested
+        if enabled:
+            self.ui.setWindowOpacity(1.0)
         succeeded = self.capture_privacy.set_enabled(enabled)
+        if succeeded:
+            self.apply_taskbar_preference()
         # Also update after a repeated click whose verified state is unchanged.
         self.on_privacy_state(self.capture_privacy.verified, self.capture_privacy.message)
         if persist and previous != enabled:
@@ -670,6 +694,7 @@ class MainController(QObject):
     def on_privacy_state(self, enabled, error):
         self.privacy_enabled = enabled
         self.ui.set_privacy_button(enabled, self.capture_privacy.requested, error)
+        self.ui.preview_transparency(self.config.get("window_transparency", 0))
         self.ui.btn_ghost.setToolTip(error or (
             "Ghost v2.1. Windows підтвердив прапор виключення. Правий клік: діагностика."
             if enabled else "Ghost v2.1 вимкнено. Правий клік: діагностика."
@@ -1043,7 +1068,7 @@ class MainController(QObject):
         self._speech_ended_at = speech_ended_at
         self._answer_cleared = False
         self.ui.txt_answer.setPlainText("")
-        self.ui.lbl_status.setText("EXAM AI аналізує…")
+        self.ui.lbl_status.setText("EXAM AI ···")
         target_from = submitted if speech_ended_at is None else speech_ended_at
         remaining_to_hint = target_from + ANSWER_TARGET_SECONDS - submitted
         if remaining_to_hint <= 0:
@@ -1055,6 +1080,10 @@ class MainController(QObject):
         save_history = self.config.get("save_answer_history", False)
         selected_document = self.ui.list_docs.currentItem()
         source_hint = selected_document.text() if selected_document else self._last_imported_source
+        # A recently imported file is a useful code hint, but is not a user
+        # selection when multiple files share an explicitly requested name.
+        retrieval_hint = (None if selected_document is None and FILE_REFERENCE.search(question.casefold())
+                          else source_hint)
 
         def task():
             rag_started = perf_counter()
@@ -1063,7 +1092,7 @@ class MainController(QObject):
                 try:
                     context = self.rag.retrieve_relevant_context(
                         question, limit=4 if mode == 'smart' else 2,
-                        source_hint=source_hint, request_id=request_id,
+                        source_hint=retrieval_hint, request_id=request_id,
                     )
                 except ReferenceLookupError as exc:
                     answer = str(exc)
@@ -1247,7 +1276,7 @@ class MainController(QObject):
             timing.info("request_id=%s ui_answer_updated=1 ui_update_ms=%.1f voice first_ui_text_ms=%.1f",
                         self._answer_request_id, (now - emitted) * 1000 if emitted is not None else -1,
                         (now - self._speech_ended_at) * 1000 if self._speech_ended_at is not None else -1)
-        self.ui.lbl_status.setText("EXAM AI відповідає…")
+        self.ui.lbl_status.setText("EXAM AI")
 
     @Slot(object, str)
     def on_answer(self, value, error):

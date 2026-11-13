@@ -45,6 +45,9 @@ DEFAULT_CONFIG = {
     "privacy_mode": False,
     "ghost_controls_locked": False,
     "font_size": 13,
+    "ghost_hide_taskbar": False,
+    "settings_docked": True,
+    "window_transparency": 0,
     "window_opacity": 0.98,
     "gemini_api_key": "",
     "language": "UA"

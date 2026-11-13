@@ -1,4 +1,5 @@
 import sqlite3
+from pathlib import Path
 from contextlib import closing, contextmanager
 
 
@@ -44,6 +45,9 @@ class DatabaseManager:
                     is_code INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            conn.execute("""CREATE TABLE IF NOT EXISTS document_origins (
+                source TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE
+            )""")
             conn.execute("CREATE INDEX IF NOT EXISTS documents_source ON documents(source)")
             conn.execute("CREATE INDEX IF NOT EXISTS document_lines_source ON document_lines(source, line_number)")
             existing = conn.execute(
@@ -93,8 +97,8 @@ class DatabaseManager:
             if line_fts_exists is None:
                 conn.execute("INSERT INTO document_lines_fts(document_lines_fts) VALUES ('rebuild')")
 
-    def get_documents_list(self):
-        with self.connection() as conn:
+    def get_documents_list(self, *, timeout=3):
+        with self.connection(timeout=timeout) as conn:
             rows = conn.execute("SELECT DISTINCT source FROM documents ORDER BY source")
             return [source for source, in rows if source]
 
@@ -103,9 +107,50 @@ class DatabaseManager:
             conn.execute("DELETE FROM documents WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_lines WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_meta WHERE source = ?", (source_name,))
+            conn.execute("DELETE FROM document_origins WHERE source = ?", (source_name,))
 
-    def replace_document(self, source_name, chunks, *, lines=None, is_code=False):
+    def named_document_text(self, source, budget):
+        with self.connection(timeout=0.05) as conn:
+            rows = conn.execute("""
+                SELECT substr(content, 1, ?) FROM document_lines
+                WHERE source = ? ORDER BY line_number LIMIT ?
+            """, (budget + 1, source, budget + 1))
+            pieces = []
+            used = 0
+            for (line,) in rows:
+                pieces.append(line[:max(0, budget - used)])
+                used += len(line) + 1
+                if used > budget:
+                    return "\n".join(pieces), True, True
+            if pieces:
+                return "\n".join(pieces), False, True
+            rows = conn.execute("""
+                SELECT substr(content, 1, ?) FROM documents WHERE source = ? ORDER BY id LIMIT 12
+            """, (budget, source))
+            text = "\n\n".join(content for content, in rows)
+            return text[:budget], len(text) >= budget, False
+
+    def replace_document(self, source_name, chunks, *, lines=None, is_code=False, origin=None):
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if origin is not None:
+                known = conn.execute("SELECT source FROM document_origins WHERE path = ?", (origin,)).fetchone()
+                if known:
+                    source_name = known[0]
+                else:
+                    taken = conn.execute(
+                        "SELECT 1 FROM document_origins WHERE casefold(source) = casefold(?)", (source_name,)
+                    ).fetchone()
+                    if taken:
+                        project = Path(origin).parent.name or "project"
+                        base = f"{project}/{source_name}"
+                        source_name = base
+                        n = 2
+                        while conn.execute("SELECT 1 FROM documents WHERE casefold(source) = casefold(?)",
+                                           (source_name,)).fetchone():
+                            source_name = f"{project} ({n})/{Path(base).name}"
+                            n += 1
+                    conn.execute("INSERT INTO document_origins VALUES (?, ?)", (source_name, origin))
             conn.execute("DELETE FROM documents WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_lines WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_meta WHERE source = ?", (source_name,))

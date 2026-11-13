@@ -49,14 +49,14 @@ def test_cards_stream_history_error_and_switch_modes(tmp_path):
     ui.window_mode.toggle()
     assert not cards.isVisible()
     ui.window_mode.toggle()
-    assert cards.answer.isVisible() and cards.answer_text.toPlainText() == long_answer
+    assert cards.answer.isVisible() and cards.answer_text.copyable_text() == long_answer
 
     cards.begin("two", "Інше питання")
     cards.progress("one", "Застарілий текст")
     cards.ready("one", "Старий запит", "Застаріла відповідь")
     assert cards.answer_text.toPlainText() == ""
     cards.error("two", "Мережева помилка")
-    assert cards.answer_text.toPlainText() == long_answer
+    assert cards.answer_text.copyable_text() == long_answer
     cards.dismiss()
     assert ui.height() == base.height()
     cards.ready("one", "Що таке граф?", long_answer, history=True)

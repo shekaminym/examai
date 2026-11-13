@@ -1,4 +1,6 @@
 import logging
+import os
+from packaging.requirements import InvalidRequirement, Requirement
 import re
 from pathlib import Path
 from time import perf_counter
@@ -33,6 +35,7 @@ LINE_BEFORE_NUMBER = re.compile(
     re.IGNORECASE,
 )
 FUNCTION_NAME = re.compile(r"(?:функц\w*|function)\s+([A-Za-z_][A-Za-z_0-9]*)", re.IGNORECASE)
+FILE_REFERENCE = re.compile(r"(?<![\w.])[\w.-]+\.(?:txt|pdf|docx)(?![\w.-])")
 IDENTIFIER = re.compile(r"(?<![A-Za-z_0-9])([A-Za-z_][A-Za-z_0-9]*[A-Z][A-Za-z_0-9]*)(?![A-Za-z_0-9])")
 
 
@@ -65,6 +68,34 @@ def code_terms(question):
     if any(word in lowered for word in ("цикл", "loop", "масив", "массив", "array")):
         terms.extend(("for", "while", "do"))
     return list(dict.fromkeys(term for term in terms if len(term) >= 2))[:8]
+
+
+def describe_requirements(text, truncated=False):
+    """Classify pip syntax as document data. Never open includes or run pip."""
+    text = re.sub(r"\\[ \t]*\n", " ", text)
+    lines = text.splitlines()
+    if truncated:
+        lines = lines[:-1]
+    result = []
+    for raw in lines:
+        line = re.split(r"(?:^|\s+)#", raw, maxsplit=1)[0].strip()
+        if not line:
+            continue
+        if re.match(r"^(?:-r(?=\s|[^-])|--requirement(?:=|\s))", line):
+            kind = "Вкладений список (не прочитано)"
+        elif re.match(r"^(?:-c(?=\s|[^-])|--constraint(?:=|\s))", line):
+            kind = "Обмеження (не прочитано)"
+        else:
+            try:
+                Requirement(line)
+            except InvalidRequirement:
+                kind = "Інший запис"
+            else:
+                kind = "Залежність"
+        result.append(f"{kind}: {line}")
+    if truncated:
+        result.append("[Список скорочено]")
+    return "\n".join(result)
 
 
 class RAGEngine:
@@ -106,7 +137,8 @@ class RAGEngine:
             start = end - OVERLAP
         chunks = [chunk for chunk in chunks if chunk]
         self.db_mgr.replace_document(path.name, chunks, lines=lines,
-                                     is_code=looks_like_code(text) if lines is not None else False)
+                                     is_code=looks_like_code(text) if lines is not None else False,
+                                     origin=os.path.normcase(str(path.resolve())) if path.name.casefold() == "requirements.txt" else None)
         return len(chunks)
 
     @staticmethod
@@ -139,6 +171,20 @@ class RAGEngine:
             raise ValueError("Підтримуються TXT, PDF та DOCX.")
 
     def _resolve_line_source(self, question, source_hint, sources):
+        names = FILE_REFERENCE.findall(question.casefold())
+        if names:
+            explicit = [entry for entry in sources if Path(entry[0]).name.casefold() in names]
+            if not explicit:
+                raise ReferenceLookupError(f"Рядки файлу «{names[0]}» недоступні. Перевірте імпорт.")
+            qualified = [entry for entry in explicit if "/" in entry[0] and entry[0].casefold() in question.casefold()]
+            if len(qualified) == 1:
+                return qualified[0]
+            if len(explicit) == 1:
+                return explicit[0]
+            selected = next((entry for entry in explicit if entry[0] == source_hint), None)
+            if selected:
+                return selected
+            raise ReferenceLookupError("Є кілька файлів з цією назвою. Виберіть потрібний у «Конспектах».")
         if not sources:
             raise ReferenceLookupError("Немає TXT-файлу з доступними номерами рядків. Імпортуйте його повторно.")
         lowered = question.casefold()
@@ -222,12 +268,48 @@ class RAGEngine:
         preview = "\n".join(f"{number}: {content}" for number, content in rows)
         return f"Файл «{source}» (початок коду):\n{preview[:max_chars]}"
 
+    def _named_context(self, query, source_hint, request_id):
+        # Full names take precedence over BM25/semantic search, including in FAST.
+        matches = FILE_REFERENCE.findall(query.casefold())
+        matches = list(dict.fromkeys(matches))
+        if not matches:
+            return None
+        sources = self.db_mgr.get_documents_list(timeout=INTERACTIVE_SQLITE_BUDGET_SECONDS)
+        contexts = []
+        budget = max(256, (MAX_CONTEXT_CHARS - 200) // len(matches))
+        for name in matches:
+            candidates = [source for source in sources if Path(source).name.casefold() == name]
+            selected = next((source for source in candidates if "/" in source and
+                             source.casefold() in query.casefold()), None)
+            if not candidates:
+                raise ReferenceLookupError(f"Файл «{name}» не імпортовано.")
+            if not selected:
+                if len(candidates) == 1:
+                    selected = candidates[0]
+                elif source_hint in candidates:
+                    selected = source_hint
+                else:
+                    raise ReferenceLookupError(f"Є кілька файлів «{name}». Виберіть потрібний у «Конспектах».")
+            text, truncated, exact = self.db_mgr.named_document_text(selected, budget)
+            log.info("request_id=%s rag_document_resolved=%s exact_lines=%s truncated=%s",
+                     request_id, selected, exact, truncated)
+            if not text.strip():
+                raise ReferenceLookupError(f"Текст файлу «{selected}» недоступний. Імпортуйте його повторно.")
+            if name == "requirements.txt" and exact:
+                text = describe_requirements(text, truncated)
+            qualifier = " (фрагмент)" if truncated or not exact else ""
+            contexts.append(f"Файл «{selected}»{qualifier} — довідкові дані:\n{text[:budget]}")
+        return "\n\n".join(contexts)[:MAX_CONTEXT_CHARS]
+
     def retrieve_relevant_context(self, query, *, limit=4, source_hint=None, request_id="-"):
         started = perf_counter()
         query = query[:4000].strip()
         sources = self.db_mgr.get_line_sources() if requested_line(query) is not None else None
         if sources is not None:
             return self._exact_line_context(query, source_hint, sources, request_id)
+        named_context = self._named_context(query, source_hint, request_id)
+        if named_context is not None:
+            return named_context
         code_context = self._code_context(query, source_hint, request_id)
         words = dict.fromkeys(WORD.findall(query.casefold()))
         terms = [word for word in words if len(word) >= 2 and word not in STOP_WORDS][:24]

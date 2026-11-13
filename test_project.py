@@ -828,7 +828,7 @@ class QtTests(unittest.TestCase):
                         worker.wait(5000)
                         app.processEvents()
             self.assertTrue(any("voice first_ui_text_ms=" in line for line in logs.output))
-            self.assertEqual(early_text, ["EXAM AI відповідає…"])
+            self.assertEqual(early_text, ["EXAM AI"])
             self.assertEqual(controller.ui.txt_answer.toPlainText(), "First answer")
             self.assertEqual(controller.ui.txt_answer.copyable_text(), "**First answer**")
 

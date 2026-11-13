@@ -159,7 +159,7 @@ class CapturePrivacy(QObject):
             self.state_changed.emit(*state)
 
     def eventFilter(self, watched, event):
-        if (self._busy or watched in self._retired
+        if (getattr(self, "_busy", True) or watched in self._retired
                 or not isinstance(watched, QWidget) or not watched.isWindow()):
             return False
         event_type = event.type()
