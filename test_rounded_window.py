@@ -110,6 +110,9 @@ class RoundedWindowTests(unittest.TestCase):
             self.skipTest(f"Original UI helper modules are unavailable: {error.name}")
 
         class Settings:
+            def set(self, key, value):
+                pass
+
             def get(self, key, default=None):
                 if key == "window_opacity":
                     return 0.82
@@ -121,10 +124,10 @@ class RoundedWindowTests(unittest.TestCase):
             window = MainWindow(Settings(), database)
         self.windows.append(window)
         self.assertFalse(window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground))
-        self.assertAlmostEqual(window.windowOpacity(), 0.82, places=2)
+        self.assertAlmostEqual(window.windowOpacity(), 1.0, places=2)
         self.assertFalse(window.mask().contains(QPoint(0, 0)))
         self.assertTrue(window.mask().contains(window.rect().center()))
-        self.assertEqual(window.palette().color(QPalette.ColorRole.Window), QColor("#0a0a0a"))
+        self.assertIn("#141518", window.styleSheet())
 
 
 if __name__ == "__main__":

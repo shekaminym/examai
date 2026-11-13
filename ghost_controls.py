@@ -1,6 +1,6 @@
 """Painted Ghost Mode switch and lock; no emoji/font icon dependencies."""
 from PySide6.QtCore import Property, QEasingCurve, QPointF, QPropertyAnimation, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QAbstractButton
 
 
@@ -18,6 +18,7 @@ class GhostToggle(QAbstractButton):
         self.verified = False
         self.error = ""
         self._position = 0.0
+        self._animation_enabled = True
         self.animation = QPropertyAnimation(self, b"thumbPosition", self)
         self.animation.setDuration(240)
         self.animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
@@ -35,10 +36,19 @@ class GhostToggle(QAbstractButton):
 
     def _animate(self, checked):
         self.animation.stop()
-        self.animation.setStartValue(self._position)
-        self.animation.setEndValue(1.0 if checked else 0.0)
-        self.animation.start()
+        if self._animation_enabled:
+            self.animation.setStartValue(self._position)
+            self.animation.setEndValue(1.0 if checked else 0.0)
+            self.animation.start()
+        else:
+            self._set_position(1.0 if checked else 0.0)
         self.setText("Ghost Mode ON" if checked else "Ghost Mode OFF")
+
+    def set_animation_enabled(self, enabled):
+        self._animation_enabled = bool(enabled)
+        if not enabled:
+            self.animation.stop()
+            self._set_position(1.0 if self.isChecked() else 0.0)
 
     def set_locked(self, locked):
         self.locked = bool(locked)
@@ -64,9 +74,12 @@ class GhostToggle(QAbstractButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         pill = QRectF(0.75, 0.75, self.width() - 1.5, self.height() - 1.5)
-        painter.setBrush(QColor("#1a1a1a" if self.isChecked() else "#131313"))
+        fill = QLinearGradient(0, 0, self.width(), 0)
+        fill.setColorAt(0, QColor("#294b92" if self.isChecked() else "#263e71"))
+        fill.setColorAt(1, QColor("#644fb0" if self.isChecked() else "#273b68"))
+        painter.setBrush(fill)
         painter.setPen(QPen(QColor("#a87552" if self.error else (
-            "#686868" if self.verified else "#353535"
+            "#aaa8f3" if self.verified else "#6b84b6"
         )), 1.0))
         painter.drawRoundedRect(pill, 15, 15)
         clip = QPainterPath()
@@ -78,17 +91,17 @@ class GhostToggle(QAbstractButton):
         painter.setFont(font)
         progress = self._position
         # Two captions cross-fade and slide beneath the opaque moving thumb.
-        painter.setPen(QColor("#a2a2a2"))
+        painter.setPen(QColor("#d2dffc"))
         painter.setOpacity(1.0 - progress)
-        painter.drawText(QRectF(34 - progress * 12, 0, 114, 30), Qt.AlignmentFlag.AlignCenter, "Ghost Mode OFF")
+        painter.drawText(QRectF(34, 0, 112, 30), Qt.AlignmentFlag.AlignCenter, "Ghost Mode OFF")
         painter.setOpacity(progress)
-        painter.setPen(QColor("#f2f2f2" if not self.error else "#edbe92"))
-        painter.drawText(QRectF(6 + (1 - progress) * 12, 0, 114, 30), Qt.AlignmentFlag.AlignCenter,
+        painter.setPen(QColor("#f5f1ff" if not self.error else "#edbe92"))
+        painter.drawText(QRectF(7, 0, 112, 30), Qt.AlignmentFlag.AlignCenter,
                          "Ghost Mode !" if self.error else "Ghost Mode ON")
         painter.setOpacity(1.0)
         center = QPointF(15 + progress * (self.width() - 30), 15)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#f0f0f0" if not self.locked else "#c9c9c9"))
+        painter.setBrush(QColor("#6e95e9" if not self.locked else "#a88ded"))
         painter.drawEllipse(center, 11, 11)
         # A small, recognisable ghost drawn directly as a vector path.
         painter.save()
@@ -102,9 +115,9 @@ class GhostToggle(QAbstractButton):
         ghost.lineTo(6, 13)
         ghost.lineTo(3, 11)
         ghost.closeSubpath()
-        painter.setBrush(QColor("#1a1a1a"))
+        painter.setBrush(QColor("#f5f8ff"))
         painter.drawPath(ghost)
-        painter.setBrush(QColor("#f0f0f0"))
+        painter.setBrush(QColor("#5072b3"))
         painter.drawEllipse(QPointF(4, 6), 1, 1.4)
         painter.drawEllipse(QPointF(8, 6), 1, 1.4)
         painter.restore()
@@ -126,7 +139,10 @@ class GhostLockButton(QAbstractButton):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor("#ededed" if self.isChecked() else "#777777")
+        painter.setPen(QPen(QColor("#8d82d3" if self.isChecked() else "#5f79b4"), 1))
+        painter.setBrush(QColor("#3e4a87" if self.isChecked() else "#293e72"))
+        painter.drawRoundedRect(QRectF(0.75, 0.75, 24.5, 28.5), 9, 9)
+        color = QColor("#e4d7ff" if self.isChecked() else "#c4d9ff")
         painter.setPen(QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         path = QPainterPath()
@@ -143,5 +159,5 @@ class GhostLockButton(QAbstractButton):
         painter.setBrush(color)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(QRectF(6, 13, 14, 11), 3, 3)
-        painter.setBrush(QColor("#171717"))
+        painter.setBrush(QColor("#344a7e"))
         painter.drawEllipse(QPointF(13, 18), 1.2, 1.2)

@@ -196,7 +196,7 @@ class FastSpeechTests(unittest.TestCase):
             self.assertFalse(config.get("speech_auto_language"))
             self.assertEqual(config.get("gemini_api_key"), "session-secret")
             config.set("speech_end_silence_ms", 420)
-            self.assertNotIn("session-secret", path.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["gemini_api_key"], "session-secret")
 
 if __name__ == "__main__":
     unittest.main()

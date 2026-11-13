@@ -1,6 +1,8 @@
 """Interactive screen-region selection; pixels remain in memory."""
 from __future__ import annotations
 
+from math import ceil
+
 from PySide6.QtCore import QBuffer, QIODevice, QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
@@ -31,6 +33,13 @@ def encode_image(image: QImage) -> tuple[bytes, str]:
     """Keep fine text lossless where possible, with a bounded inline payload."""
     if image.isNull():
         raise ValueError("Порожня виділена область.")
+    if image.height() < 64 and image.width() <= 1600:
+        factor = min(4, max(2, ceil(80 / image.height())), max(1, 3200 // image.width()))
+        if factor > 1:
+            # Enlarge tiny UI text without changing its aspect ratio or blurring glyph edges.
+            image = image.scaled(image.width() * factor, image.height() * factor,
+                                 Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.FastTransformation)
 
     def encode(source: QImage, fmt: str, quality: int = -1) -> bytes:
         buffer = QBuffer()

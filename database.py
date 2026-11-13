@@ -28,7 +28,24 @@ class DatabaseManager:
                     model TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_lines (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    line_number INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    UNIQUE(source, line_number)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_meta (
+                    source TEXT PRIMARY KEY,
+                    line_count INTEGER NOT NULL,
+                    is_code INTEGER NOT NULL DEFAULT 0
+                )
+            """)
             conn.execute("CREATE INDEX IF NOT EXISTS documents_source ON documents(source)")
+            conn.execute("CREATE INDEX IF NOT EXISTS document_lines_source ON document_lines(source, line_number)")
             existing = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='documents_fts'"
             ).fetchone()
@@ -52,6 +69,29 @@ class DatabaseManager:
             """)
             if existing is None:
                 conn.execute("INSERT INTO documents_fts(documents_fts) VALUES ('rebuild')")
+            line_fts_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='document_lines_fts'"
+            ).fetchone()
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS document_lines_fts USING fts5(
+                    content, content='document_lines', content_rowid='id', tokenize='unicode61'
+                )
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS document_lines_fts_insert AFTER INSERT ON document_lines
+                BEGIN
+                    INSERT INTO document_lines_fts(rowid, content) VALUES (new.id, new.content);
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS document_lines_fts_delete AFTER DELETE ON document_lines
+                BEGIN
+                    INSERT INTO document_lines_fts(document_lines_fts, rowid, content)
+                    VALUES ('delete', old.id, old.content);
+                END
+            """)
+            if line_fts_exists is None:
+                conn.execute("INSERT INTO document_lines_fts(document_lines_fts) VALUES ('rebuild')")
 
     def get_documents_list(self):
         with self.connection() as conn:
@@ -61,14 +101,51 @@ class DatabaseManager:
     def delete_document_source(self, source_name):
         with self.connection() as conn:
             conn.execute("DELETE FROM documents WHERE source = ?", (source_name,))
+            conn.execute("DELETE FROM document_lines WHERE source = ?", (source_name,))
+            conn.execute("DELETE FROM document_meta WHERE source = ?", (source_name,))
 
-    def replace_document(self, source_name, chunks):
+    def replace_document(self, source_name, chunks, *, lines=None, is_code=False):
         with self.connection() as conn:
             conn.execute("DELETE FROM documents WHERE source = ?", (source_name,))
+            conn.execute("DELETE FROM document_lines WHERE source = ?", (source_name,))
+            conn.execute("DELETE FROM document_meta WHERE source = ?", (source_name,))
             conn.executemany(
                 "INSERT INTO documents (content, source) VALUES (?, ?)",
                 ((chunk, source_name) for chunk in chunks),
             )
+            if lines is not None:
+                conn.executemany(
+                    "INSERT INTO document_lines (source, line_number, content) VALUES (?, ?, ?)",
+                    ((source_name, number, content) for number, content in enumerate(lines, 1)),
+                )
+                conn.execute(
+                    "INSERT INTO document_meta (source, line_count, is_code) VALUES (?, ?, ?)",
+                    (source_name, len(lines), int(is_code)),
+                )
+
+    def get_line_sources(self):
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT source, line_count, is_code FROM document_meta ORDER BY source"
+            ).fetchall()
+
+    def get_line_window(self, source, number, radius=5):
+        with self.connection() as conn:
+            rows = conn.execute("""
+                SELECT line_number, content FROM document_lines
+                WHERE source = ? AND line_number BETWEEN ? AND ?
+                ORDER BY line_number
+            """, (source, max(1, number - radius), number + radius)).fetchall()
+        return rows
+
+    def search_code_lines(self, expression, *, source=None, limit=4):
+        with self.connection(timeout=0.05) as conn:
+            return conn.execute("""
+                SELECT d.source, d.line_number, d.content FROM document_lines_fts AS f
+                JOIN document_lines AS d ON d.id = f.rowid
+                WHERE document_lines_fts MATCH ? AND (? IS NULL OR d.source = ?)
+                ORDER BY bm25(document_lines_fts), d.id LIMIT ?
+            """, (expression, source, source, limit)).fetchall()
 
     def save_qa(self, question, answer, model):
         with self.connection() as conn:

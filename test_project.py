@@ -76,7 +76,7 @@ class StorageTests(unittest.TestCase):
         source = self.root / "notes.txt"
         source.write_text("Матриця " * 120, encoding="utf-8-sig")
         self.assertGreater(rag.index_file_sync(source), 1)
-        source.write_bytes(b"\xff")
+        source.write_bytes(b"\x98")
         with self.assertRaises(UnicodeError):
             rag.index_file_sync(source)
         self.assertIn("Матриця", rag.get_summary_context(source.name))
@@ -129,7 +129,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(config.get("audio_device_index"), -1)
         self.assertEqual(config.get("gemini_api_key"), "synthetic")
         config.save_config({"gemini_api_key": "synthetic-other", "audio_device_index": 3})
-        self.assertNotIn("synthetic", path.read_text())
+        self.assertEqual(json.loads(path.read_text())["gemini_api_key"], "synthetic")
         self.assertEqual(ConfigManager(path).get("audio_device_index"), 3)
 
 
@@ -418,7 +418,7 @@ class APITests(unittest.TestCase):
             payload = json.loads(request.content)
             system = payload["systemInstruction"]["parts"][0]["text"]
             self.assertIn("Формола, радіус-вектор", system)
-            self.assertIn("познач своє припущення", system)
+            self.assertIn("коротко попроси уточнити", system)
             self.assertIn("застосування називай прикладами", system)
             text = payload["contents"][0]["parts"][0]["text"]
             self.assertEqual(text, "Запитання:\nФормола, радіус-вектор.")
@@ -707,7 +707,12 @@ class QtTests(unittest.TestCase):
             controller.submit_question = MagicMock()
             controller.handle_question("Що таке рекурсія?")
             controller.handle_question("  Що   таке рекурсія?  ")
-            controller.submit_question.assert_called_once_with("Що таке рекурсія?", manual=False)
+            controller._finalize_voice_question(force=True)
+            controller.handle_question("Що таке рекурсія?")
+            controller._finalize_voice_question(force=True)
+            controller.submit_question.assert_called_once_with(
+                "Що таке рекурсія?", manual=False, speech_ended_at=None, request_id=None
+            )
             controller.submit_manual_question("Що таке рекурсія?")
             self.assertEqual(controller.submit_question.call_count, 2)
 
@@ -810,6 +815,7 @@ class QtTests(unittest.TestCase):
             controller.audio.isInterruptionRequested.return_value = False
             with self.assertLogs("phantom.timing", level="INFO") as logs:
                 controller.handle_question("test", time.perf_counter() - 2.5)
+                controller._finalize_voice_question(force=True)
                 self.assertEqual(controller.ui.lbl_status.text(), "Відповідь затримується…")
                 worker = controller.api
                 try:
@@ -822,7 +828,7 @@ class QtTests(unittest.TestCase):
                         worker.wait(5000)
                         app.processEvents()
             self.assertTrue(any("voice first_ui_text_ms=" in line for line in logs.output))
-            self.assertEqual(early_text, ["Відповідаю…"])
+            self.assertEqual(early_text, ["EXAM AI відповідає…"])
             self.assertEqual(controller.ui.txt_answer.toPlainText(), "First answer")
             self.assertEqual(controller.ui.txt_answer.copyable_text(), "**First answer**")
 

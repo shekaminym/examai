@@ -16,11 +16,15 @@ from PySide6.QtGui import QPainter, QColor, QPen
 from audio_capturer import AudioCapturer, audio_log
 from audio_vad import NeuralVAD, SpeechSegmenter, Utterance
 from config import ConfigManager
+from developer_timing import DeveloperTimingWindow
 from database import DatabaseManager
 from llm_engine import GenerationError, LLMEngine
 from privacy_qt import CapturePrivacy
 from rounded_window import configure_rounded_window
 from rag_engine import FileIndexerThread, RAGEngine
+from rag_engine import ReferenceLookupError
+from question_aggregator import QuestionAggregator, is_continuation_fragment, is_unreliable_transcript
+from image_intent import EXPLAIN_CODE, image_intent, select_screen_instruction
 from stt_engine import STTEngine
 from speech_correction import SpeechCorrector, has_non_ukrainian_cyrillic
 from ui_main import MainWindow
@@ -32,6 +36,7 @@ _VAD_NOT_PREPARED = object()
 CLOUD_FINAL_TIMEOUT_SECONDS = 0.65
 ANSWER_TARGET_SECONDS = 2.0
 MAX_RETIRED_ANSWERS = 2
+MAX_SESSION_ANSWERS = 30
 
 
 class ModernSpinner(QWidget):
@@ -51,7 +56,7 @@ class ModernSpinner(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         
-        pen = QPen(QColor(255, 255, 255, 200))
+        pen = QPen(QColor(139, 177, 255, 225))
         pen.setWidth(4)
         pen.setCapStyle(Qt.RoundCap)
         painter.setPen(pen)
@@ -67,19 +72,20 @@ class SplashScreen(QWidget):
         self.main_window = main_window 
         
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SplashScreen)
-        self.setStyleSheet("background-color: #0f0f0f;")
-        self.setFixedSize(450, 300)
-        configure_rounded_window(self, radius=20, opacity=0.95, color="#0f0f0f")
+        self.setStyleSheet("background-color: #101f47;")
+        self.setFixedSize(420, 230)
+        configure_rounded_window(self, radius=22, opacity=0.90, color="#101f47")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.bg_frame = QWidget(self)
+        self.bg_frame.setObjectName("SplashCard")
         self.bg_frame.setStyleSheet("""
-            QWidget {
-                background-color: rgba(15, 15, 15, 230);
-                border-radius: 20px;
-                border: 1px solid rgba(255, 255, 255, 20);
+            QWidget#SplashCard {
+                background-color: rgba(27, 53, 111, 230);
+                border-radius: 22px;
+                border: 1px solid rgba(164, 194, 255, 70);
             }
         """)
         
@@ -89,20 +95,19 @@ class SplashScreen(QWidget):
         self.title_label = QLabel("EXAM AI", self.bg_frame)
         self.title_label.setStyleSheet("""
             color: white; 
-            font-family: 'Cairo Black'; 
-            font-size: 42px; 
+            font-family: 'Segoe UI';
+            font-size: 32px;
             font-weight: bold; 
             background: transparent;
             border: none;
         """)
         self.title_label.setAlignment(Qt.AlignCenter)
 
-        self.slogan_label = QLabel("LET'S CHEAT", self.bg_frame)
+        self.slogan_label = QLabel("Слухаю • розумію • відповідаю", self.bg_frame)
         self.slogan_label.setStyleSheet("""
-            color: rgba(255, 255, 255, 120); 
-            font-family: 'Cairo Black'; 
-            font-size: 14px; 
-            letter-spacing: 10px; 
+            color: #b8caf5;
+            font-family: 'Segoe UI';
+            font-size: 13px;
             background: transparent;
             border: none;
         """)
@@ -113,7 +118,7 @@ class SplashScreen(QWidget):
         bg_layout.addStretch()
         bg_layout.addWidget(self.title_label)
         bg_layout.addWidget(self.slogan_label)
-        bg_layout.addSpacing(40)
+        bg_layout.addSpacing(20)
         bg_layout.addWidget(self.spinner, alignment=Qt.AlignCenter)
         bg_layout.addStretch()
 
@@ -125,13 +130,13 @@ class SplashScreen(QWidget):
         self.fade_effect.setOpacity(0.0)
 
         self.fade_in_anim = QPropertyAnimation(self.fade_effect, b"opacity")
-        self.fade_in_anim.setDuration(1200) 
+        self.fade_in_anim.setDuration(240)
         self.fade_in_anim.setStartValue(0.0)
         self.fade_in_anim.setEndValue(1.0)
         self.fade_in_anim.setEasingCurve(QEasingCurve.InOutQuad)
 
         self.fade_out_anim = QPropertyAnimation(self.fade_effect, b"opacity")
-        self.fade_out_anim.setDuration(1000)
+        self.fade_out_anim.setDuration(260)
         self.fade_out_anim.setStartValue(1.0)
         self.fade_out_anim.setEndValue(0.0)
         self.fade_out_anim.setEasingCurve(QEasingCurve.InOutQuad)
@@ -141,10 +146,11 @@ class SplashScreen(QWidget):
     def start_splash(self):
         self.show()
         self.fade_in_anim.start()
-        QTimer.singleShot(3500, self.fade_out_anim.start)
+        QTimer.singleShot(850, self.fade_out_anim.start)
 
     def finish_splash(self):
         # Stop tracking before close destroys the splash's native HWND.
+        self.spinner.timer.stop()
         self.finished.emit()
         self.close()
         self.main_window.show()
@@ -201,11 +207,12 @@ class AudioWorker(QThread):
     question_finished = Signal(str)
     timed_question = Signal(str, object, str)
     voice_endpoint = Signal(float)
+    speech_started = Signal(float)
     status = Signal(str)
 
     def __init__(self, stt, language, device_index, loopback, *,
                  previews=False, neural_vad=False, end_silence_seconds=0.42,
-                 gemini_key=""):
+                 gemini_key="", pre_roll_seconds=0.24):
         super().__init__()
         self.stt = stt
         self.language = language
@@ -214,6 +221,7 @@ class AudioWorker(QThread):
         self.previews = previews
         self.neural_vad = neural_vad
         self.end_silence_seconds = end_silence_seconds
+        self.pre_roll_seconds = pre_roll_seconds
         self.gemini_key = gemini_key
         self.corrector = SpeechCorrector(Path(__file__).with_name("speech_glossary.json"))
         self.capturer = AudioCapturer()
@@ -224,6 +232,7 @@ class AudioWorker(QThread):
         self._latest_delivered_id = 0
         self._pending_cloud_finals: dict[int, Utterance] = {}
         self._hedged_cloud_ids: set[int] = set()
+        self._auto_language_ids: set[int] = set()
         self._pending_lock = threading.Lock()
         self.cloud = None
         self._cloud_label = "Gemini Live"
@@ -267,7 +276,7 @@ class AudioWorker(QThread):
                 audio_log.exception("capture stream activation failed")
                 self.status.emit(f"Не вдалося запустити аудіопотік: {exc}")
                 return
-            self.status.emit("Слухаю…")
+            self.status.emit("EXAM AI слухає…")
             self.process_audio(vad=vad)
         except Exception:
             self.status.emit("Помилка аудіозахоплення або обробки звуку.")
@@ -298,18 +307,25 @@ class AudioWorker(QThread):
                 return
             if utterance.is_final:
                 with self._pending_lock:
+                    auto_language = utterance.utterance_id in self._auto_language_ids
+                    self._auto_language_ids.discard(utterance.utterance_id)
                     if utterance.utterance_id <= self._latest_delivered_id:
                         continue
+            else:
+                auto_language = False
             started = perf_counter()
             try:
                 text, _ = self.stt.transcribe_chunk(
                     utterance.audio,
-                    language=self.language,
+                    language="auto" if auto_language else self.language,
                     sample_rate=utterance.sample_rate,
                     preview=not utterance.is_final,
                 )
             except Exception:
                 self.status.emit("Помилка розпізнавання окремої фрази.")
+                if utterance.is_final:
+                    self.timed_question.emit("", utterance.speech_ended_at,
+                                             self._trace_id(utterance.utterance_id))
                 continue
             timing.info("request_id=%s stt final=%s queue_ms=%.1f decode_ms=%.1f audio_ms=%.1f",
                         self._trace_id(utterance.utterance_id), utterance.is_final, (started - utterance.queued_at) * 1000,
@@ -324,6 +340,7 @@ class AudioWorker(QThread):
             if utterance.is_final:
                 self._publish_final(utterance.utterance_id, text, utterance.speech_ended_at)
             else:
+                timing.info("request_id=%s stt_partial=1", self._trace_id(utterance.utterance_id))
                 self.text_updated.emit(text)
 
     def _publish_final(self, utterance_id: int, text: str, speech_ended_at=None) -> None:
@@ -334,7 +351,7 @@ class AudioWorker(QThread):
             self.text_updated.emit(text)
             self.question_finished.emit(text)
             trace_id = self._trace_id(utterance_id)
-            timing.info('request_id=%s stt_final_from_speech_end_ms=%.1f', trace_id,
+            timing.info('request_id=%s stt_final=1 stt_final_from_speech_end_ms=%.1f', trace_id,
                         (perf_counter() - speech_ended_at) * 1000 if speech_ended_at is not None else -1)
             self.timed_question.emit(text, speech_ended_at, trace_id)
 
@@ -345,6 +362,7 @@ class AudioWorker(QThread):
                 utterance_id, started = speech
                 timing.info("request_id=%s stt_cloud_partial_ms=%.1f",
                             self._trace_id(utterance_id), (perf_counter() - started) * 1000)
+            timing.info("request_id=%s stt_partial=1", self._trace_id(speech[0]) if speech else "-")
             self.text_updated.emit(self.corrector.correct(text))
 
     def _cloud_final(self, utterance_id: int, text: str) -> None:
@@ -357,7 +375,9 @@ class AudioWorker(QThread):
         if not text.strip() or has_non_ukrainian_cyrillic(text):
             if not hedged and not self.isInterruptionRequested():
                 if text.strip():
-                    self.status.emit("Gemini почув неукраїнський фрагмент. Перевіряю Whisper.")
+                    with self._pending_lock:
+                        self._auto_language_ids.add(utterance_id)
+                    self.status.emit("Мішана або російська мова. Перевіряю локальним Whisper.")
                 self._submit(utterance)
             return
         timing.info("request_id=%s stt_cloud_final_ms=%.1f", self._trace_id(utterance_id),
@@ -373,7 +393,7 @@ class AudioWorker(QThread):
     def _dispatch_utterance(self, utterance: Utterance, *, cloud_streamed=True) -> None:
         if utterance.is_final and utterance.speech_ended_at is not None:
             self.voice_endpoint.emit(utterance.speech_ended_at)
-            timing.info("request_id=%s vad_endpoint_ms=%.1f", self._trace_id(utterance.utterance_id),
+            timing.info("request_id=%s pause=1 vad_endpoint_ms=%.1f", self._trace_id(utterance.utterance_id),
                         (utterance.queued_at - utterance.speech_ended_at) * 1000)
         if self.cloud is not None and self.cloud.ready and cloud_streamed and utterance.is_final:
             with self._pending_lock:
@@ -414,6 +434,7 @@ class AudioWorker(QThread):
             vad = self._create_vad()
         segmenter = SpeechSegmenter(
             previews=self.previews, vad=vad, end_silence_seconds=self.end_silence_seconds,
+            pre_roll_seconds=self.pre_roll_seconds,
         )
         capture_generation = None
         streaming = False
@@ -467,9 +488,10 @@ class AudioWorker(QThread):
                 utterances = segmenter.push(audio, self.capturer.sample_rate, rms,
                                             self.capturer.last_block_at)
                 if segmenter.started_audio is not None:
+                    self.speech_started.emit(vad_started)
                     self._cloud_speech = (segmenter.utterance_id, vad_started)
                     device_ms = self.capturer.last_device_latency_ms
-                    timing.info("request_id=%s audio_device_ms=%.1f audio_queue_ms=%.1f vad_first_block_ms=%.1f",
+                    timing.info("request_id=%s speech_start=1 audio_device_ms=%.1f audio_queue_ms=%.1f vad_first_block_ms=%.1f",
                                 self._trace_id(segmenter.utterance_id),
                                 device_ms if device_ms is not None else -1,
                                 (vad_started - self.capturer.last_block_at) * 1000
@@ -529,6 +551,7 @@ class TaskWorker(QThread):
 
 class MainController(QObject):
     hotkey = Signal()
+    recover_window_hotkey = Signal()
 
     def __init__(self, app):
         super().__init__()
@@ -544,15 +567,29 @@ class MainController(QObject):
         self._pending_options = {}
         self._selecting_screen = False
         self._screen_overlays = []
+        self._pending_screen_instruction = ""
+        self._last_manual_instruction = ""
         self._retired_answers = {}
+        self._answer_history = []
+        self._history_index = -1
+        self._current_question = ""
+        self._current_answer_text = ""
         self._answer_hint_timer = QTimer(self)
         self._voice_timer = QTimer(self)
+        self._question_timer = QTimer(self)
+        self._question_aggregator = QuestionAggregator(mode=self.config.get("speech_pace_mode", "auto"))
+        self._recent_voice_item = None
+        self.timing_window = None
+        self._dev_speech_started_at = None
+        self._dev_request_started_at = None
+        self._last_imported_source = None
         self._voice_wait_at = None
-        for timer in (self._answer_hint_timer, self._voice_timer):
+        for timer in (self._answer_hint_timer, self._voice_timer, self._question_timer):
             timer.setSingleShot(True)
             timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._answer_hint_timer.timeout.connect(self._show_answer_delay)
         self._voice_timer.timeout.connect(self._expire_voice)
+        self._question_timer.timeout.connect(self._finalize_voice_question)
         self.answer_started = False
         self._speech_ended_at = None
         self._answer_cleared = False
@@ -560,6 +597,7 @@ class MainController(QObject):
         self._last_auto_at = 0.0
         self.closing = False
         self.hotkey_handle = None
+        self.recover_hotkey_handle = None
         self.privacy_enabled = False
         self.capture_privacy = CapturePrivacy(app, self)
         self.capture_privacy.register(self.ui)
@@ -580,13 +618,26 @@ class MainController(QObject):
         self.ui.question_submitted.connect(self.submit_manual_question)
         self.ui.screen_select_signal.connect(self.start_screen_selection)
         self.ui.clear_all_signal.connect(self.on_clear_all)
+        self.ui.history_step_signal.connect(self.on_history_step)
+        self.ui.history_selected_signal.connect(self.on_history_select)
+        self.ui.developer_timing_signal.connect(self.open_timing_window)
         self.ui.close_requested.connect(self.request_close)
         self.hotkey.connect(self.ui.on_toggle_listen)
+        self.recover_window_hotkey.connect(self.recover_window, Qt.ConnectionType.QueuedConnection)
         try:
             self.hotkey_handle = keyboard.add_hotkey("ctrl+alt+r", self.hotkey.emit)
         except Exception:
             self.ui.lbl_status.setText("Глобальна комбінація клавіш недоступна.")
+        try:
+            self.recover_hotkey_handle = keyboard.add_hotkey("ctrl+shift+f12", self.recover_window_hotkey.emit)
+        except Exception:
+            self.ui.window_mode.enable_local_recovery()
         self.app.aboutToQuit.connect(self.shutdown)
+
+    @Slot()
+    def recover_window(self):
+        if not self.closing:
+            self.ui.window_mode.recover()
 
     def update_meter(self):
         self.ui.update_audio_indicator(self.audio.capturer.current_rms if self.audio else 0.0)
@@ -637,9 +688,25 @@ class MainController(QObject):
         self.ui.show_toast("Діагностику скопійовано. Ключі API не включені.")
 
     @Slot()
+    def open_timing_window(self):
+        if self.timing_window is None:
+            self.timing_window = DeveloperTimingWindow()
+            self.capture_privacy.register(self.timing_window)
+        self.timing_window.show()
+        self.timing_window.raise_()
+
+    def _timing_metric(self, key, milliseconds):
+        if self.timing_window is not None and self.timing_window.isVisible():
+            self.timing_window.set_milliseconds(key, milliseconds)
+
+    @Slot()
     def start_listening(self):
         if self.closing or self.audio is not None:
             return
+        self._question_timer.stop()
+        pace_mode = self.config.get("speech_pace_mode", "auto")
+        self._question_aggregator = QuestionAggregator(mode=pace_mode)
+        self._recent_voice_item = None
         index = self.config.get("audio_device_index")
         settings = tuple(self.config.get(name) for name in (
             "whisper_model_size", "whisper_device", "whisper_compute_type", "whisper_noise_reduction",
@@ -655,15 +722,20 @@ class MainController(QObject):
             language,
             index if index >= 0 else None,
             self.config.get("audio_mode") == "loopback",
-            previews=self.config.get("local_previews"),
+            previews=self.config.get("local_previews") or (pace_mode == "auto" and self.ui.profile != "eco"),
             neural_vad=self.config.get("vad_mode") != "energy",
-            end_silence_seconds=max(300, min(1500, self.config.get("speech_end_silence_ms"))) / 1000,
+            end_silence_seconds=max(
+                0.40 if pace_mode == "complete" else 0.42 if pace_mode == "slow" else 0.30,
+                max(300, min(1500, self.config.get("speech_end_silence_ms"))) / 1000,
+            ),
+            pre_roll_seconds=0.32 if pace_mode == "complete" else 0.24,
             gemini_key=self.config.get("gemini_api_key") if language == "uk" else "",
         )
         self.audio.status.connect(self.on_audio_status)
         self.audio.text_updated.connect(self.on_live_text)
         self.audio.timed_question.connect(self.handle_question)
         self.audio.voice_endpoint.connect(self._watch_voice_endpoint)
+        self.audio.speech_started.connect(self._on_speech_started)
         self.audio.finished.connect(self.audio_done)
         self.audio.start()
         self.meter.start()
@@ -671,6 +743,8 @@ class MainController(QObject):
 
     @Slot()
     def stop_listening(self):
+        self._finalize_voice_question(force=True)
+        self._question_timer.stop()
         self._voice_timer.stop()
         self._voice_wait_at = None
         if self.pending_question and not self.pending_question[1]:
@@ -684,14 +758,47 @@ class MainController(QObject):
     @Slot(str)
     def on_audio_status(self, status):
         if self.audio and not self.audio.isInterruptionRequested() and not self.closing:
-            self.ui.lbl_status.setText(status)
+            self.ui.lbl_status.setText("EXAM AI слухає…" if status == "Слухаю…" else status)
 
     @Slot(str)
     def on_live_text(self, text):
-        if (self.audio and not self.audio.isInterruptionRequested()
-                and not self.closing and not self._selecting_screen
-                and not self.ui.txt_question.hasFocus()):
-            self.ui.txt_question.setPlainText(text)
+        if self.audio and not self.audio.isInterruptionRequested() and not self.closing:
+            preview = self._question_aggregator.preview(text)
+            if not self._selecting_screen and not self.ui.txt_question.hasFocus():
+                self.ui.txt_question.setPlainText(preview)
+
+    @Slot(float)
+    def _on_speech_started(self, started_at):
+        if not self._question_aggregator.pending:
+            self._dev_speech_started_at = started_at
+            if self.timing_window is not None and self.timing_window.isVisible():
+                self.timing_window.reset()
+        if self._question_aggregator.pending:
+            self._question_aggregator.speech_started(now=started_at)
+            self._arm_question_timer()
+
+    def _arm_question_timer(self):
+        if self._question_aggregator.speech_active and self._question_aggregator.mode != "auto":
+            self._question_timer.stop()
+            return
+        deadline = self._question_aggregator.deadline
+        if deadline is not None:
+            self._question_timer.start(max(1, ceil((deadline - perf_counter()) * 1000)))
+
+    def _finalize_voice_question(self, *, force=False):
+        item = self._question_aggregator.finalize(force=force)
+        if item is None:
+            self._arm_question_timer()
+            return
+        self._question_timer.stop()
+        if item.speech_ended_at is not None:
+            self._timing_metric("assembly", (perf_counter() - item.speech_ended_at) * 1000)
+        timing.info("request_id=%s question_finalized=1 fragments=%d wait_ms=%.1f",
+                    item.request_id, item.fragments,
+                    (perf_counter() - item.speech_ended_at) * 1000
+                    if item.speech_ended_at is not None else -1)
+        self.ui.txt_question.setPlainText(item.text)
+        self._submit_auto_question(item.text, item.speech_ended_at, item.request_id)
 
     @Slot()
     def audio_done(self):
@@ -725,6 +832,11 @@ class MainController(QObject):
         if not self.config.get("gemini_api_key"):
             self.ui.lbl_status.setText("Додайте ключ Gemini у налаштуваннях.")
             return
+        self._pending_screen_instruction = select_screen_instruction(
+            self.ui.txt_question.toPlainText(), self._last_manual_instruction,
+        )
+        self._question_timer.stop()
+        self._question_aggregator.clear()
         self._selecting_screen = True
         self._voice_timer.stop()
         self._voice_wait_at = None
@@ -767,6 +879,7 @@ class MainController(QObject):
     def _cancel_screen_selection(self):
         if self._selecting_screen:
             self._finish_screen_selection()
+            self._pending_screen_instruction = ""
             self.ui.lbl_status.setText("Виділення скасовано.")
 
     @Slot(object)
@@ -774,12 +887,21 @@ class MainController(QObject):
         if not self._selecting_screen:
             return
         self._finish_screen_selection()
+        instruction = self._pending_screen_instruction
+        self._pending_screen_instruction = ""
         label = f"Зображення з екрана ({image.width()} × {image.height()})"
-        self.ui.txt_question.setPlainText(label)
-        self.submit_question(label, manual=True, image=image)
+        display = instruction + "\n" + label if instruction else label
+        self.ui.txt_question.setPlainText(display)
+        request_id = uuid4().hex[:12]
+        timing.info("request_id=%s screen_image_captured=1 width=%d height=%d",
+                    request_id, image.width(), image.height())
+        self.submit_question(display, manual=True, image=image, image_instruction=instruction,
+                             request_id=request_id)
 
     @Slot(float)
     def _watch_voice_endpoint(self, speech_ended_at):
+        if self._dev_speech_started_at is not None:
+            self._timing_metric("voice", (speech_ended_at - self._dev_speech_started_at) * 1000)
         if (self.closing or self._selecting_screen or not self.audio or self.audio.isInterruptionRequested()
                 or not self.ui.auto_send.isChecked() or self.ui.txt_question.hasFocus()):
             return
@@ -795,6 +917,8 @@ class MainController(QObject):
 
     @Slot(str, object, str)
     def handle_question(self, question, speech_ended_at=None, request_id=None):
+        if speech_ended_at is not None:
+            self._timing_metric("stt", (perf_counter() - speech_ended_at) * 1000)
         if speech_ended_at is not None and speech_ended_at == self._voice_wait_at:
             self._voice_timer.stop()
             self._voice_wait_at = None
@@ -802,8 +926,30 @@ class MainController(QObject):
                 or self._selecting_screen or not self.ui.auto_send.isChecked()
                 or self.ui.txt_question.hasFocus()):
             return
-        if self.config.get('whisper_language', 'uk') == 'uk' and has_non_ukrainian_cyrillic(question):
-            self.ui.lbl_status.setText("Нерозбірливо українською. Повторіть або виправте текст.")
+        recent = self._recent_voice_item
+        if (recent and not self._question_aggregator.pending
+                and perf_counter() - recent[3] <= 4.0
+                and is_continuation_fragment(question)):
+            self._question_aggregator.add_final(recent[0], recent[1], recent[2])
+            self._question_aggregator.speech_started()
+            self._recent_voice_item = None
+            self._cancel_active_answer()
+            timing.info("request_id=%s question_reopened=1", recent[2])
+        accepted = self._question_aggregator.add_final(question, speech_ended_at, request_id or "")
+        if accepted:
+            self.ui.txt_question.setPlainText(self._question_aggregator.text)
+        if self._question_aggregator.pending:
+            timing.info("request_id=%s aggregator_waiting=1 fragments=%d",
+                        self._question_aggregator.request_id, self._question_aggregator.fragments)
+            self._arm_question_timer()
+        return
+
+    def _submit_auto_question(self, question, speech_ended_at, request_id):
+        if self.closing or not self.ui.auto_send.isChecked():
+            return
+        if is_unreliable_transcript(question):
+            timing.info("request_id=%s aggregator_rejected=unreliable", request_id)
+            self.ui.lbl_status.setText("Розпізнавання непевне. Перевірте текст і натисніть «Надіслати питання».")
             return
         normalized = " ".join(question.casefold().split())
         now = perf_counter()
@@ -811,18 +957,24 @@ class MainController(QObject):
             return
         self._last_auto_question = normalized
         self._last_auto_at = now
-        if speech_ended_at is None:
-            self.submit_question(question, manual=False)
-        else:
-            self.submit_question(question, manual=False, speech_ended_at=speech_ended_at,
-                                 request_id=request_id)
+        self.submit_question(question, manual=False, speech_ended_at=speech_ended_at,
+                             request_id=request_id or None)
+        self._recent_voice_item = (question, speech_ended_at, request_id or "", now)
 
     @Slot(str)
     def submit_manual_question(self, question):
+        self._recent_voice_item = None
+        if self._question_aggregator.pending and not self.ui.txt_question.hasFocus():
+            item = self._question_aggregator.finalize(force=True)
+            question = item.text
+        self._question_aggregator.clear()
+        self._question_timer.stop()
+        self._last_manual_instruction = question.strip()
         self.submit_question(question, manual=True)
 
     def submit_question(self, question, manual, speech_ended_at=None, *, request_id=None,
-                        mode=None, enqueued_at=None, image=None, image_bytes=None, image_mime=None):
+                        mode=None, enqueued_at=None, image=None, image_bytes=None, image_mime=None,
+                        image_instruction=""):
         question = question.strip()
         if self.closing or not question:
             return
@@ -838,7 +990,8 @@ class MainController(QObject):
                 if self._pending_options:
                     timing.info("request_id=%s queue_replaced=1", self._pending_options["request_id"])
                 self._pending_options = dict(request_id=request_id, mode=mode, enqueued_at=enqueued_at,
-                                             image=image, image_bytes=image_bytes, image_mime=image_mime)
+                                             image=image, image_bytes=image_bytes, image_mime=image_mime,
+                                             image_instruction=image_instruction)
                 timing.info("request_id=%s answer_queued=1", request_id)
             self.ui.lbl_status.setText("Наступне питання в черзі…")
             return
@@ -846,13 +999,18 @@ class MainController(QObject):
             self.ui.lbl_status.setText("Мережа затримує попередні запити. Повторіть спробу.")
             return
         llm = self.get_llm(mode)
+        self._dev_request_started_at = submitted
         self._answer_request_id = request_id
+        self._current_question = question
+        self._current_answer_text = ""
+        self._history_index = -1
+        self._sync_history_controls(busy=True)
         self._answer_enqueued_at = enqueued_at
         self.answer_started = False
         self._speech_ended_at = speech_ended_at
         self._answer_cleared = False
         self.ui.txt_answer.setPlainText("")
-        self.ui.lbl_status.setText("Думаю…")
+        self.ui.lbl_status.setText("EXAM AI аналізує…")
         target_from = submitted if speech_ended_at is None else speech_ended_at
         remaining_to_hint = target_from + ANSWER_TARGET_SECONDS - submitted
         if remaining_to_hint <= 0:
@@ -862,13 +1020,23 @@ class MainController(QObject):
 
         cancelled = threading.Event()
         save_history = self.config.get("save_answer_history", False)
+        selected_document = self.ui.list_docs.currentItem()
+        source_hint = selected_document.text() if selected_document else self._last_imported_source
 
         def task():
             rag_started = perf_counter()
             context = ""
             if not has_image:
                 try:
-                    context = self.rag.retrieve_relevant_context(question, limit=4 if mode == 'smart' else 2)
+                    context = self.rag.retrieve_relevant_context(
+                        question, limit=4 if mode == 'smart' else 2,
+                        source_hint=source_hint, request_id=request_id,
+                    )
+                except ReferenceLookupError as exc:
+                    answer = str(exc)
+                    timing.info("request_id=%s rag_reference_unavailable=1", request_id)
+                    worker.answer_ready.emit(answer)
+                    return answer, "Готово"
                 except sqlite3.Error:
                     context = ""
             requested = perf_counter()
@@ -885,7 +1053,9 @@ class MainController(QObject):
                 now = perf_counter()
                 if last_update is None:
                     timing.info("request_id=%s llm_first_text_ms=%.1f", request_id, (now - requested) * 1000)
-                if last_update is None or now - last_update >= 0.05:
+                refresh_interval = (0.12 if self.ui.profile == "eco"
+                                    else 0.05)
+                if last_update is None or now - last_update >= refresh_interval:
                     last_update = now
                     worker.progress.emit(text, now)
 
@@ -894,6 +1064,7 @@ class MainController(QObject):
             if speech_ended_at is not None:
                 timing.info("request_id=%s llm_start_from_speech_end_ms=%.1f", request_id,
                             (perf_counter() - speech_ended_at) * 1000)
+            timing.info("request_id=%s llm_request=1", request_id)
             try:
                 if not has_image:
                     answer = llm.generate_answer(question, context, on_text=on_text,
@@ -904,8 +1075,20 @@ class MainController(QObject):
                                                          else (image_bytes, image_mime))
                     except ValueError as exc:
                         raise GenerationError(str(exc)) from None
-                    answer = llm.generate_image_answer(prepared_bytes, prepared_mime, on_text=on_text,
-                                                       mode=mode, request_id=request_id)
+                    intent = image_intent(image_instruction)
+                    image_context = ""
+                    if intent == EXPLAIN_CODE and source_hint:
+                        try:
+                            image_context = self.rag.get_source_preview(source_hint)
+                        except sqlite3.Error:
+                            pass
+                    timing.info("request_id=%s screen_image_sent=1 intent=%s context_chars=%d",
+                                request_id, intent, len(image_context))
+                    answer = llm.generate_image_answer(
+                        prepared_bytes, prepared_mime, on_text=on_text,
+                        mode=mode, request_id=request_id, user_instruction=image_instruction,
+                        context=image_context, intent=intent,
+                    )
             except GenerationError:
                 if latest_text and not cancelled.is_set():
                     worker.progress.emit(latest_text, perf_counter())
@@ -947,16 +1130,63 @@ class MainController(QObject):
         sender = self.sender()
         return (sender is None or sender is self.api) and not self._answer_cleared
 
+    def _sync_history_controls(self, *, busy=False):
+        total = len(self._answer_history)
+        position = self._history_index + 1 if self._history_index >= 0 else 0
+        self.ui.set_history_position(position, total, busy=busy or self.api is not None)
+
+    def _remember_answer(self, answer):
+        if not answer or (self._answer_history and self._answer_history[-1][0] == self._answer_request_id):
+            return
+        self._answer_history.append((self._answer_request_id, self._current_question, answer))
+        if len(self._answer_history) > MAX_SESSION_ANSWERS:
+            del self._answer_history[0]
+        self._history_index = len(self._answer_history) - 1
+        self.ui.set_history_items(self._answer_history)
+        self._sync_history_controls()
+
+    @Slot(int)
+    def on_history_select(self, index):
+        if self.api is not None or not 0 <= index < len(self._answer_history):
+            return
+        self._history_index = index
+        _, question, answer = self._answer_history[index]
+        self.ui.txt_question.setPlainText(question)
+        self.ui.txt_answer.show_response(answer)
+        self.ui.tabs.setCurrentWidget(self.ui.tab_live)
+        self._sync_history_controls()
+
+    @Slot(int)
+    def on_history_step(self, step):
+        if self.api is not None or not self._answer_history:
+            return
+        index = self._history_index if self._history_index >= 0 else len(self._answer_history)
+        index = max(0, min(len(self._answer_history) - 1, index + step))
+        self._history_index = index
+        _, question, answer = self._answer_history[index]
+        self.ui.txt_question.setPlainText(question)
+        self.ui.txt_answer.show_response(answer)
+        self._sync_history_controls()
+
     @Slot(str)
     def _answer_ready(self, answer):
         if self._accept_answer_signal():
             self._answer_hint_timer.stop()
+            self._current_answer_text = answer
+            self._remember_answer(answer)
             self.ui.txt_answer.show_response(answer)
             now = perf_counter()
+            if not self.answer_started:
+                if self._dev_request_started_at is not None:
+                    self._timing_metric("first_text", (now - self._dev_request_started_at) * 1000)
+                if self._speech_ended_at is not None:
+                    self._timing_metric("speech_to_first", (now - self._speech_ended_at) * 1000)
+            if self._dev_request_started_at is not None:
+                self._timing_metric("complete", (now - self._dev_request_started_at) * 1000)
             timing.info("request_id=%s ui_complete_from_submit_ms=%.1f end_to_end_complete_ms=%.1f",
                         self._answer_request_id, (now - self._answer_enqueued_at) * 1000,
                         (now - self._speech_ended_at) * 1000 if self._speech_ended_at is not None else -1)
-            self.ui.lbl_status.setText("Готово")
+            self.ui.lbl_status.setText("Відповідь EXAM AI")
 
     @Slot(str, float)
     def on_answer_progress(self, text, emitted=None):
@@ -965,13 +1195,18 @@ class MainController(QObject):
         self._answer_hint_timer.stop()
         first = not self.answer_started
         self.answer_started = True
+        self._current_answer_text = text
         self.ui.txt_answer.show_streaming_response(text)
         if first:
             now = perf_counter()
-            timing.info("request_id=%s ui_update_ms=%.1f voice first_ui_text_ms=%.1f",
+            if self._dev_request_started_at is not None:
+                self._timing_metric("first_text", (now - self._dev_request_started_at) * 1000)
+            if self._speech_ended_at is not None:
+                self._timing_metric("speech_to_first", (now - self._speech_ended_at) * 1000)
+            timing.info("request_id=%s ui_answer_updated=1 ui_update_ms=%.1f voice first_ui_text_ms=%.1f",
                         self._answer_request_id, (now - emitted) * 1000 if emitted is not None else -1,
                         (now - self._speech_ended_at) * 1000 if self._speech_ended_at is not None else -1)
-        self.ui.lbl_status.setText("Відповідаю…")
+        self.ui.lbl_status.setText("EXAM AI відповідає…")
 
     @Slot(object, str)
     def on_answer(self, value, error):
@@ -980,16 +1215,23 @@ class MainController(QObject):
         self._answer_hint_timer.stop()
         if error:
             if self.answer_started:
+                self._remember_answer(self._current_answer_text)
                 self.ui.lbl_status.setText(error)
             else:
                 self.ui.txt_answer.setPlainText(error)
                 self.ui.lbl_status.setText("Помилка AI")
         else:
             _, status = value
-            self.ui.lbl_status.setText(status)
+            self.ui.lbl_status.setText("Відповідь EXAM AI" if status == "Готово" else status)
 
     @Slot()
     def on_clear_all(self):
+        self._recent_voice_item = None
+        self._question_timer.stop()
+        self._question_aggregator.clear()
+        self._pending_screen_instruction = ""
+        self._last_manual_instruction = ""
+        self._history_index = -1
         self.pending_question = None
         self._voice_timer.stop()
         self._voice_wait_at = None
@@ -997,6 +1239,7 @@ class MainController(QObject):
         self._answer_hint_timer.stop()
         self._pending_options = {}
         self._cancel_active_answer()
+        self._sync_history_controls()
         self._last_auto_question = ""
         self.ui.lbl_status.setText("Готовий" if self.ui.tr.current_lang == "UA" else "Ready")
 
@@ -1046,6 +1289,7 @@ class MainController(QObject):
             worker.deleteLater()
             self.api = None
             self._answer_hint_timer.stop()
+            self._sync_history_controls()
             self._start_pending_answer()
         self.finish_close()
 
@@ -1099,6 +1343,8 @@ class MainController(QObject):
     def on_index_result(self, filename, count, error):
         message = error or f"«{filename}» збережено ({count} блоків)."
         self.ui.txt_docs_result.setPlainText(message)
+        if not error:
+            self._last_imported_source = filename
 
     def start_docs(self, worker):
         self.docs = worker
@@ -1119,6 +1365,8 @@ class MainController(QObject):
         if self._selecting_screen:
             self._finish_screen_selection()
         self._voice_timer.stop()
+        self._question_timer.stop()
+        self._question_aggregator.clear()
         self.pending_question = None
         if self.audio:
             self.audio.requestInterruption()
@@ -1134,11 +1382,15 @@ class MainController(QObject):
 
     @Slot()
     def shutdown(self):
-        if self.hotkey_handle is not None:
-            try:
-                keyboard.remove_hotkey(self.hotkey_handle)
-            except (KeyError, ValueError):
-                pass
+        if self.timing_window is not None:
+            self.capture_privacy.unregister(self.timing_window)
+            self.timing_window.close()
+        for handle in (self.hotkey_handle, self.recover_hotkey_handle):
+            if handle is not None:
+                try:
+                    keyboard.remove_hotkey(handle)
+                except (KeyError, ValueError):
+                    pass
         if self.audio is not None:
             self.audio.requestInterruption()
         for worker in (self.audio, self.api, self.docs, *self._retired_answers):
@@ -1162,7 +1414,11 @@ class MainController(QObject):
 
 if __name__ == "__main__":
     if os.environ.get("PHANTOM_TIMING") == "1":
-        timing.addHandler(logging.StreamHandler())
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        timing.addHandler(handler)
         timing.setLevel(logging.INFO)
     if os.environ.get("PHANTOM_AUDIO_DIAGNOSTICS") == "1":
         audio_log.addHandler(logging.StreamHandler())

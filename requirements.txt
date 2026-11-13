@@ -9,3 +9,4 @@ pypdf==7.0.1
 python-docx==1.2.0
 keyboard==0.13.5
 matplotlib==3.10.9
+psutil==5.9.8

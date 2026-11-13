@@ -24,6 +24,47 @@ STOP_WORDS = set(
     "the and what how why does do is are of a an".split()
 )
 log = logging.getLogger("phantom.timing.rag")
+LINE_AFTER_NUMBER = re.compile(
+    r"(?<!\w)(\d{1,6})(?:[-‐‑–]?(?:й|ий|ій|му|го|та|th|st|nd|rd))?\s*"
+    r"(?:ряд(?:ок|к\w*|ц\w*)|строк\w*|line\b)", re.IGNORECASE,
+)
+LINE_BEFORE_NUMBER = re.compile(
+    r"(?:ряд(?:ок|к\w*|ц\w*)|строк\w*|line\b)\s*(?:№|#|номер\s*)?(\d{1,6})",
+    re.IGNORECASE,
+)
+FUNCTION_NAME = re.compile(r"(?:функц\w*|function)\s+([A-Za-z_][A-Za-z_0-9]*)", re.IGNORECASE)
+IDENTIFIER = re.compile(r"(?<![A-Za-z_0-9])([A-Za-z_][A-Za-z_0-9]*[A-Z][A-Za-z_0-9]*)(?![A-Za-z_0-9])")
+
+
+class ReferenceLookupError(LookupError):
+    """An exact source reference cannot be resolved safely."""
+
+
+def requested_line(question):
+    for pattern in (LINE_AFTER_NUMBER, LINE_BEFORE_NUMBER):
+        match = pattern.search(question)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def looks_like_code(text):
+    sample = text[:12000]
+    return bool(re.search(r"^\s*#\s*include\b", sample, re.MULTILINE)) or sum((
+        len(re.findall(r"[;{}]", sample)) >= 5,
+        bool(re.search(r"\b(?:int|void|double|float|char)\s+\w+\s*\(", sample)),
+        bool(re.search(r"\b(?:if|for|while)\s*\(", sample)),
+    )) >= 2
+
+
+def code_terms(question):
+    terms = FUNCTION_NAME.findall(question) + IDENTIFIER.findall(question)
+    lowered = question.casefold()
+    if any(word in lowered for word in ("пам'ят", "пам’ят", "памят", "памяти", "memory", "виділя", "выделя")):
+        terms.extend(("malloc", "calloc", "realloc"))
+    if any(word in lowered for word in ("цикл", "loop", "масив", "массив", "array")):
+        terms.extend(("for", "while", "do"))
+    return list(dict.fromkeys(term for term in terms if len(term) >= 2))[:8]
 
 
 class RAGEngine:
@@ -38,14 +79,18 @@ class RAGEngine:
         parts = []
         length = 0
         for piece in self._read_text(path):
-            if piece:
+            if piece is not None:
                 length += len(piece) + 1
                 if length > MAX_TEXT_CHARS:
                     raise ValueError("Документ перевищує 2 млн символів.")
                 parts.append(piece)
-        text = "\n".join(parts).strip()
-        if not text:
+        text = "\n".join(parts)
+        if not text.strip():
             raise ValueError("Файл не містить доступного тексту.")
+        lines = None
+        if path.suffix.lower() == ".txt":
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            lines = text.split("\n")
         chunks = []
         start = 0
         while start < len(text):
@@ -60,14 +105,18 @@ class RAGEngine:
                 break
             start = end - OVERLAP
         chunks = [chunk for chunk in chunks if chunk]
-        self.db_mgr.replace_document(path.name, chunks)
+        self.db_mgr.replace_document(path.name, chunks, lines=lines,
+                                     is_code=looks_like_code(text) if lines is not None else False)
         return len(chunks)
 
     @staticmethod
     def _read_text(path):
         suffix = path.suffix.lower()
         if suffix == ".txt":
-            yield path.read_text(encoding="utf-8-sig")
+            try:
+                yield path.read_text(encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                yield path.read_text(encoding="cp1251")
         elif suffix == ".pdf":
             from pypdf import PdfReader
 
@@ -89,13 +138,101 @@ class RAGEngine:
         else:
             raise ValueError("Підтримуються TXT, PDF та DOCX.")
 
-    def retrieve_relevant_context(self, query, *, limit=4):
+    def _resolve_line_source(self, question, source_hint, sources):
+        if not sources:
+            raise ReferenceLookupError("Немає TXT-файлу з доступними номерами рядків. Імпортуйте його повторно.")
+        lowered = question.casefold()
+        named = []
+        for source, count, is_code in sources:
+            name = Path(source).stem.casefold()
+            full_name = source.casefold()
+            if (re.search(r"(?<!\w)" + re.escape(full_name) + r"(?!\w)", lowered)
+                    or (len(name) >= 3 and re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", lowered))):
+                named.append((source, count, is_code))
+        if len(named) == 1:
+            return named[0]
+        if len(named) > 1:
+            raise ReferenceLookupError("Уточніть назву файлу: запит відповідає кільком документам.")
+        for entry in sources:
+            if entry[0] == source_hint:
+                return entry
+        code_sources = [entry for entry in sources if entry[2]]
+        if len(code_sources) == 1 and any(word in lowered for word in ("код", "програм", "лаборатор", "code")):
+            return code_sources[0]
+        if len(sources) == 1:
+            return sources[0]
+        raise ReferenceLookupError("Уточніть назву TXT-файлу або виберіть його в «Конспектах».")
+
+    def _exact_line_context(self, query, source_hint, sources, request_id):
+        number = requested_line(query)
+        if number is None:
+            return None
+        source, count, _ = self._resolve_line_source(query, source_hint, sources)
+        log.info("request_id=%s rag_document_resolved=%s line=%d", request_id, source, number)
+        if number < 1 or number > count:
+            raise ReferenceLookupError(f"У файлі «{source}» немає рядка {number}; у ньому {count} рядків.")
+        started = perf_counter()
+        rows = self.db_mgr.get_line_window(source, number)
+        log.info("request_id=%s rag_exact_line_ms=%.1f source=%s line=%d",
+                 request_id, (perf_counter() - started) * 1000, source, number)
+        if not any(line == number for line, _ in rows):
+            raise ReferenceLookupError(f"Рядок {number} у файлі «{source}» недоступний.")
+        def display(line, content):
+            maximum = 1100 if line == number else 180
+            if len(content) > maximum:
+                content = content[:maximum] + "… [довгий рядок скорочено]"
+            return f"{line}: {content}"
+        shown = "\n".join(display(line, content) for line, content in rows)
+        return f"Точні рядки з файлу «{source}» (цільовий рядок {number}):\n{shown}"
+
+    def _code_context(self, query, source_hint, request_id):
+        terms = code_terms(query)
+        if not terms:
+            return ""
+        expression = " OR ".join('"' + term + '"' for term in terms)
+        started = perf_counter()
+        rows = self.db_mgr.search_code_lines(expression, source=source_hint)
+        if not rows and source_hint is not None:
+            rows = self.db_mgr.search_code_lines(expression)
+        if not rows:
+            return ""
+        log.info("request_id=%s rag_code_lookup_ms=%.1f hits=%d",
+                 request_id, (perf_counter() - started) * 1000, len(rows))
+        excerpts = []
+        for source, line, _ in rows[:3]:
+            window = self.db_mgr.get_line_window(source, line, radius=2)
+            excerpts.append(f"Файл «{source}», рядок {line}:\n" +
+                            "\n".join(f"{number}: {content}" for number, content in window))
+        return "\n\n".join(excerpts)[:1800]
+
+    def get_source_preview(self, source, *, max_chars=2200):
+        """Small, optional code reference for a selected file in an image request."""
+        if not source:
+            return ""
+        with self.db_mgr.connection(timeout=0.05) as conn:
+            metadata = conn.execute(
+                "SELECT is_code FROM document_meta WHERE source = ?", (source,)
+            ).fetchone()
+            if not metadata or not metadata[0]:
+                return ""
+            rows = conn.execute("""
+                SELECT line_number, content FROM document_lines
+                WHERE source = ? ORDER BY line_number LIMIT 80
+            """, (source,)).fetchall()
+        preview = "\n".join(f"{number}: {content}" for number, content in rows)
+        return f"Файл «{source}» (початок коду):\n{preview[:max_chars]}"
+
+    def retrieve_relevant_context(self, query, *, limit=4, source_hint=None, request_id="-"):
         started = perf_counter()
         query = query[:4000].strip()
+        sources = self.db_mgr.get_line_sources() if requested_line(query) is not None else None
+        if sources is not None:
+            return self._exact_line_context(query, source_hint, sources, request_id)
+        code_context = self._code_context(query, source_hint, request_id)
         words = dict.fromkeys(WORD.findall(query.casefold()))
         terms = [word for word in words if len(word) >= 2 and word not in STOP_WORDS][:24]
         if not terms or limit <= 0:
-            return ""
+            return code_context
         lexical = self._lexical_rows(terms)
         lexical_done = perf_counter()
         semantic, status = self.semantic.search(query, MAX_CANDIDATES, started + RETRIEVAL_BUDGET_SECONDS)
@@ -110,10 +247,12 @@ class RAGEngine:
                 rows[doc_id] = row
         ordered = sorted(scores, key=scores.__getitem__, reverse=True)[:limit]
         context = "\n\n".join(f"[{rows[doc_id][1]}]\n{rows[doc_id][2]}" for doc_id in ordered)
+        if code_context:
+            context = code_context + ("\n\n" + context if context else "")
         context = context[:min(MAX_CONTEXT_CHARS, limit * (CHUNK_SIZE + 50))]
-        log.info("lexical_ms=%.1f semantic_ms=%.1f semantic_status=%s lexical_hits=%d "
+        log.info("request_id=%s lexical_ms=%.1f semantic_ms=%.1f semantic_status=%s lexical_hits=%d "
                  "semantic_hits=%d context_chars=%d",
-                 (lexical_done - started) * 1000, (perf_counter() - lexical_done) * 1000,
+                 request_id, (lexical_done - started) * 1000, (perf_counter() - lexical_done) * 1000,
                  status, len(lexical), len(semantic), len(context))
         return context
 

@@ -44,6 +44,14 @@ class ResponseView(QTextEdit):
         self.setDocument(document)
         self.source = ""
         self._formula_cache = {}
+        self._formula_color = "#f4f4f4"
+
+    def set_formula_color(self, color):
+        if color != self._formula_color:
+            self._formula_color = color
+            self._formula_cache.clear()
+            if any(image.startswith("formula:") for image in re.findall(r'src="([^"]+)"', self.document().toHtml())):
+                self.show_response(self.source, streaming=True)
 
     def setPlainText(self, text):
         self.source = text
@@ -102,7 +110,9 @@ class ResponseView(QTextEdit):
             if cache_key not in self._formula_cache:
                 if len(self._formula_cache) >= 32:
                     self._formula_cache.pop(next(iter(self._formula_cache)))
-                self._formula_cache[cache_key] = render_formula(expression, display)
+                self._formula_cache[cache_key] = (render_formula(expression, display)
+                    if self._formula_color == "#f4f4f4" else
+                    render_formula(expression, display, color=self._formula_color))
             image = self._formula_cache[cache_key]
             if image is None:
                 cursor.insertText(literal)
@@ -125,7 +135,7 @@ class ResponseView(QTextEdit):
         return self.source if not self.document().isEmpty() else ""
 
 
-def render_formula(expression, display):
+def render_formula(expression, display, *, color="#f4f4f4"):
     expression = " ".join(expression.split())
     if not expression or len(expression) > 300:
         return None
@@ -140,7 +150,7 @@ def render_formula(expression, display):
         with rc_context({"savefig.transparent": True, "text.usetex": False}):
             math_to_image(
                 "$" + expression + "$", output, dpi=144, format="png",
-                prop=FontProperties(size=13 if display else 11), color="#f4f4f4",
+                prop=FontProperties(size=13 if display else 11), color=color,
             )
         image = QImage.fromData(output.getvalue(), "PNG")
         return None if image.isNull() else image
