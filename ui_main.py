@@ -3,7 +3,7 @@ import math
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
     QPushButton, QComboBox, QTabWidget, QFileDialog, QProgressBar, QLineEdit,
-    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QApplication, QColorDialog, QSpinBox
+    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QDialog, QStackedWidget, QApplication, QColorDialog, QSpinBox
 )
 from PySide6.QtCore import QEvent, Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSize, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication, QPainter, QColor, QPen, QPixmap, QIcon, QLinearGradient, QPainterPath
@@ -15,8 +15,7 @@ from performance import LEGACY, PROFILES, PerformanceMonitor, RuntimePolicy, det
 from window_mode import WindowMode
 from live_cards import LiveCards
 
-VERSION = "2.2.0"
-REPOSITORY = "https://github.com/shekaminym/examai"
+from branding import VERSION, REPOSITORY
 
 from rounded_window import configure_rounded_window
 from ghost_controls import GhostToggle, GhostLockButton
@@ -388,12 +387,19 @@ class MainWindow(QMainWindow):
         self.compact_listen.clicked.connect(self.on_toggle_listen)
         self.compact_screen = QPushButton()
         self.compact_screen.clicked.connect(self.screen_select_signal.emit)
-        self.compact_widgets = (self.compact_status, self.compact_listen, self.compact_screen)
+        self.compact_settings = QPushButton("⚙")
+        self.compact_settings.setToolTip("Налаштування")
+        self.compact_settings.setAccessibleName("Налаштування")
+        self.compact_settings.setFixedSize(29, 30)
+        self.compact_settings.clicked.connect(self.open_settings)
+        self.compact_widgets = (self.compact_status, self.compact_listen, self.compact_screen,
+                                self.compact_settings)
         for button in (self.compact_listen, self.compact_screen):
             button.setMinimumHeight(32)
             top_bar.addWidget(button)
         top_bar.addSpacing(7)
         top_bar.addWidget(self.answer_mode)
+        top_bar.addWidget(self.compact_settings)
         top_bar.addSpacing(8)
         top_bar.addWidget(self.btn_ghost)
         top_bar.addWidget(self.btn_ghost_lock)
@@ -470,9 +476,8 @@ class MainWindow(QMainWindow):
         self.btn_select_screen.installEventFilter(self)
         self.tabs.addTab(self.tab_live, "AI")
 
-        self.tab_settings = QWidget()
-        self.init_settings_tab()
-        self.tabs.addTab(self.tab_settings, "Налаштування")
+        self.init_settings_window()
+        self.nav_buttons["settings"].clicked.connect(self.open_settings)
 
         self.tab_docs = QWidget()
         self.init_docs_tab()
@@ -495,7 +500,7 @@ class MainWindow(QMainWindow):
         self.tab_subscriptions = QWidget()
         self.tabs.addTab(self.tab_subscriptions, "Підписки")
         for name, page in (("live", self.tab_live), ("docs", self.tab_docs),
-                           ("settings", self.tab_settings), ("history", self.tab_history),
+                           ("history", self.tab_history),
                            ("about", self.tab_about), ("subscriptions", self.tab_subscriptions)):
             self.nav_buttons[name].clicked.connect(lambda _checked=False, target=page:
                                                     self.tabs.setCurrentWidget(target))
@@ -590,11 +595,10 @@ class MainWindow(QMainWindow):
 
     def retranslate_ui(self):
         self.tabs.setTabText(0, self.tr.get("tab_ai"))
-        self.tabs.setTabText(1, self.tr.get("tab_settings"))
-        self.tabs.setTabText(2, self.tr.get("tab_docs"))
-        self.tabs.setTabText(3, "Історія" if self.tr.current_lang == "UA" else "History")
-        self.tabs.setTabText(4, "Про нас" if self.tr.current_lang == "UA" else "About us")
-        self.tabs.setTabText(5, "Підписки" if self.tr.current_lang == "UA" else "Subscriptions")
+        self.tabs.setTabText(1, self.tr.get("tab_docs"))
+        self.tabs.setTabText(2, "Історія" if self.tr.current_lang == "UA" else "History")
+        self.tabs.setTabText(3, "Про нас" if self.tr.current_lang == "UA" else "About us")
+        self.tabs.setTabText(4, "Підписки" if self.tr.current_lang == "UA" else "Subscriptions")
         labels = {
             "live": "AI",
             "docs": self.tr.get("tab_docs"),
@@ -632,7 +636,7 @@ class MainWindow(QMainWindow):
         self.lbl_set_model.setText(self.tr.get("set_model"))
         self.lbl_set_source.setText(self.tr.get("set_audio_source"))
         self.lbl_set_device.setText(self.tr.get("set_audio_device"))
-        self.btn_save_cfg.setText(self.tr.get("btn_save_settings"))
+        self.btn_save_cfg.setText("Зберегти" if self.tr.current_lang == "UA" else "Save")
         self.btn_open_timing.setText("ВІКНО ЗАМІРІВ" if self.tr.current_lang == "UA" else "TIMING WINDOW")
         
         self.btn_upload.setText(self.tr.get("btn_add_doc"))
@@ -659,7 +663,7 @@ class MainWindow(QMainWindow):
     def update_nav_selection(self, _index):
         current = self.tabs.currentWidget()
         for name, page in (("live", self.tab_live), ("docs", self.tab_docs),
-                           ("settings", self.tab_settings), ("history", self.tab_history),
+                           ("history", self.tab_history),
                            ("about", self.tab_about), ("subscriptions", self.tab_subscriptions)):
             button = self.nav_buttons[name]
             button.setObjectName("NavButtonActive" if current is page else "NavButton")
@@ -765,20 +769,50 @@ class MainWindow(QMainWindow):
         if typed:
             self.input_manual_question.clear()
 
-    def init_settings_tab(self):
-        outer = QVBoxLayout(self.tab_settings)
-        outer.setContentsMargins(0, 0, 0, 0)
-        self.settings_scroll = QScrollArea()
-        self.settings_scroll.setObjectName("SettingsScroll")
-        self.settings_scroll.setWidgetResizable(True)
-        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer.addWidget(self.settings_scroll)
-        content = QWidget()
-        self.settings_scroll.setWidget(content)
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(2, 8, 8, 8)
-        layout.setSpacing(10)
+    def open_settings(self):
+        self.settings_window.show()
+        self.settings_window.raise_()
+        self.settings_window.activateWindow()
+
+    def init_settings_window(self):
+        window = self.settings_window = QDialog(self)
+        window.setWindowTitle("EXAM AI · Налаштування")
+        window.setObjectName("SettingsWindow")
+        window.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        window.resize(720, 490)
+        window.setSizeGripEnabled(True)
+        window.setMinimumSize(410, 300)
+        root = QVBoxLayout(window)
+        body = QHBoxLayout()
+        root.addLayout(body, 1)
+        self.settings_navigation = QListWidget()
+        self.settings_navigation.setFixedWidth(156)
+        self.settings_navigation.setWordWrap(True)
+        body.addWidget(self.settings_navigation)
+        pages = QStackedWidget()
+        body.addWidget(pages, 1)
+        groups = {}
+        for key, label in (
+            ("general", "Загальні"), ("models", "ШІ та моделі"),
+            ("audio", "Аудіо та розпізнавання"), ("appearance", "Інтерфейс і теми"),
+            ("performance", "Продуктивність"), ("keys", "Гарячі клавіші"),
+            ("diagnostics", "Діагностика"),
+        ):
+            self.settings_navigation.addItem(label)
+            scroll = QScrollArea()
+            scroll.setObjectName("SettingsScroll")
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            content = QWidget()
+            scroll.setWidget(content)
+            layout = QVBoxLayout(content)
+            layout.setContentsMargins(7, 8, 7, 8)
+            layout.setSpacing(10)
+            groups[key] = layout
+            pages.addWidget(scroll)
+        self.settings_navigation.currentRowChanged.connect(pages.setCurrentIndex)
+        self.settings_navigation.setCurrentRow(0)
+        layout = groups["models"]
 
         self.lbl_set_gemini = QLabel("GEMINI API KEY:")
         layout.addWidget(self.lbl_set_gemini)
@@ -795,11 +829,16 @@ class MainWindow(QMainWindow):
 
         self.save_history = QCheckBox("Зберігати питання та відповіді локально")
         self.save_history.setChecked(self.config_mgr.get("save_answer_history", False))
-        layout.addWidget(self.save_history)
+        groups["general"].addWidget(self.save_history)
+        auto_send = QCheckBox("Автоматично надсилати голосові питання")
+        auto_send.setChecked(self.auto_send.isChecked())
+        auto_send.toggled.connect(self.auto_send.setChecked)
+        self.auto_send.toggled.connect(auto_send.setChecked)
+        groups["general"].addWidget(auto_send)
 
         self.lbl_stt_plan = QLabel("Мова: Gemini Live → локальний Whisper при збої")
         self.lbl_stt_plan.setWordWrap(True)
-        layout.addWidget(self.lbl_stt_plan)
+        groups["audio"].addWidget(self.lbl_stt_plan)
 
         self.lbl_set_model = QLabel("МОДЕЛЬ AI:")
         layout.addWidget(self.lbl_set_model)
@@ -815,6 +854,7 @@ class MainWindow(QMainWindow):
         model_controls.addWidget(self.combo_gemini, 1)
         layout.addLayout(model_controls)
         model_controls = QHBoxLayout()
+        layout = groups["audio"]
         model_controls.addWidget(QLabel("Whisper"))
         self.combo_whisper = MinimalComboBox()
         self.combo_whisper.addItem("Точніше (small)", "small")
@@ -845,6 +885,7 @@ class MainWindow(QMainWindow):
         ))
         layout.addWidget(self.combo_speech_pace)
 
+        layout = groups["performance"]
         self.lbl_ui_performance = QLabel("ШВИДКОДІЯ ІНТЕРФЕЙСУ:")
         layout.addWidget(self.lbl_ui_performance)
         self.combo_ui_performance = MinimalComboBox()
@@ -861,7 +902,9 @@ class MainWindow(QMainWindow):
         self.performance_note = QLabel()
         self.performance_note.setWordWrap(True)
         layout.addWidget(self.performance_note)
-        self.init_appearance_controls(layout)
+        self.init_appearance_controls(groups["appearance"])
+
+        layout = groups["audio"]
 
         self.lbl_set_source = QLabel("ДЖЕРЕЛО АУДІО:")
         layout.addWidget(self.lbl_set_source)
@@ -880,16 +923,38 @@ class MainWindow(QMainWindow):
         self.combo_audio_source.currentIndexChanged.connect(self.refresh_audio_devices)
 
         self.btn_save_cfg = QPushButton("ЗБЕРЕГТИ НАЛАШТУВАННЯ")
-        self.btn_save_cfg.setFixedHeight(42)
+        self.btn_save_cfg.setFixedHeight(38)
+        self.btn_save_cfg.setMinimumWidth(104)
         self.btn_save_cfg.setObjectName("BtnPrimary")
         self.btn_save_cfg.clicked.connect(self.save_settings)
-        layout.addWidget(self.btn_save_cfg)
+        actions = QHBoxLayout()
+        self.settings_feedback = QLabel()
+        self.settings_feedback.setWordWrap(True)
+        actions.addWidget(self.settings_feedback, 1)
+        actions.addWidget(self.btn_save_cfg)
+        back = QPushButton("Повернутися")
+        back.setMinimumSize(104, 38)
+        back.clicked.connect(window.close)
+        actions.addWidget(back)
+        root.addLayout(actions)
+        layout = groups["diagnostics"]
+        self.transcript_diagnostics = QCheckBox("Виводити транскрипції в консоль")
+        layout.addWidget(self.transcript_diagnostics)
+        notice = QLabel("Може містити приватний текст. Діє до закриття програми. "
+                        "Текст виводиться локально у stderr.")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        for shortcut in ("Ctrl+Alt+R · слухати / зупинити", "Ctrl+Shift+F12 · повернути Dock"):
+            key_label = QLabel(shortcut)
+            key_label.setWordWrap(True)
+            groups["keys"].addWidget(key_label)
         self.btn_open_timing = QPushButton("ВІКНО ЗАМІРІВ")
         self.btn_open_timing.setObjectName("BtnSecondary")
         self.btn_open_timing.setFixedHeight(38)
         self.btn_open_timing.clicked.connect(self.developer_timing_signal.emit)
         layout.addWidget(self.btn_open_timing)
-        layout.addStretch()
+        for group in groups.values():
+            group.addStretch()
 
     def init_appearance_controls(self, layout):
         def choice(label, options, key, default):
@@ -934,7 +999,7 @@ class MainWindow(QMainWindow):
 
     def pick_accent(self):
         current = self.config_mgr.get("accent")
-        color = QColorDialog.getColor(QColor(current), self, "Custom Accent")
+        color = QColorDialog.getColor(QColor(current), self.settings_window, "Custom Accent")
         if color.isValid():
             self.save_appearance("accent", color.name())
 
@@ -942,8 +1007,9 @@ class MainWindow(QMainWindow):
         try:
             self.config_mgr.set(key, value)
         except OSError:
-            self.show_toast("Помилка збереження / Save error")
+            self.settings_feedback.setText("Помилка збереження / Save error")
             return
+        self.settings_feedback.clear()
         if key in {"dock_anchor", "dock_screen"}:
             if self.window_mode.docked:
                 self.window_mode.apply()
@@ -954,25 +1020,49 @@ class MainWindow(QMainWindow):
             self.apply_performance_mode(self.config_mgr.get("ui_performance_mode"))
 
     def init_about_tab(self):
-        layout = QVBoxLayout(self.tab_about)
-        layout.setSpacing(16)
+        outer = QVBoxLayout(self.tab_about)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroll)
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
+        layout.setSpacing(11)
         title = QLabel("EXAM AI")
         title.setObjectName("BrandTitle")
         layout.addWidget(title)
+        layout.addWidget(QLabel("Real-Time AI Desktop Copilot"))
         description = QLabel(
-            "Інтелектуальний настільний асистент для роботи з голосом, кодом, документами та зображеннями"
+            "EXAM AI — інтелектуальний настільний асистент для роботи з голосовими "
+            "запитаннями, програмним кодом, документами та зображеннями. Поєднує "
+            "розпізнавання мовлення, пошук за змістом і швидку генерацію відповідей "
+            "у зручному інтерфейсі Windows."
         )
         description.setWordWrap(True)
         layout.addWidget(description)
-        layout.addWidget(QLabel("Oleksandr Avramenko · Arseniy Pishniak"))
-        layout.addWidget(QLabel("Версія " + VERSION))
-        details = QLabel(
-            "Python · PySide6 · WASAPI · Google Gemini · faster-whisper · SQLite · E5 / BM25"
-            "\nPySide6: LGPLv3 / GPLv3 / комерційна ліцензія Qt. faster-whisper: MIT."
-            "\nВідомості про ліцензію EXAM AI див. у репозиторії."
-        )
-        details.setWordWrap(True)
-        layout.addWidget(details)
+        for heading, text in (
+            ("Можливості", "Голосові питання, потокові відповіді FAST / SMART, Compact Dock "
+                           "з Live Cards, пошук у конспектах, аналіз виділеної області екрана."),
+            ("Розробники", "Oleksandr Avramenko · Arseniy Pishniak"),
+            ("Технології", "Python · PySide6 · WASAPI · Google Gemini API · faster-whisper · SQLite · E5 / BM25"),
+            ("Версія", VERSION),
+            ("GitHub", REPOSITORY),
+            ("Ліцензії", "PySide6 Essentials — LGPL-3.0-only / GPL-2.0-only / GPL-3.0-only. faster-whisper — MIT."),
+            ("Подяки", "Дякуємо спільнотам відкритого ПЗ за інструменти, на яких працює EXAM AI."),
+        ):
+            card = QFrame()
+            card.setObjectName("LiveCard")
+            section = QVBoxLayout(card)
+            label = QLabel(heading)
+            label.setObjectName("HeaderLabel")
+            section.addWidget(label)
+            detail = QLabel(text)
+            detail.setWordWrap(True)
+            detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            section.addWidget(detail)
+            layout.addWidget(card)
         buttons = QHBoxLayout()
         repository = QPushButton("Відкрити репозиторій")
         repository.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(REPOSITORY)))
@@ -1153,7 +1243,7 @@ class MainWindow(QMainWindow):
 
     def apply_aurora_theme(self):
         template = """
-        #ExamAIWindow { background-color: #0a173b; border: none; }
+        #SettingsWindow, #ExamAIWindow { background-color: #0a173b; border: none; }
         #CentralContainer {
             background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                 stop:0 #192f67, stop:0.48 #102454, stop:1 #0b1b42);
@@ -1306,10 +1396,11 @@ class MainWindow(QMainWindow):
         base = THEMES.get(theme, THEMES["midnight"])[1]
         glass = blend(base, "#8594b0", (1 - tint) * .35)
         self.setStyleSheet(template.replace(
-            "#ExamAIWindow { background-color: " + base,
-            "#ExamAIWindow { background-color: " + glass
+            "#SettingsWindow, #ExamAIWindow { background-color: " + base,
+            "#SettingsWindow, #ExamAIWindow { background-color: " + glass
         ).replace("stop:0 " + blend(base, THEMES.get(theme, THEMES["midnight"])[4], .055),
                   "stop:0 " + glass, 1))
+        self.settings_window.setStyleSheet(self.styleSheet())
         foreground = "#192337" if theme == "frosted_light" else "#f4f4f4"
         for view in (self.txt_answer, self.txt_docs_result):
             view.set_formula_color(foreground)
@@ -1418,10 +1509,10 @@ class MainWindow(QMainWindow):
                 "language": self.tr.current_lang,
             })
         except OSError:
-            self.lbl_toast.setText("Помилка збереження / Save error")
+            self.settings_feedback.setText("Помилка збереження / Save error")
         else:
             self.apply_performance_mode(self.combo_ui_performance.currentData())
-            self.show_toast(self.tr.get("toast_saved"))
+            self.settings_feedback.setText(self.tr.get("toast_saved"))
 
     @Slot(float)
     def update_audio_indicator(self, rms_val: float):

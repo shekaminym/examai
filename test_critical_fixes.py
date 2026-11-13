@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QScrollArea, QApplication, QLabel
 
 from database import DatabaseManager
 from image_intent import EXPLAIN_CODE, image_intent, select_screen_instruction
@@ -276,9 +276,9 @@ class ImageAndHistoryTests(unittest.TestCase):
         ui.config_mgr.set("reduce_motion", True)
         ui.window_mode.expand_toggle()
         ui.show()
-        ui.tabs.setCurrentWidget(ui.tab_settings)
+        ui.open_settings()
         self.app.processEvents()
-        self.assertEqual(ui.settings_scroll.horizontalScrollBar().maximum(), 0)
+        self.assertEqual(ui.settings_window.findChild(QScrollArea).horizontalScrollBar().maximum(), 0)
         self.assertGreater(ui.lbl_status.width(), ui.sidebar.width())
         self.assertEqual(ui.answer_mode.currentText(), "FAST")
         for name, page in (("about", ui.tab_about), ("subscriptions", ui.tab_subscriptions)):

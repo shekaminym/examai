@@ -98,7 +98,8 @@ def test_config_and_ui_controls(tmp_path: Path):
         window.save_appearance("reduce_motion", True)
         window.window_mode.expand_toggle()
         assert window.y() == dock_top and window.height() >= 440
-        window.tabs.setCurrentWidget(window.tab_settings)
+        window.open_settings()
+        window.settings_navigation.setCurrentRow(2)
         app.processEvents()
         combo = window.combo_speech_pace
         previous = combo.currentIndex()

@@ -23,6 +23,7 @@ from privacy_qt import CapturePrivacy
 from rounded_window import configure_rounded_window
 from rag_engine import FileIndexerThread, RAGEngine
 from rag_engine import ReferenceLookupError
+from branding import brand_answer
 from question_aggregator import is_noise, QuestionAggregator, is_continuation_fragment, is_unreliable_transcript
 from image_intent import EXPLAIN_CODE, image_intent, select_screen_instruction
 from stt_engine import STTEngine
@@ -204,6 +205,7 @@ class DecodeMailbox:
 
 class AudioWorker(QThread):
     text_updated = Signal(str)
+    partial_transcript = Signal(str)
     question_finished = Signal(str)
     timed_question = Signal(str, object, str)
     voice_endpoint = Signal(float)
@@ -342,6 +344,7 @@ class AudioWorker(QThread):
             else:
                 timing.info("request_id=%s stt_partial=1", self._trace_id(utterance.utterance_id))
                 self.text_updated.emit(text)
+                self.partial_transcript.emit(text)
 
     def _publish_final(self, utterance_id: int, text: str, speech_ended_at=None) -> None:
         with self._pending_lock:
@@ -363,7 +366,9 @@ class AudioWorker(QThread):
                 timing.info("request_id=%s stt_cloud_partial_ms=%.1f",
                             self._trace_id(utterance_id), (perf_counter() - started) * 1000)
             timing.info("request_id=%s stt_partial=1", self._trace_id(speech[0]) if speech else "-")
-            self.text_updated.emit(self.corrector.correct(text))
+            corrected = self.corrector.correct(text)
+            self.text_updated.emit(corrected)
+            self.partial_transcript.emit(corrected)
 
     def _cloud_final(self, utterance_id: int, text: str) -> None:
         with self._pending_lock:
@@ -601,6 +606,7 @@ class MainController(QObject):
         self.privacy_enabled = False
         self.capture_privacy = CapturePrivacy(app, self)
         self.capture_privacy.register(self.ui)
+        self.capture_privacy.register(self.ui.settings_window)
         self.capture_privacy.state_changed.connect(self.on_privacy_state)
         self.ui.btn_ghost.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.btn_ghost.customContextMenuRequested.connect(self.privacy_menu)
@@ -732,7 +738,7 @@ class MainController(QObject):
             gemini_key=self.config.get("gemini_api_key") if language == "uk" else "",
         )
         self.audio.status.connect(self.on_audio_status)
-        self.audio.text_updated.connect(self.on_live_text)
+        self.audio.partial_transcript.connect(self.on_live_text)
         self.audio.timed_question.connect(self.handle_question)
         self.audio.voice_endpoint.connect(self._watch_voice_endpoint)
         self.audio.speech_started.connect(self._on_speech_started)
@@ -760,8 +766,13 @@ class MainController(QObject):
         if self.audio and not self.audio.isInterruptionRequested() and not self.closing:
             self.ui.lbl_status.setText("EXAM AI слухає…" if status == "Слухаю…" else status)
 
+    def log_transcript(self, stage, text, request_id=None):
+        if self.ui.transcript_diagnostics.isChecked():
+            print(f"[STT {stage}] request={request_id or '-'} text={text!r}", file=sys.stderr)
+
     @Slot(str)
     def on_live_text(self, text):
+        self.log_transcript("partial", text)
         if self.audio and not self.audio.isInterruptionRequested() and not self.closing:
             preview = self._question_aggregator.preview(text)
             if not self._selecting_screen and not self.ui.txt_question.hasFocus():
@@ -847,6 +858,8 @@ class MainController(QObject):
         self._voice_timer.stop()
         self._voice_wait_at = None
         self.ui.btn_select_screen.setEnabled(False)
+        self._restore_settings = self.ui.settings_window.isVisible()
+        self.ui.settings_window.hide()
         self.ui.hide()
         # Let Windows repaint the desktop without this window before grabbing it.
         QTimer.singleShot(180, self._show_screen_selection)
@@ -880,6 +893,9 @@ class MainController(QObject):
             self.ui.show()
             self.ui.raise_()
             self.ui.activateWindow()
+            if getattr(self, "_restore_settings", False):
+                self.ui.open_settings()
+        self._restore_settings = False
 
     @Slot()
     def _cancel_screen_selection(self):
@@ -923,6 +939,7 @@ class MainController(QObject):
 
     @Slot(str, object, str)
     def handle_question(self, question, speech_ended_at=None, request_id=None):
+        self.log_transcript("final", question, request_id)
         if speech_ended_at is not None:
             self._timing_metric("stt", (perf_counter() - speech_ended_at) * 1000)
         if speech_ended_at is not None and speech_ended_at == self._voice_wait_at:
@@ -963,6 +980,7 @@ class MainController(QObject):
             return
         if is_unreliable_transcript(question):
             timing.info("request_id=%s aggregator_rejected=unreliable", request_id)
+            self.ui.live_cards.review(question)
             self.ui.lbl_status.setText("Розпізнавання непевне. Перевірте текст і натисніть «Надіслати питання».")
             return
         normalized = " ".join(question.casefold().split())
@@ -1166,6 +1184,7 @@ class MainController(QObject):
             return
         self._history_index = index
         request_id, question, answer = self._answer_history[index]
+        answer = brand_answer(answer)
         self.ui.live_cards.ready(request_id, question, answer, history=True)
         self.ui.txt_question.setPlainText(question)
         self.ui.txt_answer.show_response(answer)
@@ -1180,6 +1199,7 @@ class MainController(QObject):
         index = max(0, min(len(self._answer_history) - 1, index + step))
         self._history_index = index
         request_id, question, answer = self._answer_history[index]
+        answer = brand_answer(answer)
         self.ui.live_cards.ready(request_id, question, answer, history=True)
         self.ui.txt_question.setPlainText(question)
         self.ui.txt_answer.show_response(answer)
@@ -1188,6 +1208,7 @@ class MainController(QObject):
     @Slot(str)
     def _answer_ready(self, answer):
         if self._accept_answer_signal():
+            answer = brand_answer(answer)
             self._answer_hint_timer.stop()
             self._current_answer_text = answer
             self._remember_answer(answer)
@@ -1211,6 +1232,7 @@ class MainController(QObject):
         if not self._accept_answer_signal():
             return
         self._answer_hint_timer.stop()
+        text = brand_answer(text)
         first = not self.answer_started
         self.answer_started = True
         self._current_answer_text = text
@@ -1290,7 +1312,7 @@ class MainController(QObject):
         if error:
             self.ui.txt_docs_result.setPlainText(error)
         else:
-            self.ui.txt_docs_result.show_response(value)
+            self.ui.txt_docs_result.show_response(brand_answer(value))
 
     def start_api(self, worker, on_result):
         self.api = worker
@@ -1392,6 +1414,7 @@ class MainController(QObject):
         if self.audio:
             self.audio.requestInterruption()
         self._cancel_active_answer()
+        self.ui.settings_window.hide()
         self.ui.centralWidget().setEnabled(False)
         self.ui.lbl_status.setText("Завершую активні операції…")
         self.finish_close()

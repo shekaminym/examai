@@ -7,10 +7,16 @@ import re
 from time import perf_counter
 
 
-LEADING_FILLER = re.compile(r"^(?:(?:е{2,}|э{2,}|м{2,}|а{2,}|ну)[\s,.…-]+)+", re.IGNORECASE)
+LEADING_FILLER = re.compile(
+    r"^(?:(?:[еэєма]{2,}|[еэєм](?=[,.…])|ем+|эм+|гм+|хм+|ну|угу|ага)"
+    r"[\s,.…-]+)+", re.IGNORECASE
+)
 TRAILING_OPEN = re.compile(r"\b(?:і|й|та|або|чи|що|який|яка|яке|як|для|не|з|із|від|и|или|что|как|для|с|and|or)\s*[,.…?]*$", re.IGNORECASE)
 QUESTION_START = re.compile(r"^(?:що|чому|навіщо|як|який|яка|яке|де|коли|хто|чи|поясни|що\s+таке|что|почему|как|где|зачем|what|why|how)\b", re.IGNORECASE)
 CONTINUATION_START = re.compile(r"^(?:і|й|та|або|и|или|а|and|or)\b", re.IGNORECASE)
+FILLER_SEQUENCE = re.compile(r"(?:[еэєма]{2,}|ем+|эм+|гм+|хм+|ну|угу|ага|тобто|то есть)", re.I)
+BARE_OPENERS = {"що таке", "что такое", "what is", "що це таке", "что это такое",
+                "поясни", "объясни", "розкажи", "расскажи", "наприклад", "например"}
 NOISE = {"е", "ээ", "ее", "мм", "м", "аа", "а", "ну", "так", "це", "эм", "угу"}
 
 
@@ -22,13 +28,16 @@ def clean_fragment(text: str) -> str:
 
 def is_noise(text: str) -> bool:
     plain = re.sub(r"[^\w]+", "", text.casefold())
-    return not plain or plain in NOISE or bool(re.fullmatch(r"[еэма]{2,}", plain))
+    repeated = re.sub(r"\b([еэєма])(?:[-–]\1)+\b", r"\1\1", text.casefold())
+    tokens = re.findall(r"[^\W_]+", re.sub(r"\bто есть\b", "тобто", repeated))
+    return (not plain or plain in NOISE or
+            bool(tokens and all(FILLER_SEQUENCE.fullmatch(token) for token in tokens)))
 
 
 def is_open_fragment(text: str) -> bool:
     clean = clean_fragment(text).rstrip(" ?!.,…").casefold()
     return (text.rstrip().endswith(("...", "…")) or bool(TRAILING_OPEN.search(clean))
-            or clean in {"що таке", "что такое", "what is"})
+            or clean in BARE_OPENERS)
 
 
 def is_unreliable_transcript(text: str) -> bool:
@@ -37,7 +46,7 @@ def is_unreliable_transcript(text: str) -> bool:
     if is_noise(clean) or is_open_fragment(clean):
         return True
     words = re.findall(r"[^\W_]+", clean, re.UNICODE)
-    if len(words) == 1 and len(words[0]) < 4 and not clean.endswith("?"):
+    if len(words) == 1 and len(words[0]) < 4 and not words[0].isupper() and not clean.endswith("?"):
         return True
     return bool(words and len(words[-1]) == 1 and words[-1].isalpha()
                 and not clean.endswith("?"))
@@ -52,9 +61,9 @@ def join_fragments(previous: str, fragment: str) -> str:
         return fragment
     left = previous.rstrip(" .,…?!")
     right = fragment.lstrip(" ,.…")
-    if right.casefold().startswith(left.casefold()) and len(right) > len(left):
+    if right.casefold() == left.casefold() or right.casefold().startswith(left.casefold() + " "):
         return right
-    if left.casefold().startswith(right.casefold()):
+    if left.casefold().startswith(right.rstrip(" .,…?!").casefold() + " "):
         return previous
     left_words = left.split()
     right_words = right.split()
@@ -112,9 +121,13 @@ class QuestionAggregator:
         if not self.pending:
             self.started_at = now
             self.request_id = request_id
-        if self.text.casefold() == cleaned.casefold():
+        merged = join_fragments(self.text, cleaned)
+        if merged == self.text:
+            if self.speech_active:
+                self.speech_active = False
+                self.deadline = min(self.deadline, now + 0.52)
             return False
-        self.text = join_fragments(self.text, cleaned)
+        self.text = merged
         self.speech_ended_at = speech_ended_at
         self.fragments += 1
         self.speech_active = False

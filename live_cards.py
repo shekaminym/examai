@@ -1,7 +1,7 @@
 """Live transcript and streaming answer within the compact dock's HWND."""
 from time import perf_counter
 
-from PySide6.QtCore import QEvent, QTimer
+from PySide6.QtCore import QAbstractAnimation, QEvent, QTimer, Qt
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
@@ -26,6 +26,9 @@ class LiveCards(QWidget):
         self.answer, self.answer_status, self.answer_text, answer_tools = self.card("Відповідь EXAM AI")
         self.send = self.button(question_tools, "Надіслати", "Надіслати питання",
                                 lambda: window.question_submitted.emit(self.question_text.toPlainText()))
+        self.edit_draft = self.button(question_tools, "Виправити", "Виправити чернетку",
+                                      self.open_draft)
+        self.edit_draft.hide()
         self.button(question_tools, "×", "Сховати картки", self.dismiss)
         self.previous = self.button(answer_tools, "‹", "Попередня відповідь",
                                     lambda: window.history_step_signal.emit(-1))
@@ -87,11 +90,29 @@ class LiveCards(QWidget):
             return
         if self.question_text.toPlainText() != text:
             self.question_text.setPlainText(text)
+        self.edit_draft.hide()
         self.send.setVisible(not self.window.auto_send.isChecked())
         self.question_status.setText(status)
         self.question_status.setToolTip("")
         self.question.show()
         self.schedule_fit()
+
+    def review(self, text):
+        self.preview(text, status="Перевірте текст")
+        self.send.show()
+        self.edit_draft.show()
+
+    def open_draft(self):
+        if self.window.window_mode.collapsed:
+            self.window.window_mode.expand_toggle()
+        self.window.tabs.setCurrentWidget(self.window.tab_live)
+        editor = self.window.txt_question
+        editor.setPlainText(self.question_text.toPlainText())
+        animation = self.window.window_mode.animation
+        if animation.state() == QAbstractAnimation.State.Running:
+            animation.finished.connect(editor.setFocus, Qt.ConnectionType.SingleShotConnection)
+        else:
+            editor.setFocus()
 
     def stop_listening(self):
         if self.request_id is None and self.question_status.text() == "Слухає…":

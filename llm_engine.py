@@ -5,6 +5,7 @@ from time import perf_counter
 import httpx
 from google import genai
 from google.genai import errors, types
+from branding import ANSWER_PREFIX
 from image_intent import AUTO_IMAGE, EXPLAIN_CODE
 
 
@@ -35,7 +36,7 @@ def collect_text(chunks, on_text, prefix="", *, request_id="-"):
         timing.info('request_id=%s llm stream_error=%s http=%s', request_id,
                     type(exc).__name__, getattr(exc, 'code', None))
         if "".join(parts).strip():
-            message = ("Gemini не продовжив потік вчасно. Відповідь неповна."
+            message = ("Потік відповіді EXAM AI перервався. Відповідь неповна."
                        if isinstance(exc, httpx.ReadTimeout)
                        else "З’єднання перервано. Відповідь неповна.")
             raise PartialGenerationError(message) from None
@@ -269,7 +270,7 @@ class LLMEngine:
         if not answer or not answer.strip():
             raise GenerationError("Gemini повернув порожню відповідь.")
         self.used_model = model
-        return f"⚡ [Gemini]\n{answer.strip()}"
+        return ANSWER_PREFIX + answer.strip()
 
     def request_gemini(self, model, instruction, prompt, budget, on_text=None, *,
                        deadline=None, basic=False, request_id="-"):
@@ -338,7 +339,7 @@ class LLMEngine:
                                     (perf_counter() - sent_at) * 1000)
                     yield text
 
-            answer = collect_text(deltas(), on_text, "⚡ [Gemini]\n", request_id=request_id)
+            answer = collect_text(deltas(), on_text, ANSWER_PREFIX, request_id=request_id)
             if answer.strip() and not finished:
                 raise PartialGenerationError("Потік Gemini завершився без підтвердження.")
             return answer
