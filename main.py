@@ -23,7 +23,7 @@ from privacy_qt import CapturePrivacy
 from rounded_window import configure_rounded_window
 from rag_engine import FileIndexerThread, RAGEngine
 from rag_engine import ReferenceLookupError
-from question_aggregator import QuestionAggregator, is_continuation_fragment, is_unreliable_transcript
+from question_aggregator import is_noise, QuestionAggregator, is_continuation_fragment, is_unreliable_transcript
 from image_intent import EXPLAIN_CODE, image_intent, select_screen_instruction
 from stt_engine import STTEngine
 from speech_correction import SpeechCorrector, has_non_ukrainian_cyrillic
@@ -766,6 +766,10 @@ class MainController(QObject):
             preview = self._question_aggregator.preview(text)
             if not self._selecting_screen and not self.ui.txt_question.hasFocus():
                 self.ui.txt_question.setPlainText(preview)
+                if not is_noise(text):
+                    cards = self.ui.live_cards
+                    cards.preview(preview, new=cards.request_id is not None
+                                  and not self._question_aggregator.pending)
 
     @Slot(float)
     def _on_speech_started(self, started_at):
@@ -798,6 +802,7 @@ class MainController(QObject):
                     (perf_counter() - item.speech_ended_at) * 1000
                     if item.speech_ended_at is not None else -1)
         self.ui.txt_question.setPlainText(item.text)
+        self.ui.live_cards.preview(item.text, status="")
         self._submit_auto_question(item.text, item.speech_ended_at, item.request_id)
 
     @Slot()
@@ -808,6 +813,7 @@ class MainController(QObject):
         self.meter.stop()
         self.update_meter()
         self.ui.set_listening(False)
+        self.ui.live_cards.stop_listening()
         if stopped and not self.closing:
             self.ui.lbl_status.setText("Зупинено")
         self.finish_close()
@@ -923,8 +929,13 @@ class MainController(QObject):
             self._voice_timer.stop()
             self._voice_wait_at = None
         if (not self.audio or self.audio.isInterruptionRequested()
-                or self._selecting_screen or not self.ui.auto_send.isChecked()
-                or self.ui.txt_question.hasFocus()):
+                or self._selecting_screen or self.ui.txt_question.hasFocus()):
+            return
+        if not self.ui.auto_send.isChecked():
+            if not is_noise(question):
+                self.ui.txt_question.setPlainText(question)
+                cards = self.ui.live_cards
+                cards.preview(question, new=cards.request_id is not None, status="")
             return
         recent = self._recent_voice_item
         if (recent and not self._question_aggregator.pending
@@ -938,6 +949,9 @@ class MainController(QObject):
         accepted = self._question_aggregator.add_final(question, speech_ended_at, request_id or "")
         if accepted:
             self.ui.txt_question.setPlainText(self._question_aggregator.text)
+            cards = self.ui.live_cards
+            cards.preview(self._question_aggregator.text,
+                          new=cards.request_id is not None and self._question_aggregator.fragments == 1)
         if self._question_aggregator.pending:
             timing.info("request_id=%s aggregator_waiting=1 fragments=%d",
                         self._question_aggregator.request_id, self._question_aggregator.fragments)
@@ -1002,6 +1016,7 @@ class MainController(QObject):
         self._dev_request_started_at = submitted
         self._answer_request_id = request_id
         self._current_question = question
+        self.ui.live_cards.begin(request_id, question)
         self._current_answer_text = ""
         self._history_index = -1
         self._sync_history_controls(busy=True)
@@ -1150,7 +1165,8 @@ class MainController(QObject):
         if self.api is not None or not 0 <= index < len(self._answer_history):
             return
         self._history_index = index
-        _, question, answer = self._answer_history[index]
+        request_id, question, answer = self._answer_history[index]
+        self.ui.live_cards.ready(request_id, question, answer, history=True)
         self.ui.txt_question.setPlainText(question)
         self.ui.txt_answer.show_response(answer)
         self.ui.tabs.setCurrentWidget(self.ui.tab_live)
@@ -1163,7 +1179,8 @@ class MainController(QObject):
         index = self._history_index if self._history_index >= 0 else len(self._answer_history)
         index = max(0, min(len(self._answer_history) - 1, index + step))
         self._history_index = index
-        _, question, answer = self._answer_history[index]
+        request_id, question, answer = self._answer_history[index]
+        self.ui.live_cards.ready(request_id, question, answer, history=True)
         self.ui.txt_question.setPlainText(question)
         self.ui.txt_answer.show_response(answer)
         self._sync_history_controls()
@@ -1174,6 +1191,7 @@ class MainController(QObject):
             self._answer_hint_timer.stop()
             self._current_answer_text = answer
             self._remember_answer(answer)
+            self.ui.live_cards.ready(self._answer_request_id, self._current_question, answer)
             self.ui.txt_answer.show_response(answer)
             now = perf_counter()
             if not self.answer_started:
@@ -1196,6 +1214,7 @@ class MainController(QObject):
         first = not self.answer_started
         self.answer_started = True
         self._current_answer_text = text
+        self.ui.live_cards.progress(self._answer_request_id, text, emitted)
         self.ui.txt_answer.show_streaming_response(text)
         if first:
             now = perf_counter()
@@ -1214,6 +1233,7 @@ class MainController(QObject):
             return
         self._answer_hint_timer.stop()
         if error:
+            self.ui.live_cards.error(self._answer_request_id, error)
             if self.answer_started:
                 self._remember_answer(self._current_answer_text)
                 self.ui.lbl_status.setText(error)
@@ -1226,6 +1246,7 @@ class MainController(QObject):
 
     @Slot()
     def on_clear_all(self):
+        self.ui.live_cards.clear()
         self._recent_voice_item = None
         self._question_timer.stop()
         self._question_aggregator.clear()

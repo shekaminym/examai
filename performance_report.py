@@ -8,7 +8,7 @@ from statistics import median, quantiles
 METRICS = (
     "vad_first_block_ms", "stt_final_from_speech_end_ms", "decode_ms", "wait_ms",
     "rag_ms", "llm_ttft_ms",
-    "llm_first_text_ms", "first_ui_text_ms", "llm_complete_ms",
+    "dock_first_paint_ms", "llm_first_text_ms", "first_ui_text_ms", "llm_complete_ms",
     "end_to_end_complete_ms", "gui_lag_ms",
     "expand_ms", "animation_fps", "cpu_pct", "rss_mib",
 )

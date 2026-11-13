@@ -13,8 +13,9 @@ from translator import Translator
 from appearance import THEMES, blend, set_windows_backdrop, stylesheet
 from performance import LEGACY, PROFILES, PerformanceMonitor, RuntimePolicy, detect_hardware, recommend
 from window_mode import WindowMode
+from live_cards import LiveCards
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 REPOSITORY = "https://github.com/shekaminym/examai"
 
 from rounded_window import configure_rounded_window
@@ -283,6 +284,9 @@ class MainWindow(QMainWindow):
         self.performance_monitor = PerformanceMonitor(self, self.performance_policy, self.on_performance_sample)
         app = QGuiApplication.instance()
         app.screenRemoved.connect(self.on_screen_removed)
+        app.screenAdded.connect(self.watch_screen_geometry)
+        for screen in app.screens():
+            self.watch_screen_geometry(screen)
         self.refresh_audio_devices()
         self.refresh_documents_list()
         self.retranslate_ui()
@@ -404,9 +408,12 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(btn_min)
         top_bar.addWidget(btn_close)
         self.header_widget = QWidget()
+        self.header_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.header_widget.setLayout(top_bar)
         top_bar.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(self.header_widget)
+        self.live_cards = LiveCards(self)
+        main_layout.addWidget(self.live_cards)
 
         # Navigation and pages
         body = QHBoxLayout()
@@ -977,6 +984,13 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         layout.addStretch()
 
+    def watch_screen_geometry(self, screen):
+        screen.availableGeometryChanged.connect(self.on_screen_geometry_changed)
+
+    def on_screen_geometry_changed(self, _area):
+        if self.window_mode.docked:
+            self.window_mode.apply()
+
     def on_screen_removed(self, _screen):
         if self.window_mode.docked:
             QTimer.singleShot(0, self.window_mode.apply)
@@ -1153,6 +1167,9 @@ class MainWindow(QMainWindow):
                 stop:0 #5d70e8, stop:1 #9b62ea);
             border: 1px solid #a1acff; border-radius: 13px;
         }
+        #LiveCard { background-color: #203a72; border: 1px solid #526fa8; border-radius: 11px; }
+        #LiveCardText { background-color: #1b3268; color: #f0f5ff; border: none; border-radius: 6px; }
+        #LiveCard QPushButton { min-height: 20px; padding: 0 6px; border-radius: 7px; }
         #CompactHeader QPushButton { padding: 0 9px; }
         #LangContainer, #HeaderPill, #HeaderMode {
             background-color: #263a70; border: 1px solid #526b9e;
@@ -1309,8 +1326,11 @@ class MainWindow(QMainWindow):
                                                       max(0, label.contentsRect().width() - 12)))
 
     def eventFilter(self, watched, event):
-        if watched is getattr(self, "compact_status", None) and event.type() == QEvent.Type.Resize:
-            self.refresh_compact_status()
+        if watched is getattr(self, "compact_status", None):
+            if event.type() == QEvent.Type.Resize:
+                self.refresh_compact_status()
+            elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self.live_cards.reopen()
         if event.type() == QEvent.Type.EnabledChange and hasattr(self, "btn_select_screen"):
             if watched is self.btn_toggle_listen:
                 self.compact_listen.setEnabled(watched.isEnabled())
@@ -1347,6 +1367,9 @@ class MainWindow(QMainWindow):
         self.clear_all_signal.emit()
 
     def set_history_position(self, position, total, *, busy=False):
+        self.live_cards.history_total = total
+        self.live_cards.previous.setEnabled(not busy and total > 0 and position != 1)
+        self.live_cards.latest.setEnabled(not busy and total > 0 and position != total)
         self.lbl_history_position.setText(f"{position}/{total}")
         self.btn_history_prev.setEnabled(not busy and (position > 1 or (position == 0 and total > 0)))
         self.btn_history_next.setEnabled(not busy and 0 < position < total)
