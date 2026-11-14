@@ -92,11 +92,7 @@ class LLMEngine:
         prompt = f"Запитання:\n{question}"
         if context.strip():
             prompt += f"\n\nДовідкові уривки з конспектів:\n{context}"
-        instruction = (
-            "Відповідай українською. Спочатку дай висновок, далі поясни аргументи, формули і кроки. "
-            if mode == "smart" else
-            "Почни з відповіді українською. Дай 1–2 речення, до 40 слів. "
-        )
+        instruction = "Почни з відповіді українською. Дай 1–2 речення, до 40 слів. "
         timing.info("request_id=%s prompt_ms=%.1f context_chars=%d",
                     request_id, (perf_counter() - build_started) * 1000, len(context))
         return self._generate(
@@ -114,7 +110,7 @@ class LLMEngine:
             "і не підміняй запит власним тлумаченням. Не починай відповідь із "
             "«Виправлення запиту» або «ймовірно, мається на увазі». Якщо зміст "
             "неможливо визначити, коротко попроси уточнити. Не вигадуй факти.",
-            prompt, 600 if mode == "smart" else 140, on_text=on_text, deadline=deadline,
+            prompt, 140, on_text=on_text, deadline=deadline,
             request_id=request_id,
         )
 
@@ -130,11 +126,7 @@ class LLMEngine:
                               user_instruction="", context="", intent=AUTO_IMAGE):
         if mime_type not in {"image/png", "image/jpeg"} or not image_bytes or len(image_bytes) > 12 * 1024 * 1024:
             raise GenerationError("Зображення не вдалося підготувати для Gemini.")
-        instruction = (
-            "Відповідай українською. Спочатку результат, потім чіткі кроки розв’язання. "
-            if mode == "smart" else
-            "Відповідай українською: спочатку результат, далі лише необхідні кроки. "
-        )
+        instruction = "Відповідай українською: спочатку результат, далі лише необхідні кроки. "
         instruction += (
             "Уважно прочитай друкований і рукописний текст, англійські слова, математичні "
             "знаки, індекси, степені, дроби та рівняння. Розв’яжи завдання із зображення. "
@@ -165,7 +157,7 @@ class LLMEngine:
             types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
         ]
         return self._generate(instruction, contents,
-                              900 if mode == "smart" else 420 if intent == EXPLAIN_CODE else 260,
+                              420 if intent == EXPLAIN_CODE else 260,
                               on_text=on_text, deadline=deadline, request_id=request_id)
 
     def _generate(self, instruction, prompt, budget, *, on_text=None, deadline=None, request_id="-"):

@@ -39,12 +39,15 @@ class CapturePrivacy(QObject):
         self._settle_timer.timeout.connect(self._refresh)
         app.installEventFilter(self)
 
-    def register(self, window: QWidget) -> None:
-        """Call after window construction and before its first show()."""
+    def register(self, window: QWidget, *, require_hidden=True) -> None:
+        """Track a top-level window; optional dialogs are checked when shown."""
         self._retired.discard(window)
         self._track(window)
-        self._required.add(window)
-        if self.requested:
+        if require_hidden:
+            self._required.add(window)
+        else:
+            self._required.discard(window)
+        if self.requested and (require_hidden or window.isVisible()):
             self._apply_one(window)
             self._publish()
 
@@ -67,7 +70,7 @@ class CapturePrivacy(QObject):
             if window.windowHandle() is not None:
                 self._track(window)
         for window in list(self._windows):
-            if isValid(window):
+            if isValid(window) and (window in self._required or window.isVisible()):
                 self._apply_one(window)
         self._publish()
         self._settle_timer.start()
@@ -176,7 +179,11 @@ class CapturePrivacy(QObject):
             return False
         # WinIdChange also fires during teardown; do not recreate a destroyed
         # native window just to protect it. Show will apply before painting.
-        if event_type == QEvent.Type.Show or watched.windowHandle() is not None:
+        if event_type == QEvent.Type.WinIdChange:
+            # Qt can emit this while the old HWND has already gone and the new
+            # one is not ready. Verify only after the native transition ends.
+            self._results.pop(watched, None)
+        elif event_type == QEvent.Type.Show or watched.windowHandle() is not None:
             self._apply_one(watched)
         else:
             self._results.pop(watched, None)

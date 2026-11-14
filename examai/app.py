@@ -8,12 +8,13 @@ from time import perf_counter
 from uuid import uuid4
 
 import keyboard
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt, QPropertyAnimation, QEasingCurve
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QGraphicsOpacityEffect, QMenu
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QMenu, QMessageBox
 from PySide6.QtGui import QPainter, QColor, QPen
 
 from examai.audio.audio_capturer import AudioCapturer, audio_log
 from examai.audio.audio_vad import NeuralVAD, SpeechSegmenter, Utterance
+from examai.beta import CloudEngine
 from examai.config import ConfigManager
 from examai.ui.developer_timing import DeveloperTimingWindow
 from examai.database import DatabaseManager
@@ -40,13 +41,14 @@ MAX_SESSION_ANSWERS = 30
 
 
 class ModernSpinner(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, animated=True):
         super().__init__(parent)
-        self.setFixedSize(50, 50)
+        self.setFixedSize(38, 38)
         self._angle = 0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.rotate)
-        self.timer.start(15)
+        if animated:
+            self.timer.start(30)
 
     def rotate(self):
         self._angle = (self._angle + 6) % 360
@@ -61,19 +63,19 @@ class ModernSpinner(QWidget):
         pen.setCapStyle(Qt.RoundCap)
         painter.setPen(pen)
 
-        painter.drawArc(5, 5, 40, 40, -self._angle * 16, 140 * 16)
+        painter.drawArc(5, 5, 28, 28, -self._angle * 16, 140 * 16)
 
 
 class SplashScreen(QWidget):
     finished = Signal()
 
-    def __init__(self, main_window):
+    def __init__(self, main_window, *, reduced_motion=False):
         super().__init__()
         self.main_window = main_window
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SplashScreen)
         self.setStyleSheet("background-color: #101f47;")
-        self.setFixedSize(420, 230)
+        self.setFixedSize(360, 185)
         configure_rounded_window(self, radius=22, opacity=0.90, color="#101f47")
 
         layout = QVBoxLayout(self)
@@ -103,50 +105,20 @@ class SplashScreen(QWidget):
         """)
         self.title_label.setAlignment(Qt.AlignCenter)
 
-        self.slogan_label = QLabel("Слухаю • розумію • відповідаю", self.bg_frame)
-        self.slogan_label.setStyleSheet("""
-            color: #b8caf5;
-            font-family: 'Segoe UI';
-            font-size: 13px;
-            background: transparent;
-            border: none;
-        """)
-        self.slogan_label.setAlignment(Qt.AlignCenter)
-
-        self.spinner = ModernSpinner(self.bg_frame)
+        self.spinner = ModernSpinner(self.bg_frame, animated=not reduced_motion)
 
         bg_layout.addStretch()
         bg_layout.addWidget(self.title_label)
-        bg_layout.addWidget(self.slogan_label)
-        bg_layout.addSpacing(20)
+        bg_layout.addSpacing(16)
         bg_layout.addWidget(self.spinner, alignment=Qt.AlignCenter)
         bg_layout.addStretch()
 
         layout.addWidget(self.bg_frame)
 
-        # Keep the rounded translucent native surface stable and fade content.
-        self.fade_effect = QGraphicsOpacityEffect(self.bg_frame)
-        self.bg_frame.setGraphicsEffect(self.fade_effect)
-        self.fade_effect.setOpacity(0.0)
-
-        self.fade_in_anim = QPropertyAnimation(self.fade_effect, b"opacity")
-        self.fade_in_anim.setDuration(240)
-        self.fade_in_anim.setStartValue(0.0)
-        self.fade_in_anim.setEndValue(1.0)
-        self.fade_in_anim.setEasingCurve(QEasingCurve.InOutQuad)
-
-        self.fade_out_anim = QPropertyAnimation(self.fade_effect, b"opacity")
-        self.fade_out_anim.setDuration(260)
-        self.fade_out_anim.setStartValue(1.0)
-        self.fade_out_anim.setEndValue(0.0)
-        self.fade_out_anim.setEasingCurve(QEasingCurve.InOutQuad)
-
-        self.fade_out_anim.finished.connect(self.finish_splash)
-
     def start_splash(self):
         self.show()
-        self.fade_in_anim.start()
-        QTimer.singleShot(850, self.fade_out_anim.start)
+        # The UI is already initialized. Do not hold it back for an animation.
+        QTimer.singleShot(0, self.finish_splash)
 
     def finish_splash(self):
         # Stop tracking before close destroys the splash's native HWND.
@@ -605,7 +577,7 @@ class MainController(QObject):
         self.privacy_enabled = False
         self.capture_privacy = CapturePrivacy(app, self)
         self.capture_privacy.register(self.ui)
-        self.capture_privacy.register(self.ui.settings_window)
+        self.capture_privacy.register(self.ui.settings_window, require_hidden=False)
         self.capture_privacy.state_changed.connect(self.on_privacy_state)
         self.ui.btn_ghost.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.ui.btn_ghost.customContextMenuRequested.connect(self.privacy_menu)
@@ -731,6 +703,63 @@ class MainController(QObject):
 
     @Slot()
     def start_listening(self):
+        if self.closing or self.audio is not None or self._lease_worker is not None:
+            return
+        client = self.ui.account_panel.client
+        if client.token and not self.config.get("gemini_api_key"):
+            self.ui.btn_toggle_listen.setEnabled(False)
+            self._run_listen_lease(client, "acquire")
+            return
+        self._start_audio()
+
+    def _run_listen_lease(self, client, action):
+        from examai.ui.account import NetworkJob
+        def perform():
+            if action == "renew":
+                if not client.request("POST", "/activity/start")["granted"]:
+                    raise GenerationError("Beta access expired.")
+            else:
+                getattr(client, action)()
+        job = self._lease_worker = NetworkJob(perform, self)
+        def result(_value, error):
+            if self.closing:
+                if action == "acquire" and not error:
+                    self._cloud_listening = client
+                return
+            if action == "acquire":
+                self.ui.btn_toggle_listen.setEnabled(True)
+            if error:
+                self.ui.lbl_status.setText(error)
+                if action == "renew" and self.audio:
+                    self.audio.requestInterruption()
+                return
+            if action == "acquire":
+                self._cloud_listening = client
+                self._lease_timer.start()
+                self._start_audio()
+        job.result.connect(result, Qt.ConnectionType.QueuedConnection)
+        job.finished.connect(self._lease_done)
+        job.finished.connect(job.deleteLater)
+        job.start()
+
+    @Slot()
+    def _lease_done(self):
+        self._lease_worker = None
+        if self.audio is None and self._cloud_listening:
+            self._release_listening()
+        self.finish_close()
+
+    def _renew_listening(self):
+        if self.audio and self._cloud_listening and self._lease_worker is None:
+            self._run_listen_lease(self._cloud_listening, "renew")
+
+    def _release_listening(self):
+        self._lease_timer.stop()
+        if self._cloud_listening and self._lease_worker is None:
+            client, self._cloud_listening = self._cloud_listening, None
+            self._run_listen_lease(client, "release")
+
+    def _start_audio(self):
         if self.closing or self.audio is not None:
             return
         self._question_timer.stop()
@@ -845,6 +874,10 @@ class MainController(QObject):
         stopped = self.audio.isInterruptionRequested()
         self.audio.deleteLater()
         self.audio = None
+        self._cloud_listening = None
+        self._lease_worker = None
+        self._lease_timer = QTimer(self, interval=5000)
+        self._lease_timer.timeout.connect(self._renew_listening)
         self.meter.stop()
         self.update_meter()
         self.ui.set_listening(False)
@@ -855,9 +888,10 @@ class MainController(QObject):
 
     def get_llm(self, mode="fast"):
         model = self.config.get("gemini_model")
-        if mode == "smart" and model in {"gemini-3.5-flash-lite", "gemini-3.1-flash-lite"}:
-            model = "gemini-3.5-flash"
         key = self.config.get("gemini_api_key")
+        panel = getattr(self.ui, "account_panel", None)
+        if not key and panel is not None and panel.client.token:
+            return CloudEngine(panel.client)
         if key != self.llm_settings:
             if self.llm is not None:
                 self.llm.close()
@@ -870,7 +904,7 @@ class MainController(QObject):
     def start_screen_selection(self):
         if self.closing or self._selecting_screen:
             return
-        if not self.config.get("gemini_api_key"):
+        if not self.config.get("gemini_api_key") and not self.ui.account_panel.client.token:
             self.ui.lbl_status.setText("Додайте ключ Gemini у налаштуваннях.")
             return
         self._pending_screen_instruction = select_screen_instruction(
@@ -1036,7 +1070,7 @@ class MainController(QObject):
             return
         submitted = perf_counter()
         request_id = request_id or uuid4().hex[:12]
-        mode = mode or self.config.get("answer_mode", "fast")
+        mode = "fast"
         enqueued_at = submitted if enqueued_at is None else enqueued_at
         has_image = image is not None or image_bytes is not None
         if self.api is not None:
@@ -1090,7 +1124,7 @@ class MainController(QObject):
             if not has_image:
                 try:
                     context = self.rag.retrieve_relevant_context(
-                        question, limit=4 if mode == 'smart' else 2,
+                        question, limit=2,
                         source_hint=retrieval_hint, request_id=request_id,
                     )
                 except ReferenceLookupError as exc:
@@ -1449,11 +1483,12 @@ class MainController(QObject):
 
     def finish_close(self):
         if self.closing and not self._retired_answers and all(
-                worker is None for worker in (self.audio, self.api, self.docs)):
+                worker is None for worker in (self.audio, self.api, self.docs, self._lease_worker)):
             self.app.quit()
 
     @Slot()
     def shutdown(self):
+        self.ui.account_panel.stop_jobs()
         if self.timing_window is not None:
             self.capture_privacy.unregister(self.timing_window)
             self.timing_window.close()
@@ -1475,7 +1510,7 @@ class MainController(QObject):
             self.llm.close()
 
     def run(self):
-        self.splash = SplashScreen(self.ui)
+        self.splash = SplashScreen(self.ui, reduced_motion=self.ui.motion.level == "off")
         self.capture_privacy.register(self.splash)
         self.splash.finished.connect(lambda: self.capture_privacy.unregister(self.splash))
         if self.config.get("privacy_mode"):
@@ -1495,6 +1530,23 @@ def main():
     if os.environ.get("PHANTOM_AUDIO_DIAGNOSTICS") == "1":
         audio_log.addHandler(logging.StreamHandler())
         audio_log.setLevel(logging.INFO)
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ExamAI.Desktop")
     app = QApplication(sys.argv)
-    controller = MainController(app)
-    return controller.run()
+    from pathlib import Path
+    from PySide6.QtGui import QIcon
+    app.setWindowIcon(QIcon(str(Path(__file__).with_name("assets") / "examai.ico")))
+    if "--smoke-test" in sys.argv:
+        QTimer.singleShot(1800, app.quit)
+    try:
+        controller = MainController(app)
+        return controller.run()
+    except Exception as exc:
+        logging.getLogger("examai.startup").exception("startup failed")
+        QMessageBox.critical(
+            None, "EXAM AI · помилка запуску",
+            f"EXAM AI не вдалося запустити. Перевірте встановлені залежності та налаштування.\n\n"
+            f"{type(exc).__name__}: {exc}",
+        )
+        return 1

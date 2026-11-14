@@ -126,7 +126,6 @@ class WindowMode(QObject):
             self.finish_layout()
             return
         area = screen.availableGeometry()
-        w.answer_mode.setMaximumWidth(82 if self.collapsed and area.width() < 850 else 16777215)
         target = dock_geometry(area, self.config.get("dock_anchor"), 940, 54 if self.collapsed else 620)
         if not self.docked:
             saved = self.config.get("floating_geometry", [])

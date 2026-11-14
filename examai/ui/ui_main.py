@@ -3,7 +3,8 @@ import math
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
     QPushButton, QComboBox, QTabWidget, QFileDialog, QProgressBar, QLineEdit,
-    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QDialog, QStackedWidget, QApplication, QColorDialog, QSlider
+    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QDialog, QStackedWidget, QApplication, QColorDialog, QSlider,
+    QStyledItemDelegate, QStyle, QStyleOptionViewItem
 )
 from PySide6.QtCore import QEvent, Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSize
 from PySide6.QtGui import QFont, QGuiApplication, QPainter, QColor, QPen, QPixmap, QIcon, QLinearGradient, QPainterPath
@@ -14,6 +15,10 @@ from examai.ui.appearance import THEMES, blend, set_windows_backdrop, stylesheet
 from examai.performance import LEGACY, PROFILES, PerformanceMonitor, RuntimePolicy, detect_hardware, recommend
 from examai.ui.window_mode import WindowMode
 from examai.ui.live_cards import LiveCards
+from examai.ui.motion import MotionManager
+from examai.ui.account import AccountPanel
+from examai.windows.credentials import protect
+from examai.ui.subscriptions import SubscriptionsPage
 
 from examai.branding import VERSION
 
@@ -62,6 +67,23 @@ def navigation_icon(name):
         painter.drawLine(11, 11, 15, 13)
     painter.end()
     return QIcon(pixmap)
+
+
+class SettingsNavigationDelegate(QStyledItemDelegate):
+    """Replace the platform's dotted item focus rect with a themed outline."""
+
+    def paint(self, painter, option, index):
+        focused = bool(option.state & QStyle.StateFlag.State_HasFocus)
+        clean = QStyleOptionViewItem(option)
+        clean.state &= ~QStyle.StateFlag.State_HasFocus
+        super().paint(painter, clean, index)
+        if focused:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#9cbaff"), 1.5))
+            painter.drawRoundedRect(option.rect.adjusted(2, 2, -3, -3), 6, 6)
+            painter.restore()
 
 
 class MinimalComboBox(QComboBox):
@@ -269,6 +291,8 @@ class MainWindow(QMainWindow):
         self.hardware = detect_hardware(QGuiApplication.primaryScreen())
         self.performance_policy = RuntimePolicy(recommend(self.hardware))
         self.profile = self.performance_policy.profile
+        self.motion = MotionManager(QApplication.instance())
+        self.destroyed.connect(self.motion.restore)
         self.setWindowTitle("EXAM AI")
         self.setObjectName("ExamAIWindow")
         self.resize(940, 620)
@@ -284,6 +308,8 @@ class MainWindow(QMainWindow):
         self.apply_aurora_theme()
         self.apply_performance_mode(self.config_mgr.get("ui_performance_mode"))
         self.window_mode = WindowMode(self)
+        self.motion.register(self.fade_anim, self.btn_ghost.animation, self.window_mode.animation,
+                             self.window_mode.card_animation)
         self.btn_pin.clicked.connect(self.window_mode.toggle)
         self.btn_island.clicked.connect(self.window_mode.expand_toggle)
         self.performance_monitor = PerformanceMonitor(self, self.performance_policy, self.on_performance_sample)
@@ -366,12 +392,6 @@ class MainWindow(QMainWindow):
         self.lbl_ai_provider.setObjectName("HeaderPill")
         self.lbl_ai_provider.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_ai_provider.setFixedHeight(32)
-        self.answer_mode = MinimalComboBox()
-        self.answer_mode.setObjectName("HeaderMode")
-        self.answer_mode.addItem("FAST", "fast")
-        self.answer_mode.addItem("SMART", "smart")
-        self.answer_mode.setCurrentIndex(1 if self.config_mgr.get("answer_mode") == "smart" else 0)
-        self.answer_mode.currentIndexChanged.connect(self.save_answer_mode)
 
         self.expanded_header_widgets = (self.lbl_brand_icon, lang_container, self.btn_ghost,
                                         self.btn_ghost_lock, btn_min, btn_close)
@@ -401,7 +421,6 @@ class MainWindow(QMainWindow):
         self.compact_settings.clicked.connect(self.open_settings)
         self.compact_widgets = (self.compact_status, self.compact_listen, self.compact_screen,
                                 self.compact_settings)
-        top_bar.addWidget(self.answer_mode)
         for button in (self.compact_listen, self.compact_screen):
             button.setMinimumHeight(32)
             top_bar.addWidget(button)
@@ -476,7 +495,7 @@ class MainWindow(QMainWindow):
         self.fade_anim.setDuration(220)
         self.fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.fade_anim.finished.connect(lambda: self.fade_effect.setEnabled(False))
-        self.tabs.currentChanged.connect(self.animate_tab_change)
+        self.tabs.currentChanged.connect(lambda index: self.animate_tab_change(index))
 
         self.tab_live = QWidget()
         self.init_live_tab()
@@ -484,6 +503,7 @@ class MainWindow(QMainWindow):
         self.btn_select_screen.installEventFilter(self)
         self.tabs.addTab(self.tab_live, "AI")
 
+        self.account_panel = AccountPanel(self.config_mgr)
         self.init_settings_window()
         self.nav_buttons["settings"].clicked.connect(self.open_settings)
 
@@ -506,7 +526,7 @@ class MainWindow(QMainWindow):
         self.tab_about = QWidget()
         self.init_about_tab()
         self.tabs.addTab(self.tab_about, "Про нас")
-        self.tab_subscriptions = QWidget()
+        self.tab_subscriptions = SubscriptionsPage(self.account_panel)
         self.tabs.addTab(self.tab_subscriptions, "Підписки")
         for name, page in (("live", self.tab_live), ("docs", self.tab_docs),
                            ("history", self.tab_history),
@@ -570,6 +590,7 @@ class MainWindow(QMainWindow):
             self.toast_anim_out.setDuration(160)
             self.toast_anim_out.setEndValue(0.0)
             self.toast_anim_out.finished.connect(self.lbl_toast.hide)
+            self.motion.register(self.toast_anim_in, self.toast_anim_out)
             self._toast_timer = QTimer(self)
             self._toast_timer.setSingleShot(True)
             self._toast_timer.timeout.connect(self.hide_toast)
@@ -607,6 +628,7 @@ class MainWindow(QMainWindow):
         self.toast_anim_out.start()
 
     def retranslate_ui(self):
+        self.tab_subscriptions.set_language(self.tr.current_lang)
         self.retranslate_panels()
         self.live_cards.retranslate()
         self.compact_settings.setToolTip(self.tr.get("tab_settings"))
@@ -846,6 +868,8 @@ class MainWindow(QMainWindow):
         self.settings_navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.settings_navigation.setWordWrap(True)
         self.settings_navigation.setObjectName("SettingsNavigation")
+        self.settings_navigation.setItemDelegate(SettingsNavigationDelegate(self.settings_navigation))
+        self.settings_navigation.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         body.addWidget(self.settings_navigation)
         pages = QStackedWidget()
         body.addWidget(pages, 1)
@@ -889,6 +913,12 @@ class MainWindow(QMainWindow):
 
         self.save_history = QCheckBox("Зберігати питання та відповіді локально")
         self.save_history.setChecked(self.config_mgr.get("save_answer_history", False))
+        remember_key = self.remember_gemini_key = QCheckBox("Remember Gemini key securely on Windows")
+        remember_key.setChecked(bool(self.config_mgr.get("protected_gemini_key")))
+        groups["models"].addWidget(remember_key)
+        groups["diagnostics"].addWidget(self.account_panel.reports_panel())
+        groups["diagnostics"].addWidget(self.account_panel.updates_panel())
+        groups["general"].addWidget(self.account_panel)
         groups["general"].addWidget(self.save_history)
         auto_send = self.settings_auto_send = QCheckBox("Автоматично надсилати голосові питання")
         auto_send.setChecked(self.auto_send.isChecked())
@@ -1084,11 +1114,25 @@ class MainWindow(QMainWindow):
         tip.setWordWrap(True)
         layout.addWidget(tip)
         layout.addWidget(QLabel("Інтенсивність тонування"))
-        tint = QSlider(Qt.Orientation.Horizontal)
+        tint = self.tint_slider = QSlider(Qt.Orientation.Horizontal)
         tint.setRange(75, 100)
         tint.setValue(round(100 * self.config_mgr.get("window_opacity", .98)))
-        tint.valueChanged.connect(lambda value: self.save_appearance("window_opacity", value / 100))
-        layout.addWidget(tint)
+        self._tint_commit_timer = QTimer(self)
+        self._tint_commit_timer.setSingleShot(True)
+        self._tint_commit_timer.setInterval(180)
+        self._tint_commit_timer.timeout.connect(self.commit_tint)
+        tint.valueChanged.connect(self.preview_tint)
+        tint.sliderReleased.connect(self.commit_tint)
+        tint_row = QHBoxLayout()
+        tint_row.addWidget(tint, 1)
+        self.tint_preview_swatch = QFrame()
+        self.tint_preview_swatch.setFixedSize(26, 26)
+        self.tint_percent = QLabel()
+        self.tint_percent.setFixedWidth(42)
+        tint_row.addWidget(self.tint_preview_swatch)
+        tint_row.addWidget(self.tint_percent)
+        layout.addLayout(tint_row)
+        self.preview_tint(tint.value(), schedule=False)
         for label, key in (("Системне розмиття (якщо сумісне)", "system_blur"),
                            ("Зменшити рух", "reduce_motion")):
             checkbox = QCheckBox(label)
@@ -1108,6 +1152,23 @@ class MainWindow(QMainWindow):
 
     def preview_transparency(self, value):
         self.setWindowOpacity(1.0 if self._privacy_requested else 1 - min(8, max(0, value)) / 100)
+
+    def preview_tint(self, value, *, schedule=True):
+        self.tint_percent.setText(f"{value}%")
+        theme = self.config_mgr.get("theme")
+        base = THEMES.get(theme, THEMES["midnight"])[1]
+        color = blend(base, "#8594b0", (1 - value / 100) * .35)
+        self.tint_preview_swatch.setStyleSheet(
+            f"background: {color}; border: 1px solid #96b7ff; border-radius: 8px;"
+        )
+        if schedule and not self.tint_slider.isSliderDown():
+            self._tint_commit_timer.start()
+
+    def commit_tint(self):
+        self._tint_commit_timer.stop()
+        value = self.tint_slider.value() / 100
+        if value != self.config_mgr.get("window_opacity"):
+            self.save_appearance("window_opacity", value)
 
     def queue_transparency_save(self, value, slider):
         if not slider.isSliderDown():
@@ -1178,7 +1239,7 @@ class MainWindow(QMainWindow):
         description.setWordWrap(True)
         layout.addWidget(description)
         for heading, text in (
-            ("Можливості", "Голосові питання, потокові відповіді FAST / SMART, Compact Dock "
+            ("Можливості", "Голосові питання, швидкі потокові відповіді, Compact Dock "
                            "з Live Cards, пошук у конспектах, аналіз виділеної області екрана."),
             ("Розробники", "nega71ve · shibuya"),
             ("Версія", VERSION),
@@ -1322,10 +1383,7 @@ class MainWindow(QMainWindow):
         self.btn_ghost.set_feedback(enabled, self._privacy_requested, error)
 
     def motion_ms(self, base):
-        intensity = self.config_mgr.get("animation_intensity")
-        if self.config_mgr.get("reduce_motion") or self.profile == "eco" or intensity == "off":
-            return 0
-        return round(base * (0.7 if intensity == "subtle" or self.profile == "balanced" else 1))
+        return self.motion.duration(base)
 
     def on_performance_sample(self, profile, samples):
         if profile and self.config_mgr.get("ui_performance_mode") == "auto":
@@ -1344,6 +1402,10 @@ class MainWindow(QMainWindow):
                 self.config_mgr.set("resolved_profile", self.profile)
             except OSError:
                 pass
+        previous_motion = self.motion.level
+        self.motion.configure(profile=self.profile,
+                              intensity=self.config_mgr.get("animation_intensity"),
+                              reduce_motion=self.config_mgr.get("reduce_motion"))
         motion = self.motion_ms(220)
         self.audio_visualizer.set_performance_mode(
             "visual" if self.profile == "premium" and motion else "balanced" if motion else "performance"
@@ -1359,6 +1421,10 @@ class MainWindow(QMainWindow):
             self.toast_anim_in.stop()
             self.toast_anim_out.stop()
             self.toast_opacity.setOpacity(1.0)
+        if not motion:
+            self.live_cards.loading_timer.stop()
+            if previous_motion != "off" and hasattr(self, "window_mode"):
+                self.window_mode.apply(animate=False)
         if self.isVisible():
             self.apply_backdrop()
 
@@ -1483,7 +1549,8 @@ class MainWindow(QMainWindow):
         #SettingsWindow QSlider::handle:horizontal { width: 14px; margin: -5px 0;
             border: 1px solid #526fa8; border-radius: 7px; background: #96b7ff; }
         #SettingsWindow QSlider:focus { outline: 1px solid #96b7ff; }
-        #SettingsNavigation::item { padding: 8px 5px; border-radius: 7px; }
+        #SettingsNavigation { outline: 0; }
+        #SettingsNavigation::item { padding: 8px 5px; border-radius: 7px; outline: 0; }
         #SettingsNavigation::item:selected { background-color: #3c5cb6; color: white; }
         #SettingsWindow QPushButton { min-height: 30px; padding: 0 7px; }
         QPushButton:hover { background-color: #35518b; border-color: #8eacf0; }
@@ -1547,6 +1614,7 @@ class MainWindow(QMainWindow):
         ).replace("stop:0 " + blend(base, THEMES.get(theme, THEMES["midnight"])[4], .055),
                   "stop:0 " + glass, 1))
         self.settings_window.setStyleSheet(self.styleSheet())
+        self.tab_subscriptions.apply_theme(theme, self.config_mgr.get("accent"))
         foreground = "#192337" if theme == "frosted_light" else "#f4f4f4"
         self.live_cards.update_icons(QColor(foreground))
         for view in (self.txt_answer, self.txt_docs_result, self.live_cards.answer_text):
@@ -1634,17 +1702,13 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
-    def save_answer_mode(self, _index):
-        try:
-            self.config_mgr.set('answer_mode', self.answer_mode.currentData())
-        except OSError:
-            self.lbl_toast.setText('Помилка збереження / Save error')
-
     def save_settings(self):
         selected_mode = "loopback" if self.combo_audio_source.currentIndex() == 0 else "mic"
         try:
             self.config_mgr.save_config({
                 "gemini_api_key": self.input_gemini_key.text().strip(),
+                "protected_gemini_key": protect(self.input_gemini_key.text().strip())
+                if self.remember_gemini_key.isChecked() else "",
                 "gemini_model": self.combo_gemini.currentText(),
                 "save_answer_history": self.save_history.isChecked(),
                 "auto_send": self.settings_auto_send.isChecked(),

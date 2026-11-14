@@ -39,7 +39,7 @@ class RoundedWindow(QObject):
         self.window.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
     def eventFilter(self, watched, event):
-        if watched is self.window and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+        if watched is getattr(self, "window", None) and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
             self.update_shape()
         return False
 

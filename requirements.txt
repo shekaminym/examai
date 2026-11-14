@@ -11,3 +11,4 @@ keyboard==0.13.5
 matplotlib==3.10.9
 psutil==5.9.8
 packaging>=24,<27
+cryptography>=45,<50

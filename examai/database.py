@@ -3,9 +3,12 @@ from pathlib import Path
 from contextlib import closing, contextmanager
 
 
+from examai.paths import data_root
+
+
 class DatabaseManager:
-    def __init__(self, db_name="exam_assistant.db"):
-        self.db_path = db_name
+    def __init__(self, db_name=None):
+        self.db_path = db_name if db_name is not None else data_root() / "exam_assistant.db"
         self.init_db()
 
     @contextmanager
