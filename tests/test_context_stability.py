@@ -151,3 +151,40 @@ def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
     assert neighbor.geometry() == geometry
     app.aboutToQuit.disconnect(ctl.shutdown)
     window.deleteLater()
+
+
+def test_recording_pulse_and_floating_geometry(tmp_path):
+    from examai.ui.ui_main import MainWindow
+    app, ctl = controller(tmp_path)
+    ui = ctl.ui
+    ui.show()
+    ui.motion.system_reduced = False
+    ui.config_mgr.save_config({"reduce_motion": False, "animation_intensity": "full"})
+    ui.apply_performance_mode("premium")
+    ui.set_listening(True)
+    pulse = ui.btn_toggle_listen
+    initial = pulse.phase
+    QTest.qWait(120)
+    assert pulse.pulse_timer.isActive() and pulse.phase != initial
+    ui.config_mgr.set("animation_intensity", "off")
+    ui.apply_performance_mode("premium")
+    assert not pulse.pulse_timer.isActive() and pulse.recording
+    ui.set_listening(False)
+    assert not pulse.recording
+    if ui.window_mode.docked:
+        ui.window_mode.toggle()
+    ui.resize(710, 500)
+    ui.window_mode.remember()
+    ui.config_mgr.set("animation_intensity", "full")
+    ui.apply_performance_mode("premium")
+    ui.resize(740, 520)
+    ui.config_mgr.set("animation_intensity", "off")
+    ui.apply_performance_mode("premium")
+    assert (ui.width(), ui.height()) == (740, 520)
+    ui.window_mode.remember()
+    with patch("examai.ui.ui_main.AudioCapturer.get_available_devices", return_value=[]):
+        restored = MainWindow(ConfigManager(ui.config_mgr.filepath), ctl.db)
+    assert (restored.width(), restored.height()) == (740, 520)
+    restored.deleteLater()
+    app.aboutToQuit.disconnect(ctl.shutdown)
+    ui.deleteLater()

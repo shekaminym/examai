@@ -1,7 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 import re
 from io import BytesIO
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QFont, QImage, QTextDocument, QTextImageFormat
 from PySide6.QtWidgets import QTextEdit
 
@@ -43,6 +45,39 @@ def streaming_prefix(source):
     return source
 
 
+class FormulaJobs(QObject):
+    ready = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.cache = OrderedDict()
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="examai-math")
+
+    def image(self, expression, display, color):
+        key = expression, display, color
+        future = self.cache.get(key)
+        if future is None:
+            if sum(not item.done() for item in self.cache.values()) >= 24:
+                return None
+            future = self.executor.submit(render_formula, expression, display, color=color)
+            self.cache[key] = future
+            future.add_done_callback(self.notify)
+            if len(self.cache) > 64:
+                self.cache.popitem(last=False)
+        if not future.done():
+            return None
+        try:
+            return future.result()
+        except Exception:
+            return None
+
+    def notify(self, _future):
+        try:
+            self.ready.emit()
+        except RuntimeError:
+            pass  # Native Qt object may already have been destroyed.
+
+
 class ResponseDocument(QTextDocument):
     def loadResource(self, resource_type, name):
         # Formula images are supplied directly with addResource.
@@ -59,6 +94,20 @@ class ResponseView(QTextEdit):
         self.source = ""
         self._formula_cache = {}
         self._formula_color = "#f4f4f4"
+        self.formula_jobs = None
+        self._last_rich_render = None
+
+    def enable_background_formulas(self, jobs):
+        self.formula_jobs = jobs
+        jobs.ready.connect(self._refresh_formula_images, Qt.ConnectionType.QueuedConnection)
+
+    @Slot()
+    def _refresh_formula_images(self):
+        if self._last_rich_render is not None:
+            original = self.source
+            self.show_response(self._last_rich_render, streaming=True)
+            self.source = original
+
 
     def set_formula_color(self, color):
         if color != self._formula_color:
@@ -68,6 +117,7 @@ class ResponseView(QTextEdit):
                 self.show_response(self.source, streaming=True)
 
     def setPlainText(self, text):
+        self._last_rich_render = None
         self.source = text
         super().setPlainText(text)
 
@@ -91,6 +141,7 @@ class ResponseView(QTextEdit):
 
     def show_response(self, source, *, streaming=False):
         self.source = source
+        self._last_rich_render = source
         document = self.document()
         scroll = self.verticalScrollBar()
         previous_position = scroll.value()
@@ -126,16 +177,19 @@ class ResponseView(QTextEdit):
             cursor = document.find(token)
             if cursor.isNull():
                 continue
-            cache_key = (expression, display)
-            if cache_key not in self._formula_cache:
-                if len(self._formula_cache) >= 32:
-                    self._formula_cache.pop(next(iter(self._formula_cache)))
-                self._formula_cache[cache_key] = (render_formula(expression, display)
-                    if self._formula_color == "#f4f4f4" else
-                    render_formula(expression, display, color=self._formula_color))
-            image = self._formula_cache[cache_key]
+            if self.formula_jobs is not None:
+                image = self.formula_jobs.image(expression, display, self._formula_color)
+            else:
+                cache_key = (expression, display)
+                if cache_key not in self._formula_cache:
+                    if len(self._formula_cache) >= 32:
+                        self._formula_cache.pop(next(iter(self._formula_cache)))
+                    self._formula_cache[cache_key] = (render_formula(expression, display)
+                        if self._formula_color == "#f4f4f4" else
+                        render_formula(expression, display, color=self._formula_color))
+                image = self._formula_cache[cache_key]
             if image is None:
-                cursor.insertText(literal)
+                cursor.insertText(expression.strip() if self.formula_jobs is not None else literal)
                 continue
             url = QUrl(f"formula:{index}")
             document.addResource(QTextDocument.ResourceType.ImageResource, url, image)
@@ -162,19 +216,22 @@ def render_formula(expression, display, *, color="#f4f4f4"):
     expression = MATH_ALIAS.sub(lambda match: "\\" + MATH_ALIASES[match[1]], expression)
 
     try:
-        from matplotlib import rc_context
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
         from matplotlib.font_manager import FontProperties
-        from matplotlib.mathtext import math_to_image
+        from matplotlib.mathtext import MathTextParser
 
+        math = "$" + expression + "$"
+        font = FontProperties(size=13 if display else 11)
+        width, height, depth, _, _ = MathTextParser("path").parse(math, dpi=72, prop=font)
+        figure = Figure(figsize=(width / 72, height / 72), dpi=144, facecolor="none")
+        FigureCanvasAgg(figure)
+        figure.text(0, depth / height, math, fontproperties=font, color=color, usetex=False)
         output = BytesIO()
-        with rc_context({"savefig.transparent": True, "text.usetex": False}):
-            math_to_image(
-                "$" + expression + "$", output, dpi=144, format="png",
-                prop=FontProperties(size=13 if display else 11), color=color,
-            )
+        figure.savefig(output, format="png", transparent=True)
         image = QImage.fromData(output.getvalue(), "PNG")
         return None if image.isNull() else image
-    except (ImportError, ValueError, RuntimeError, OverflowError, RecursionError):
+    except (ImportError, ValueError, RuntimeError, OverflowError, RecursionError, ZeroDivisionError):
         return None
 
 

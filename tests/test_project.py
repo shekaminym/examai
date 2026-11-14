@@ -611,6 +611,10 @@ class QtTests(unittest.TestCase):
                 controller = MainController(app)
             controller._answer_request_id = "formula-test"
             controller.on_answer_progress(r"Формула: $$L = A \land B$$")
+            loop = QEventLoop()
+            controller.formula_jobs.ready.connect(loop.quit)
+            QTimer.singleShot(10000, loop.quit)
+            loop.exec()
             self.assertIn('src="formula:', controller.ui.txt_answer.document().toHtml())
             self.assertEqual(controller.ui.txt_answer.copyable_text(),
                              r"Формула: $$L = A \land B$$")

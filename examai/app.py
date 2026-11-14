@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QMenu, QMessageBox
 from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
 from examai.ui.appearance import THEMES
+from examai.ui.response_view import FormulaJobs
 
 from examai.audio.audio_capturer import AudioCapturer, audio_log
 from examai.audio.audio_vad import NeuralVAD, SpeechSegmenter, Utterance
@@ -549,6 +550,9 @@ class MainController(QObject):
         self.rag = RAGEngine(self.db)
         self.stt = self.stt_settings = None
         self.ui = MainWindow(self.config, self.db)
+        self.formula_jobs = FormulaJobs(self.ui)
+        for view in (self.ui.txt_answer, self.ui.live_cards.answer_text, self.ui.txt_docs_result):
+            view.enable_background_formulas(self.formula_jobs)
         self.audio = self.api = self.docs = None
         self._cloud_listening = None
         self._lease_worker = None
@@ -1065,7 +1069,8 @@ class MainController(QObject):
     @Slot(str)
     def submit_manual_question(self, question):
         self._recent_voice_item = None
-        if self._question_aggregator.pending and not self.ui.txt_question.hasFocus():
+        if (self._question_aggregator.pending and not self.ui.txt_question.hasFocus()
+                and question == self.ui.txt_question.toPlainText()):
             item = self._question_aggregator.finalize(force=True)
             question = item.text
         self._question_aggregator.clear()
@@ -1128,8 +1133,15 @@ class MainController(QObject):
         # selection when multiple files share an explicitly requested name.
         retrieval_hint = (None if selected_document is None and FILE_REFERENCE.search(question.casefold())
                           else source_hint)
-        memory = self.conversation.context(question) if not has_image else ""
+        memory_started = perf_counter()
+        prior = self.conversation.relevant_turns(question) if not has_image and requested_lines(question) is None else ()
+        memory = self.conversation.format_context(prior)
+        conversation_id = self.conversation.session_id
+        timing.info("request_id=%s session=%s prior_turns=%d context_prep_ms=%.2f",
+                    request_id, conversation_id, len(prior), (perf_counter() - memory_started) * 1000)
         memory_generation = self.conversation.generation
+
+        refresh_interval = 0.12 if self.ui.profile == "eco" else 0.05
 
         def task():
             rag_started = perf_counter()
@@ -1166,8 +1178,6 @@ class MainController(QObject):
                 now = perf_counter()
                 if last_update is None:
                     timing.info("request_id=%s llm_first_text_ms=%.1f", request_id, (now - requested) * 1000)
-                refresh_interval = (0.12 if self.ui.profile == "eco"
-                                    else 0.05)
                 if last_update is None or now - last_update >= refresh_interval:
                     last_update = now
                     worker.progress.emit(text, now)
@@ -1177,7 +1187,9 @@ class MainController(QObject):
             if speech_ended_at is not None:
                 timing.info("request_id=%s llm_start_from_speech_end_ms=%.1f", request_id,
                             (perf_counter() - speech_ended_at) * 1000)
-            timing.info("request_id=%s llm_request=1", request_id)
+            timing.info("request_id=%s session=%s llm_request=1 prior_turns=%d context_chars=%d transport=%s",
+                        request_id, conversation_id, len(prior), len(context),
+                        "cloud" if isinstance(llm, CloudEngine) else "byok")
             try:
                 if not has_image:
                     answer = llm.generate_answer(question, context, on_text=on_text,
@@ -1510,7 +1522,9 @@ class MainController(QObject):
 
     @Slot()
     def shutdown(self):
+        self.app.removeEventFilter(self.capture_privacy)
         self.ui.account_panel.stop_jobs()
+        self.formula_jobs.executor.shutdown(wait=False, cancel_futures=True)
         if self.timing_window is not None:
             self.capture_privacy.unregister(self.timing_window)
             self.timing_window.close()

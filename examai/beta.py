@@ -2,6 +2,8 @@
 import base64
 import os
 import threading
+import logging
+from time import perf_counter
 from urllib.parse import urlsplit
 
 import httpx
@@ -63,8 +65,8 @@ class CloudEngine:
     def close(self):
         pass
 
-    def generate_answer(self, question, context, *, on_text=None, **_kwargs):
-        return self._stream({"question": question[:4000], "context": context[:3500]}, on_text)
+    def generate_answer(self, question, context, *, on_text=None, request_id="-", **_kwargs):
+        return self._stream({"question": question[:4000], "context": context[:3500]}, on_text, request_id)
 
     def generate_image_answer(self, image, mime, *, on_text=None, user_instruction="", context="", **_kwargs):
         return self._stream({"question": user_instruction[:4000] or "Проаналізуй зображення",
@@ -74,8 +76,13 @@ class CloudEngine:
     def generate_summary(self, context):
         return self.generate_answer("Склади короткий конспект за наданим текстом.", context)
 
-    def _stream(self, body, on_text):
+    def _stream(self, body, on_text, request_id="-"):
+        started = perf_counter()
         self.client.acquire()
+        timing = logging.getLogger("phantom.timing")
+        timing.info("request_id=%s cloud_lease_ms=%.2f", request_id, (perf_counter() - started) * 1000)
+        sent = perf_counter()
+        first = True
         stop = threading.Event()
         def heartbeat():
             while not stop.wait(5):
@@ -94,6 +101,9 @@ class CloudEngine:
                 for line in response.iter_lines():
                     event = json.loads(line)
                     if "text" in event and on_text:
+                        if first:
+                            timing.info("request_id=%s cloud_ttft_ms=%.2f", request_id, (perf_counter() - sent) * 1000)
+                            first = False
                         on_text(event["text"])
                     if "final" in event:
                         return event["final"]
@@ -103,6 +113,8 @@ class CloudEngine:
             raise GenerationError("EXAM AI Cloud request failed or the usage limit was reached.") from None
         finally:
             stop.set()
-            worker.join()
-            self.client.release()
+            def cleanup():
+                worker.join()
+                self.client.release()
+            threading.Thread(target=cleanup, daemon=True, name="examai-cloud-release").start()
         raise GenerationError("EXAM AI Cloud ended without a complete answer.")

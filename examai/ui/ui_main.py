@@ -166,7 +166,7 @@ class RecordingButton(QPushButton):
         self.animation_enabled = True
         self.phase = 0.0
         self.pulse_timer = QTimer(self)
-        self.pulse_timer.setInterval(60)
+        self.pulse_timer.setInterval(40)
         self.pulse_timer.timeout.connect(self.advance_pulse)
 
     def set_recording(self, recording):
@@ -182,7 +182,7 @@ class RecordingButton(QPushButton):
         self.set_recording(self.recording)
 
     def advance_pulse(self):
-        self.phase += 0.22
+        self.phase = (self.phase + 0.24) % math.tau
         self.update()
 
     def wheelEvent(self, event):
@@ -200,7 +200,8 @@ class RecordingButton(QPushButton):
         painter.setPen(Qt.PenStyle.NoPen)
         pulse = (math.sin(self.phase) + 1) / 2 if self.animation_enabled else 0.5
         painter.setBrush(QColor(255, 129, 164, int(90 + pulse * 75)))
-        painter.drawEllipse(19, self.height() // 2 - 10, 20, 20)
+        radius = round(7 + 4 * pulse)
+        painter.drawEllipse(29 - radius, self.height() // 2 - radius, 2 * radius, 2 * radius)
         painter.setBrush(QColor("#ffd4e1"))
         painter.drawEllipse(25, self.height() // 2 - 4, 8, 8)
 
@@ -1425,7 +1426,7 @@ class MainWindow(QMainWindow):
             self.toast_opacity.setOpacity(1.0)
         if not motion:
             self.live_cards.loading_timer.stop()
-            if previous_motion != "off" and hasattr(self, "window_mode"):
+            if previous_motion != "off" and hasattr(self, "window_mode") and self.window_mode.docked:
                 self.window_mode.apply(animate=False)
         if self.isVisible():
             self.apply_backdrop()
