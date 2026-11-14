@@ -538,6 +538,10 @@ class MainController(QObject):
         self.stt = self.stt_settings = None
         self.ui = MainWindow(self.config, self.db)
         self.audio = self.api = self.docs = None
+        self._cloud_listening = None
+        self._lease_worker = None
+        self._lease_timer = QTimer(self, interval=5000)
+        self._lease_timer.timeout.connect(self._renew_listening)
         self.llm = self.llm_settings = None
         self.pending_question = None
         self._pending_options = {}
@@ -874,10 +878,7 @@ class MainController(QObject):
         stopped = self.audio.isInterruptionRequested()
         self.audio.deleteLater()
         self.audio = None
-        self._cloud_listening = None
-        self._lease_worker = None
-        self._lease_timer = QTimer(self, interval=5000)
-        self._lease_timer.timeout.connect(self._renew_listening)
+        self._release_listening()
         self.meter.stop()
         self.update_meter()
         self.ui.set_listening(False)
@@ -1537,13 +1538,16 @@ def main():
     from pathlib import Path
     from PySide6.QtGui import QIcon
     app.setWindowIcon(QIcon(str(Path(__file__).with_name("assets") / "examai.ico")))
-    if "--smoke-test" in sys.argv:
-        QTimer.singleShot(1800, app.quit)
+    smoke_test = "--smoke-test" in sys.argv
     try:
         controller = MainController(app)
+        if smoke_test:
+            QTimer.singleShot(1800, controller.request_close)
         return controller.run()
     except Exception as exc:
         logging.getLogger("examai.startup").exception("startup failed")
+        if smoke_test:
+            return 1
         QMessageBox.critical(
             None, "EXAM AI · помилка запуску",
             f"EXAM AI не вдалося запустити. Перевірте встановлені залежності та налаштування.\n\n"

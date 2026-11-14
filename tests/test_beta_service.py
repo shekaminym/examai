@@ -99,3 +99,33 @@ def test_update_manifest_rejects_tampering_and_wrong_channel():
     from cryptography.exceptions import InvalidSignature
     with pytest.raises(InvalidSignature):
         verify_manifest(dict(envelope, manifest="e30="), public, "beta")
+
+
+def test_pkce_nonce_and_one_time_claim(tmp_path, monkeypatch):
+    import hashlib
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.setenv("EXAMAI_PUBLIC_URL", "https://beta.example.test")
+    monkeypatch.setenv("EXAMAI_GOOGLE_CLIENT_ID", "test-client")
+    monkeypatch.setenv("EXAMAI_GOOGLE_CLIENT_SECRET", "test-secret")
+    client = TestClient(create_app(tmp_path / "oauth.sqlite"))
+    flow = client.post("/oauth/start", json={"device": "desktop-fixture-0001"}).json()
+    values = parse_qs(urlsplit(flow["url"]).query)
+    assert values["code_challenge_method"] == ["S256"]
+    assert client.post("/oauth/claim", json={"claim": flow["claim"]}).json()["pending"]
+
+    def exchange(_url, **kwargs):
+        verifier = kwargs["data"]["code_verifier"]
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        assert values["code_challenge"] == [challenge]
+        import httpx
+        return httpx.Response(200, json={"id_token": "fixture"}, request=httpx.Request("POST", _url))
+
+    monkeypatch.setattr("server.api.httpx.post", exchange)
+    monkeypatch.setattr("server.api.verify_oauth2_token", lambda *_: {"sub": "google-sub", "nonce": values["nonce"][0]})
+    query = {"state": values["state"][0], "code": "test-code"}
+    assert client.get("/oauth/callback", params=query).status_code == 200
+    assert client.get("/oauth/callback", params=query).status_code == 400
+    session = client.post("/oauth/claim", json={"claim": flow["claim"]}).json()["token"]
+    assert client.get("/account", headers=bearer(session)).json()["state"] == "EXPIRED"
+    assert client.post("/oauth/claim", json={"claim": flow["claim"]}).status_code == 410
