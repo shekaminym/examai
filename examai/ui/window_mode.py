@@ -126,18 +126,21 @@ class WindowMode(QObject):
             self.finish_layout()
             return
         area = screen.availableGeometry()
-        w.answer_mode.setMaximumWidth(82 if self.collapsed and area.width() < 850 else 16777215)
         target = dock_geometry(area, self.config.get("dock_anchor"), 940, 54 if self.collapsed else 620)
         if not self.docked:
+            # The existing full-size default is also the first floating size.
+            # Saved sizes are clamped to an available screen instead of falling off it.
             saved = self.config.get("floating_geometry", [])
             if len(saved) == 4 and all(type(value) is int for value in saved):
                 candidate = QRect(*saved)
-                if candidate.isValid() and any(
-                    display.availableGeometry().intersected(candidate).width() >= 200
-                    and display.availableGeometry().contains(candidate.topLeft())
-                    for display in QGuiApplication.screens()
-                ):
-                    target = candidate
+                if candidate.isValid():
+                    bounds = next((display.availableGeometry() for display in QGuiApplication.screens()
+                                   if display.availableGeometry().contains(candidate.topLeft())), area)
+                    width = min(max(640, candidate.width()), bounds.width())
+                    height = min(max(440, candidate.height()), bounds.height())
+                    x = max(bounds.left(), min(candidate.x(), bounds.right() - width + 1))
+                    y = max(bounds.top(), min(candidate.y(), bounds.bottom() - height + 1))
+                    target = QRect(x, y, width, height)
         if animate and w.motion_ms(260):
             self.started = perf_counter()
             self.frames = 0

@@ -1,0 +1,54 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>EXAM AI beta administration</title>
+<style>body{color:#f0efff;background:#15131c;font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,select,button{font:inherit;padding:8px;background:#242030;color:inherit;border:1px solid #71618b;border-radius:6px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#211c2b;padding:16px}form{display:flex;gap:8px;flex-wrap:wrap}</style>
+<h1>EXAM AI beta administration</h1>
+<p>Sign in using an authorized Google account. The session stays in this page.</p>
+<button id="sign-in">Continue with Google</button><button id="sign-out">Sign out</button><input id="query" placeholder="Google account subject">
+<button id="load">Load users and reports</button>
+<h2>Account action</h2>
+<form id="action"><input name="sub" required placeholder="Google account subject"><select name="action">
+<option>invite</option><option>minutes</option><option>days</option><option>suspend</option><option>report</option>
+</select><input name="amount" type="number" min="0" max="365" placeholder="Minutes or days">
+<input name="report_id" type="number" min="0" placeholder="Report ID"><select name="status">
+<option>Received</option><option>Reviewing</option><option>Confirmed</option><option>Fixed</option><option>Closed</option></select>
+<button>Apply</button></form><pre id="result" aria-live="polite"></pre>
+<script>
+let token = '';
+let device = localStorage.getItem('examaiAdminDevice') || crypto.randomUUID();
+localStorage.setItem('examaiAdminDevice', device);
+const post = (path, data) => fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+document.getElementById('sign-in').onclick = async () => {
+ const popup = window.open('about:blank', '_blank');
+ if (!popup) return;
+ try {
+  const response = await post('/oauth/start', {device});
+  if (!response.ok) throw Error();
+  const auth = await response.json();
+  const url = new URL(auth.url);
+  if (url.origin !== 'https://accounts.google.com') throw Error();
+  popup.opener = null;
+  popup.location = url.href;
+  for (let i=0; i<120; i++) {
+   await new Promise(resolve => setTimeout(resolve, 2000));
+   const claim = await post('/oauth/claim', {claim:auth.claim});
+   if (!claim.ok) throw Error();
+   const value = await claim.json();
+   if (value.token) { token=value.token; await call('/admin/data'); return; }
+  }
+  throw Error();
+ } catch (_) { popup.close(); document.getElementById('result').textContent='Sign-in failed or expired.'; }
+};
+document.getElementById('sign-out').onclick = async () => {
+ try { await fetch('/logout', {method:'POST', headers:{Authorization:'Bearer '+token}}); }
+ finally { token=''; document.getElementById('result').textContent='Signed out.'; }
+};
+async function call(path, body) {
+ const result = document.getElementById('result');
+ try {
+  const response = await fetch(path, {method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+  result.textContent = JSON.stringify(await response.json(), null, 2);
+ } catch (_) { result.textContent = 'Request failed.'; }
+}
+document.getElementById('load').onclick = () => call('/admin/data?q='+encodeURIComponent(document.getElementById('query').value));
+document.getElementById('action').onsubmit = e => {e.preventDefault(); const b=Object.fromEntries(new FormData(e.target)); b.amount=Number(b.amount); b.report_id=Number(b.report_id); call('/admin/action',b);};
+</script></html>

@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 
 
-MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "semantic-e5-small"
+from examai.paths import data_root
+
+MODEL_DIR = data_root() / "models" / "semantic-e5-small"
 MODEL_FILE = "model_quantized.onnx"
 MODEL_ID = "xenova-e5-small:761b726dd34fb83930e26aab4e9ac3899aa1fa78:quantized:512"
 DIMENSIONS = 384

@@ -1,11 +1,12 @@
 """Regression coverage for line references, question assembly, and screen intent."""
 
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QScrollArea, QApplication, QLabel
@@ -16,6 +17,7 @@ from examai.ai.llm_engine import LLMEngine
 from examai.audio.question_aggregator import QuestionAggregator
 from examai.ai.rag_engine import RAGEngine, ReferenceLookupError
 from examai.ui.screen_selection import encode_image
+from examai.windows.privacy_utils import AffinityResult, WDA_EXCLUDEFROMCAPTURE, WDA_NONE
 
 
 class CodeReferenceTests(unittest.TestCase):
@@ -179,6 +181,28 @@ class ImageAndHistoryTests(unittest.TestCase):
         self.addCleanup(dispose)
         return controller
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows taskbar behavior")
+    def test_ghost_tool_window_can_be_restored_and_disabled(self):
+        controller = self._controller()
+        controller.config.set("ghost_hide_taskbar", True)
+        controller.recover_hotkey_handle = 1
+        controller.capture_privacy._apply_api = lambda _hwnd, enabled: AffinityResult(
+            True, WDA_EXCLUDEFROMCAPTURE if enabled else WDA_NONE
+        )
+        controller.ui.show()
+        controller.apply_privacy(True, persist=False)
+        self.app.processEvents()
+        self.assertTrue(controller.capture_privacy.verified)
+        self.assertEqual(controller.ui.windowType(), Qt.WindowType.Tool)
+        controller.ui.hide()
+        controller.recover_window_hotkey.emit()
+        self.app.processEvents()
+        self.assertTrue(controller.ui.isVisible())
+        controller.apply_privacy(False, persist=False)
+        self.app.processEvents()
+        self.assertEqual(controller.ui.windowType(), Qt.WindowType.Window)
+        self.assertFalse(controller.capture_privacy.requested)
+
     def test_screen_selection_passes_previous_user_instruction(self):
         controller = self._controller()
         controller.config.set("gemini_api_key", "synthetic")
@@ -276,13 +300,14 @@ class ImageAndHistoryTests(unittest.TestCase):
         controller = self._controller()
         ui = controller.ui
         ui.config_mgr.set("reduce_motion", True)
-        ui.window_mode.expand_toggle()
+        ui.apply_performance_mode(ui.config_mgr.get("ui_performance_mode"))
         ui.show()
+        ui.window_mode.expand_toggle()
         ui.open_settings()
         self.app.processEvents()
         self.assertEqual(ui.settings_window.findChild(QScrollArea).horizontalScrollBar().maximum(), 0)
         self.assertGreater(ui.lbl_status.width(), ui.sidebar.width())
-        self.assertEqual(ui.answer_mode.currentText(), "FAST")
+        self.assertFalse(hasattr(ui, "answer_mode"))
         for name, page in (("about", ui.tab_about), ("subscriptions", ui.tab_subscriptions)):
             ui.nav_buttons[name].click()
             self.assertIs(ui.tabs.currentWidget(), page)
@@ -290,7 +315,7 @@ class ImageAndHistoryTests(unittest.TestCase):
                 labels = [label.text() for label in page.findChildren(QLabel)]
                 self.assertTrue("nega71ve · shibuya" in labels)
             else:
-                self.assertEqual(page.findChildren(QLabel), [])
+                self.assertIn("Найвигідніше", [label.text() for label in page.findChildren(QLabel)])
 
     def test_recording_animation_respects_performance_mode(self):
         controller = self._controller()

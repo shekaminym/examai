@@ -184,6 +184,28 @@ class CapturePrivacyQtTests(unittest.TestCase):
         self.assertIn(int(splash.winId()), handles)
         self.assertTrue(self.manager.verified)
 
+    def test_hidden_optional_settings_do_not_fail_toggle_but_are_checked_on_show(self):
+        main, settings = self.window(), self.window()
+        self.manager.register(main)
+        self.manager.register(settings, require_hidden=False)
+        self.assertTrue(self.manager.set_enabled(True))
+        self.assertIsNone(settings.windowHandle())
+        self.assertEqual(self.manager.message, "")
+        settings.show()
+        self.app.processEvents()
+        self.api.assert_any_call(int(settings.winId()), True)
+        self.assertTrue(self.manager.verified)
+
+    def test_winid_change_waits_for_replacement_handle(self):
+        window = self.window()
+        self.manager.register(window)
+        self.manager.set_enabled(True)
+        self.api.reset_mock()
+        QApplication.sendEvent(window, QEvent(QEvent.Type.WinIdChange))
+        self.api.assert_not_called()
+        self.app.processEvents()
+        self.api.assert_any_call(int(window.winId()), True)
+
     def test_fresh_off_does_not_treat_uncreated_hidden_splash_as_failure(self):
         main, splash = self.window(), self.window()
         self.manager.register(main)

@@ -4,10 +4,17 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 
+from examai.paths import data_root
+
 CONFIG_FILE = "config.json"
 KEY_ENV = {"gemini_api_key": "GEMINI_API_KEY"}
 
 DEFAULT_CONFIG = {
+    "server_url": "",
+    "update_channel": "beta",
+    "account_session": "",
+    "account_device": "",
+    "protected_gemini_key": "",
     "gemini_model": "gemini-3.5-flash-lite",
     "whisper_model_size": "base",
     "whisper_device": "cpu",
@@ -55,8 +62,8 @@ DEFAULT_CONFIG = {
 
 
 class ConfigManager:
-    def __init__(self, filepath=CONFIG_FILE):
-        self.filepath = Path(filepath)
+    def __init__(self, filepath=None):
+        self.filepath = Path(filepath) if filepath is not None else data_root() / CONFIG_FILE
         self.config = self.load_config()
 
     def load_config(self):
@@ -71,6 +78,9 @@ class ConfigManager:
             value = data.get(name)
             if type(value) is type(default):
                 config[name] = value
+        # SMART is retired. Keep the persisted field for old configs, but it
+        # must never affect the active answer pipeline.
+        config["answer_mode"] = "fast"
         # Older versions saved "normal" even while splitting slow questions.
         # Upgrade once; subsequent explicit mode choices remain untouched.
         version = data.get("speech_pipeline_version", 0)
@@ -93,6 +103,7 @@ class ConfigManager:
 
     def save_config(self, new_config=None):
         updated = self.config | (new_config or {})
+        updated["answer_mode"] = "fast"
         # Preserve keys already on disk while keeping newly entered keys session-only.
         try:
             original = json.loads(self.filepath.read_text(encoding="utf-8-sig"))
@@ -115,7 +126,14 @@ class ConfigManager:
 
     def get(self, key, default=None):
         if key in KEY_ENV:
-            return self.config.get(key, "") or os.environ.get(KEY_ENV[key], "").strip()
+            value = self.config.get(key, "") or os.environ.get(KEY_ENV[key], "").strip()
+            if key == "gemini_api_key" and not value and self.config.get("protected_gemini_key"):
+                from examai.windows.credentials import reveal
+                try:
+                    return reveal(self.config["protected_gemini_key"])
+                except (ValueError, OSError):
+                    return ""
+            return value
         return self.config.get(key, default)
 
     def set(self, key, value):

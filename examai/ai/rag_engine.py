@@ -26,12 +26,14 @@ STOP_WORDS = set(
     "the and what how why does do is are of a an".split()
 )
 log = logging.getLogger("phantom.timing.rag")
+LINE_WORD = r"(?:ряд(?:ок|к\w*|ц\w*)|стр(?:ок|оч)\w*|lines?)\b"
+RANGE_END = r"(?:\s*(?:[-–—]|to|до)\s*(\d{1,6})(?!\d))?"
 LINE_AFTER_NUMBER = re.compile(
-    r"(?<!\w)(\d{1,6})(?:[-‐‑–]?(?:й|ий|ій|му|го|та|th|st|nd|rd))?\s*"
-    r"(?:ряд(?:ок|к\w*|ц\w*)|строк\w*|line\b)", re.IGNORECASE,
+    r"(?<!\w)(\d{1,6})(?:[-‐‑–]?(?:й|ий|ій|му|го|та|th|st|nd|rd))?"
+    + RANGE_END + r"\s*" + LINE_WORD, re.IGNORECASE,
 )
 LINE_BEFORE_NUMBER = re.compile(
-    r"(?:ряд(?:ок|к\w*|ц\w*)|строк\w*|line\b)\s*(?:№|#|номер\s*)?(\d{1,6})",
+    LINE_WORD + r"\s*(?:№|#|номер\s*)?(\d{1,6})(?!\d)" + RANGE_END,
     re.IGNORECASE,
 )
 FUNCTION_NAME = re.compile(r"(?:функц\w*|function)\s+([A-Za-z_][A-Za-z_0-9]*)", re.IGNORECASE)
@@ -43,12 +45,18 @@ class ReferenceLookupError(LookupError):
     """An exact source reference cannot be resolved safely."""
 
 
-def requested_line(question):
-    for pattern in (LINE_AFTER_NUMBER, LINE_BEFORE_NUMBER):
+def requested_lines(question):
+    for pattern in (LINE_BEFORE_NUMBER, LINE_AFTER_NUMBER):
         match = pattern.search(question)
         if match:
-            return int(match.group(1))
+            first = int(match[1])
+            return first, int(match[2]) if match[2] else first
     return None
+
+
+def requested_line(question):
+    selection = requested_lines(question)
+    return selection[0] if selection else None
 
 
 def looks_like_code(text):
@@ -121,7 +129,7 @@ class RAGEngine:
         lines = None
         if path.suffix.lower() == ".txt":
             text = text.replace("\r\n", "\n").replace("\r", "\n")
-            lines = text.split("\n")
+            lines = text.removesuffix("\n").split("\n")
         chunks = []
         start = 0
         while start < len(text):
@@ -210,26 +218,33 @@ class RAGEngine:
         raise ReferenceLookupError("Уточніть назву TXT-файлу або виберіть його в «Конспектах».")
 
     def _exact_line_context(self, query, source_hint, sources, request_id):
-        number = requested_line(query)
-        if number is None:
+        selection = requested_lines(query)
+        if selection is None:
             return None
+        number, last = selection
         source, count, _ = self._resolve_line_source(query, source_hint, sources)
         log.info("request_id=%s rag_document_resolved=%s line=%d", request_id, source, number)
+        if last < number or last - number >= 24:
+            raise ReferenceLookupError("Вкажіть до 24 рядків у порядку зростання.")
+        if last != number and not (1 <= number <= last <= count):
+            raise ReferenceLookupError(f"Діапазон {number}–{last} виходить за межі файлу «{source}» ({count} рядків).")
         if number < 1 or number > count:
             raise ReferenceLookupError(f"У файлі «{source}» немає рядка {number}; у ньому {count} рядків.")
         started = perf_counter()
-        rows = self.db_mgr.get_line_window(source, number)
+        rows = (self.db_mgr.get_line_window(source, number) if last == number
+                else self.db_mgr.get_lines(source, number, last))
         log.info("request_id=%s rag_exact_line_ms=%.1f source=%s line=%d",
                  request_id, (perf_counter() - started) * 1000, source, number)
-        if not any(line == number for line, _ in rows):
+        if sum(number <= line <= last for line, _ in rows) != last - number + 1:
             raise ReferenceLookupError(f"Рядок {number} у файлі «{source}» недоступний.")
         def display(line, content):
-            maximum = 1100 if line == number else 180
+            maximum = (1100 if line == number else 180) if number == last else min(1100, 2600 // (last - number + 1))
             if len(content) > maximum:
                 content = content[:maximum] + "… [довгий рядок скорочено]"
             return f"{line}: {content}"
         shown = "\n".join(display(line, content) for line, content in rows)
-        return f"Точні рядки з файлу «{source}» (цільовий рядок {number}):\n{shown}"
+        target = f"цільовий рядок {number}" if number == last else f"цільові рядки {number}–{last}"
+        return f"Точні рядки з файлу «{source}» ({target}):\n{shown}"
 
     def _code_context(self, query, source_hint, request_id):
         terms = code_terms(query)

@@ -3,9 +3,12 @@ from pathlib import Path
 from contextlib import closing, contextmanager
 
 
+from examai.paths import data_root
+
+
 class DatabaseManager:
-    def __init__(self, db_name="exam_assistant.db"):
-        self.db_path = db_name
+    def __init__(self, db_name=None):
+        self.db_path = db_name if db_name is not None else data_root() / "exam_assistant.db"
         self.init_db()
 
     @contextmanager
@@ -175,12 +178,15 @@ class DatabaseManager:
             ).fetchall()
 
     def get_line_window(self, source, number, radius=5):
-        with self.connection() as conn:
+        return self.get_lines(source, max(1, number - radius), number + radius)
+
+    def get_lines(self, source, first, last):
+        with self.connection(timeout=0.05) as conn:
             rows = conn.execute("""
                 SELECT line_number, content FROM document_lines
                 WHERE source = ? AND line_number BETWEEN ? AND ?
                 ORDER BY line_number
-            """, (source, max(1, number - radius), number + radius)).fetchall()
+            """, (source, first, last)).fetchall()
         return rows
 
     def search_code_lines(self, expression, *, source=None, limit=4):

@@ -118,8 +118,8 @@ LABELS = {
     "ІСТОРІЯ ВІДПОВІДЕЙ": "ANSWER HISTORY", "Питання без тексту": "Question without text",
     "Можливості": "Capabilities", "Розробники": "Developers", "Версія": "Version",
     "Подяки": "Acknowledgments", "Скопіювати версію": "Copy version",
-    "Голосові питання, потокові відповіді FAST / SMART, Compact Dock з Live Cards, пошук у конспектах, аналіз виділеної області екрана.":
-        "Voice questions, FAST / SMART streaming, Compact Dock with Live Cards, notes search, and screen-region analysis.",
+    "Голосові питання, швидкі потокові відповіді, Compact Dock з Live Cards, пошук у конспектах, аналіз виділеної області екрана.":
+        "Voice questions, fast streaming answers, Compact Dock with Live Cards, notes search, and screen-region analysis.",
     "EXAM AI — інтелектуальний настільний асистент для роботи з голосовими запитаннями, програмним кодом, документами та зображеннями. Поєднує розпізнавання мовлення, пошук за змістом і швидку генерацію відповідей у зручному інтерфейсі Windows.":
         "EXAM AI is a Windows desktop assistant for voice questions, code, documents and images. It combines speech recognition, content search and streaming answers.",
     "Дякуємо спільнотам відкритого ПЗ за інструменти, на яких працює EXAM AI.":
