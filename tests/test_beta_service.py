@@ -129,3 +129,38 @@ def test_pkce_nonce_and_one_time_claim(tmp_path, monkeypatch):
     session = client.post("/oauth/claim", json={"claim": flow["claim"]}).json()["token"]
     assert client.get("/account", headers=bearer(session)).json()["state"] == "EXPIRED"
     assert client.post("/oauth/claim", json={"claim": flow["claim"]}).status_code == 410
+
+
+def test_cloud_requires_lease_and_streams_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAMAI_CLOUD_GEMINI_KEY", "test-only")
+    path = tmp_path / "cloud.sqlite"
+    client = TestClient(create_app(path))
+    store = Store(path)
+    with store.transaction() as db:
+        headers = bearer(store.issue(db, "beta", "device"))
+        db.execute("INSERT INTO invite(code) VALUES(?)", (digest("example"),))
+        store.redeem(db, "beta", "example")
+    calls = []
+
+    class Engine:
+        def __init__(self, key):
+            assert key == "test-only"
+
+        def close(self):
+            pass
+
+        def generate_answer(self, question, context, on_text):
+            calls.append((question, context))
+            on_text("First fragment")
+            return "First fragment and rest"
+
+    monkeypatch.setattr("server.api.LLMEngine", Engine)
+    question = {"question": "What is RAG?", "context": "fixture"}
+    assert client.post("/answer", json=question, headers=headers).status_code == 403
+    assert not calls
+    assert client.post("/activity/start", headers=headers).json()["granted"]
+    response = client.post("/answer", json=question, headers=headers)
+    assert [json.loads(line) for line in response.text.splitlines()] == [
+        {"text": "First fragment"}, {"final": "First fragment and rest"},
+    ]
+    assert calls == [("What is RAG?", "fixture")]
