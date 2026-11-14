@@ -10,11 +10,13 @@ from uuid import uuid4
 import keyboard
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QMenu, QMessageBox
-from PySide6.QtGui import QPainter, QColor, QPen
+from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
+from examai.ui.appearance import THEMES
 
 from examai.audio.audio_capturer import AudioCapturer, audio_log
 from examai.audio.audio_vad import NeuralVAD, SpeechSegmenter, Utterance
 from examai.beta import CloudEngine
+from examai.ai.conversation import Conversation
 from examai.config import ConfigManager
 from examai.ui.developer_timing import DeveloperTimingWindow
 from examai.database import DatabaseManager
@@ -22,7 +24,7 @@ from examai.ai.llm_engine import GenerationError, LLMEngine
 from examai.windows.privacy_qt import CapturePrivacy
 from examai.ui.rounded_window import configure_rounded_window
 from examai.ai.rag_engine import FILE_REFERENCE, FileIndexerThread, RAGEngine
-from examai.ai.rag_engine import ReferenceLookupError
+from examai.ai.rag_engine import ReferenceLookupError, requested_lines
 from examai.branding import brand_answer
 from examai.audio.question_aggregator import is_noise, QuestionAggregator, is_continuation_fragment, is_unreliable_transcript
 from examai.ai.image_intent import EXPLAIN_CODE, image_intent, select_screen_instruction
@@ -45,6 +47,7 @@ class ModernSpinner(QWidget):
         super().__init__(parent)
         self.setFixedSize(38, 38)
         self._angle = 0
+        self.accent = QColor(139, 177, 255, 225)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.rotate)
         if animated:
@@ -58,7 +61,7 @@ class ModernSpinner(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        pen = QPen(QColor(139, 177, 255, 225))
+        pen = QPen(self.accent)
         pen.setWidth(4)
         pen.setCapStyle(Qt.RoundCap)
         painter.setPen(pen)
@@ -69,34 +72,36 @@ class ModernSpinner(QWidget):
 class SplashScreen(QWidget):
     finished = Signal()
 
-    def __init__(self, main_window, *, reduced_motion=False):
+    def __init__(self, main_window=None, *, reduced_motion=False, config=None):
         super().__init__()
         self.main_window = main_window
+        config = config or getattr(main_window, "config_mgr", None)
+        theme = config.get("theme") if config else "midnight"
+        _, base, surface, border, foreground, _, accent = THEMES.get(theme, THEMES["midnight"])
+        target = config.get("dock_screen") if config else ""
+        self.screen_target = next((screen for screen in QGuiApplication.screens()
+                                   if screen.name() == target), QGuiApplication.primaryScreen())
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SplashScreen)
-        self.setStyleSheet("background-color: #101f47;")
+        self.setStyleSheet(f"background-color: {base};")
         self.setFixedSize(360, 185)
-        configure_rounded_window(self, radius=22, opacity=0.90, color="#101f47")
+        configure_rounded_window(self, radius=22, opacity=1.0, color=base)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.bg_frame = QWidget(self)
         self.bg_frame.setObjectName("SplashCard")
-        self.bg_frame.setStyleSheet("""
-            QWidget#SplashCard {
-                background-color: rgba(27, 53, 111, 230);
-                border-radius: 22px;
-                border: 1px solid rgba(164, 194, 255, 70);
-            }
-        """)
+        self.bg_frame.setStyleSheet(
+            f"QWidget#SplashCard {{ background: {surface}; border: 1px solid {border}; border-radius: 22px; }}"
+        )
 
         bg_layout = QVBoxLayout(self.bg_frame)
         bg_layout.setAlignment(Qt.AlignCenter)
 
         self.title_label = QLabel("EXAM AI", self.bg_frame)
-        self.title_label.setStyleSheet("""
-            color: white;
+        self.title_label.setStyleSheet(f"""
+            color: {foreground};
             font-family: 'Segoe UI';
             font-size: 32px;
             font-weight: bold;
@@ -106,6 +111,7 @@ class SplashScreen(QWidget):
         self.title_label.setAlignment(Qt.AlignCenter)
 
         self.spinner = ModernSpinner(self.bg_frame, animated=not reduced_motion)
+        self.spinner.accent = QColor(accent)
 
         bg_layout.addStretch()
         bg_layout.addWidget(self.title_label)
@@ -115,8 +121,13 @@ class SplashScreen(QWidget):
 
         layout.addWidget(self.bg_frame)
 
-    def start_splash(self):
+    def show_loading(self):
+        if self.screen_target:
+            self.move(self.screen_target.availableGeometry().center() - self.rect().center())
         self.show()
+
+    def start_splash(self):
+        self.show_loading()
         # The UI is already initialized. Do not hold it back for an animation.
         QTimer.singleShot(0, self.finish_splash)
 
@@ -125,7 +136,8 @@ class SplashScreen(QWidget):
         self.spinner.timer.stop()
         self.finished.emit()
         self.close()
-        self.main_window.show()
+        if self.main_window is not None:
+            self.main_window.show()
 
 
 class DecodeMailbox:
@@ -529,10 +541,10 @@ class MainController(QObject):
     hotkey = Signal()
     recover_window_hotkey = Signal()
 
-    def __init__(self, app):
+    def __init__(self, app, *, config=None):
         super().__init__()
         self.app = app
-        self.config = ConfigManager()
+        self.config = config if config is not None else ConfigManager()
         self.db = DatabaseManager()
         self.rag = RAGEngine(self.db)
         self.stt = self.stt_settings = None
@@ -551,6 +563,8 @@ class MainController(QObject):
         self._last_manual_instruction = ""
         self._retired_answers = {}
         self._answer_history = []
+        self.conversation = Conversation()
+        self.ui.account_panel.session_changed.connect(self.conversation.clear)
         self._history_index = -1
         self._current_question = ""
         self._current_answer_text = ""
@@ -917,7 +931,6 @@ class MainController(QObject):
         self._voice_timer.stop()
         self._voice_wait_at = None
         self.ui.btn_select_screen.setEnabled(False)
-        self._restore_settings = self.ui.settings_window.isVisible()
         self.ui.settings_window.hide()
         self.ui.hide()
         # Let Windows repaint the desktop without this window before grabbing it.
@@ -952,9 +965,6 @@ class MainController(QObject):
             self.ui.show()
             self.ui.raise_()
             self.ui.activateWindow()
-            if getattr(self, "_restore_settings", False):
-                self.ui.open_settings()
-        self._restore_settings = False
 
     @Slot()
     def _cancel_screen_selection(self):
@@ -1118,6 +1128,8 @@ class MainController(QObject):
         # selection when multiple files share an explicitly requested name.
         retrieval_hint = (None if selected_document is None and FILE_REFERENCE.search(question.casefold())
                           else source_hint)
+        memory = self.conversation.context(question) if not has_image else ""
+        memory_generation = self.conversation.generation
 
         def task():
             rag_started = perf_counter()
@@ -1131,10 +1143,15 @@ class MainController(QObject):
                 except ReferenceLookupError as exc:
                     answer = str(exc)
                     timing.info("request_id=%s rag_reference_unavailable=1", request_id)
+                    worker.memory_generation = None
                     worker.answer_ready.emit(answer)
                     return answer, "Готово"
                 except sqlite3.Error:
+                    if requested_lines(question) is not None or FILE_REFERENCE.search(question.casefold()):
+                        raise GenerationError("Не вдалося прочитати імпортований файл. Спробуйте ще раз.") from None
                     context = ""
+                if memory and requested_lines(question) is None:
+                    context = "\n\n".join(filter(None, (context[:3500-len(memory)-2], memory)))
             requested = perf_counter()
             last_update = None
             latest_text = ""
@@ -1203,6 +1220,7 @@ class MainController(QObject):
 
         worker = TaskWorker(task, "Помилка обробки запиту AI.", request_id=request_id)
         worker.cancel_answer = cancelled
+        worker.memory_generation = memory_generation if not has_image else None
         worker.progress.connect(self.on_answer_progress)
         worker.answer_ready.connect(self._answer_ready)
         self.start_api(worker, self.on_answer)
@@ -1274,6 +1292,8 @@ class MainController(QObject):
             answer = brand_answer(answer)
             self._answer_hint_timer.stop()
             self._current_answer_text = answer
+            generation = getattr(self.sender(), "memory_generation", None)
+            self.conversation.remember(self._current_question, answer, generation)
             self._remember_answer(answer)
             self.ui.live_cards.ready(self._answer_request_id, self._current_question, answer)
             self.ui.txt_answer.show_response(answer)
@@ -1331,6 +1351,7 @@ class MainController(QObject):
 
     @Slot()
     def on_clear_all(self):
+        self.conversation.clear()
         self.ui.live_cards.clear()
         self._recent_voice_item = None
         self._question_timer.stop()
@@ -1539,18 +1560,33 @@ def main():
     from PySide6.QtGui import QIcon
     app.setWindowIcon(QIcon(str(Path(__file__).with_name("assets") / "examai.ico")))
     smoke_test = "--smoke-test" in sys.argv
-    try:
-        controller = MainController(app)
-        if smoke_test:
-            QTimer.singleShot(1800, controller.request_close)
-        return controller.run()
-    except Exception as exc:
-        logging.getLogger("examai.startup").exception("startup failed")
-        if smoke_test:
-            return 1
-        QMessageBox.critical(
-            None, "EXAM AI · помилка запуску",
-            f"EXAM AI не вдалося запустити. Перевірте встановлені залежності та налаштування.\n\n"
-            f"{type(exc).__name__}: {exc}",
-        )
-        return 1
+    from examai.ui.motion import system_reduce_motion
+    config = ConfigManager()
+    splash = SplashScreen(config=config, reduced_motion=(
+        config.get("reduce_motion") or config.get("animation_intensity") == "off"
+        or config.get("ui_performance_mode") == "eco" or system_reduce_motion()
+    ))
+    controller = None
+
+    def initialize():
+        nonlocal controller
+        try:
+            controller = MainController(app, config=config)
+            if config.get("privacy_mode"):
+                controller.apply_privacy(True, persist=False)
+            controller.ui.show()
+            if smoke_test:
+                QTimer.singleShot(1800, controller.request_close)
+        except Exception as exc:
+            logging.getLogger("examai.startup").exception("startup failed")
+            splash.finish_splash()
+            if not smoke_test:
+                QMessageBox.critical(None, "EXAM AI · помилка запуску", f"{type(exc).__name__}: {exc}")
+            app.exit(1)
+            return
+        splash.finish_splash()
+
+    splash.show_loading()
+    splash.repaint()
+    QTimer.singleShot(0, initialize)
+    return app.exec()

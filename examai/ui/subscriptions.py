@@ -1,7 +1,8 @@
-"""Static subscription artwork. No purchase, account or API integration."""
+"""Themed subscription cards and catalog-backed sandbox actions."""
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QEasingCurve, Qt, QVariantAnimation
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from examai.ui.appearance import blend
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QSizePolicy, QVBoxLayout, QWidget,
@@ -70,8 +71,9 @@ class PlanTile(QWidget):
         self.setMinimumWidth(145)
         self.setMinimumHeight(295)
         outer = QVBoxLayout(self)
+        self.outer = outer
         outer.setContentsMargins(0, 15, 0, 0)
-        card = QFrame()
+        self.card = card = QFrame()
         card.setObjectName("PlanFeatured" if featured else "PlanCard")
         outer.addWidget(card)
         body = QVBoxLayout(card)
@@ -88,6 +90,11 @@ class PlanTile(QWidget):
         self.price_label.setMinimumHeight(49)
         body.addWidget(self.price_label)
         body.addSpacing(2)
+        self.hover_animation = QVariantAnimation(self)
+        self.hover_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hover_animation.valueChanged.connect(self.paint_highlight)
+        self.hover_colors = None
+        self.hover_value = 0.0
         self.features = []
         for feature in FEATURES:
             line = QHBoxLayout()
@@ -120,12 +127,49 @@ class PlanTile(QWidget):
             self.badge.move((self.width() - self.badge.width()) // 2, 0)
 
 
+    def paint_highlight(self, value):
+        if self.hover_colors is None:
+            return
+        self.hover_value = float(value)
+        host = self.window()
+        lift = round(3 * value) if hasattr(host, "motion_ms") and host.motion_ms(170) else 0
+        self.outer.setContentsMargins(0, 15 - lift, 0, lift)
+        surface, border, accent = self.hover_colors
+        glow = blend(surface, accent, 0.12 * value)
+        edge = blend(border, accent, value)
+        self.card.setStyleSheet(
+            f"QFrame#{self.card.objectName()} {{ background: {glow}; border: 1px solid {edge}; border-radius: 16px; }}"
+        )
+
+    def set_hover(self, target):
+        host = self.window()
+        duration = host.motion_ms(170) if hasattr(host, "motion_ms") else 0
+        self.hover_animation.stop()
+        if not duration or self.hover_colors is None:
+            self.paint_highlight(target)
+            return
+        self.hover_animation.setStartValue(self.hover_value)
+        self.hover_animation.setEndValue(target)
+        self.hover_animation.setDuration(duration)
+        self.hover_animation.start()
+
+    def enterEvent(self, event):
+        self.set_hover(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.set_hover(0.0)
+        super().leaveEvent(event)
+
+
 class SubscriptionsPage(QScrollArea):
     """Four visual price cards, reflowed to two columns on narrow windows."""
 
     def __init__(self, account=None):
         super().__init__()
         self.account = account
+        if account is not None:
+            account.catalog_changed.connect(self.refresh_checkout)
         self.setObjectName("SubscriptionsPage")
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -175,9 +219,27 @@ class SubscriptionsPage(QScrollArea):
         self._columns = 0
         self._reflow(4)
         self._built = True
+        if self.account is not None:
+            for index, card in enumerate(self.cards):
+                plan_id = str((1, 3, 6, 12)[index])
+                card.order_button.clicked.connect(lambda checked=False, plan=plan_id: self.account.open_checkout(plan))
+            self.refresh_checkout()
         config = getattr(self.window(), "config_mgr", None)
         if config:
             self.apply_theme(config.get("theme"), config.get("accent"))
+
+    def refresh_checkout(self):
+        if not self._built or self.account is None:
+            return
+        catalog = self.account.available_plans
+        for months, card in zip((1, 3, 6, 12), self.cards):
+            plan = catalog.get(str(months))
+            if plan:
+                card.price_label.setText(f"{plan['price_uah']} грн")
+            enabled = bool(plan and self.account.checkout.isEnabled())
+            card.order_button.setText("LiqPay · тест" if enabled else "Недоступно")
+            card.order_button.setEnabled(enabled)
+            card.order_button.setToolTip("Тестова оплата" if enabled else "Оформлення стане доступним пізніше")
 
     def apply_theme(self, theme, accent):
         if not self._built:
@@ -186,6 +248,13 @@ class SubscriptionsPage(QScrollArea):
         _, base, surface, border, fg, muted, active = THEMES.get(theme, THEMES["midnight"])
         if theme == "custom" and QColor(accent).isValid():
             active = accent
+        for card in self.cards:
+            card.hover_colors = surface, active if card.featured else border, active
+            card.hover_animation.stop()
+            card.paint_highlight(0.0)
+            motion = getattr(self.window(), "motion", None)
+            if motion:
+                motion.register(card.hover_animation)
         self.setStyleSheet(f"""
             #SubscriptionsPage {{ background: {base}; border: none; }}
             #PlanCard, #PlanFeatured, #SubscriptionStatus {{

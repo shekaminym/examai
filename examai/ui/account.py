@@ -29,12 +29,15 @@ class NetworkJob(QThread):
 
 
 class AccountPanel(QWidget):
+    session_changed = Signal()
+    catalog_changed = Signal()
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.job = None
         self.closing = False
         self.claim = ""
+        self.available_plans = {}
         self.device = config.get("account_device") or secrets.token_hex(16)
         try:
             token = reveal(config.get("account_session"))
@@ -67,7 +70,7 @@ class AccountPanel(QWidget):
         layout.addWidget(self.plans)
         self.checkout = QPushButton("Open sandbox checkout")
         self.checkout.setEnabled(False)
-        self.checkout.clicked.connect(self.open_checkout)
+        self.checkout.clicked.connect(lambda: self.open_checkout())
         layout.addWidget(self.checkout)
         self.button(layout, "Sandbox payment history", self.payment_history)
         layout.addStretch()
@@ -131,6 +134,7 @@ class AccountPanel(QWidget):
             return
         self.timer.stop()
         self.client.token = result["token"]
+        self.session_changed.emit()
         self.url.setReadOnly(True)
         try:
             self.config.set("account_session", protect(self.client.token))
@@ -159,11 +163,15 @@ class AccountPanel(QWidget):
         for plan in catalog["plans"]:
             self.plans.addItem(f"{plan['months']} mo / {plan['price_uah']} UAH", plan["id"])
         self.checkout.setEnabled(bool(account and catalog["checkout_available"]))
+        self.available_plans = {plan["id"]: plan for plan in catalog["plans"]}
+        self.catalog_changed.emit()
         label = "LiqPay sandbox checkout" if catalog["checkout_available"] else "Checkout unavailable"
         self.status.setText(f"{status}\n{prices}\n{label}")
 
-    def open_checkout(self):
-        plan = self.plans.currentData()
+    def open_checkout(self, plan=None):
+        plan = plan or self.plans.currentData()
+        if not self.checkout.isEnabled() or plan not in self.available_plans:
+            return
         def open_link(data):
             url = QUrl(data["url"])
             base = QUrl(self.client.url)
@@ -186,6 +194,7 @@ class AccountPanel(QWidget):
         self.timer.stop()
         def done(_):
             self.client.token = ""
+            self.session_changed.emit()
             self.url.setReadOnly(False)
             self.checkout.setEnabled(False)
             try:

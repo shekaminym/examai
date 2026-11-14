@@ -120,6 +120,8 @@ class CapturePrivacy(QObject):
     def _apply_one(self, window: QWidget) -> None:
         if not isValid(window) or window in self._retired:
             return
+        if window not in self._required and (not window.isVisible() or window.windowHandle() is None):
+            return
         self._busy = True
         try:
             # A QWidget can recreate its HWND after setWindowFlags(). Always

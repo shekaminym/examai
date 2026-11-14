@@ -811,6 +811,8 @@ class MainWindow(QMainWindow):
             self.input_manual_question.clear()
 
     def open_settings(self):
+        if not self.isVisible() or self.isMinimized():
+            return
         first_show = not self.settings_window.isVisible()
         self.settings_window.show()
         if first_show:
@@ -1433,6 +1435,15 @@ class MainWindow(QMainWindow):
         self.backdrop_active = set_windows_backdrop(self, enabled)
         # Keep capture-affinity windows opaque, even if transparency is configured.
         self.preview_transparency(self.config_mgr.get("window_transparency", 0))
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            self.settings_window.hide()
+        super().changeEvent(event)
+
+    def hideEvent(self, event):
+        self.settings_window.hide()
+        super().hideEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)

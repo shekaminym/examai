@@ -1,0 +1,150 @@
+"""Regression tests for the installed 3.0 feedback."""
+import os
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
+
+from examai.ai.conversation import Conversation
+from examai.ai.rag_engine import RAGEngine, ReferenceLookupError
+from examai.app import MainController
+from examai.config import ConfigManager
+from examai.database import DatabaseManager
+from examai.windows.privacy_qt import CapturePrivacy
+
+
+def controller(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    with (patch("examai.app.ConfigManager", return_value=ConfigManager(tmp_path / "config.json")),
+          patch("examai.app.DatabaseManager", return_value=DatabaseManager(tmp_path / "notes.db")),
+          patch("examai.app.keyboard.add_hotkey", return_value=None),
+          patch("examai.ui.ui_main.AudioCapturer.get_available_devices", return_value=[])):
+        return app, MainController(app)
+
+
+def test_hidden_settings_does_not_create_native_window(tmp_path):
+    app, ctl = controller(tmp_path)
+    window = ctl.ui
+    dialog = window.settings_window
+    with patch.object(dialog, "winId", wraps=dialog.winId) as native_id:
+        privacy = CapturePrivacy(app)
+        privacy.register(dialog, require_hidden=False)
+        privacy.set_enabled(True)
+        assert not native_id.called
+        window.show()
+        window.open_settings()
+        assert dialog.isVisible()
+        window.showMinimized()
+        QTest.qWait(220)
+        assert not dialog.isVisible()
+        window.open_settings()
+        assert not dialog.isVisible()
+        window.showNormal()
+        app.processEvents()
+        assert not dialog.isVisible()
+        window.open_settings()
+        assert dialog.isVisible()
+    app.removeEventFilter(privacy)
+    app.aboutToQuit.disconnect(ctl.shutdown)
+    window.deleteLater()
+
+
+def test_exact_spoken_line_and_range_preserve_physical_lines(tmp_path):
+    import pytest
+    source = tmp_path / "code.txt"
+    lines = [f"// line {number}" for number in range(1, 33)]
+    lines[26] = ""
+    lines[27] = "    for (int i = 0; i <= n; ++i) {"
+    source.write_bytes(("\r\n".join(lines) + "\r\n").encode())
+    rag = RAGEngine(DatabaseManager(tmp_path / "notes.db"))
+    rag.index_file_sync(source)
+    for query in ("Що написано в 28 рядку?", "Що робить 28 строчка?",
+                  "Поясни рядок 28 у code.txt", "What does line 28 do?", "в 28 строчке в коде"):
+        context = rag.retrieve_relevant_context(query, limit=2)
+        assert "цільовий рядок 28" in context and "28:     for (int i = 0;" in context
+        assert "\n27: \n" in context
+    context = rag.retrieve_relevant_context("Объясни строки 25–30", limit=2)
+    assert "цільові рядки 25–30" in context and "\n30: // line 30" in context and "31:" not in context
+    with pytest.raises(ReferenceLookupError, match="32 рядків"):
+        rag.retrieve_relevant_context("Поясни рядки 30–34")
+
+
+def test_followups_reach_existing_fast_engine_and_clear(tmp_path):
+    app, ctl = controller(tmp_path)
+    requests = []
+
+    class Engine:
+        used_model = "fixture"
+
+        def generate_answer(self, question, context, **_kwargs):
+            requests.append((question, context))
+            if question.startswith("Чим"):
+                if context:
+                    assert "диз'юнкція" in context and "кон'юнкція" in context
+                    return "Диз'юнкція істинна, якщо істинний хоча б один операнд. Кон'юнкція — лише якщо істинні обидва."
+                return "Missing context"
+            return "Логічна операція."
+
+    ctl.get_llm = lambda _mode: Engine()
+
+    def send(question):
+        ctl.submit_question(question, manual=True)
+        loop = QEventLoop()
+        ctl.api.finished.connect(loop.quit)
+        QTimer.singleShot(5000, loop.quit)
+        loop.exec()
+        app.processEvents()
+        assert ctl.api is None
+        return ctl.ui.txt_answer.toPlainText()
+
+    send("Що таке диз'юнкція?")
+    send("Що таке кон'юнкція?")
+    assert "обидва" in send("Чим вони відрізняються?")
+    send("Як створити таблицю в SQLite?")
+    assert "диз'юнкція" not in requests[-1][1]
+    ctl.on_clear_all()
+    assert send("Чим вони відрізняються?") == "Missing context"
+    app.aboutToQuit.disconnect(ctl.shutdown)
+    ctl.ui.deleteLater()
+
+
+def test_old_session_cannot_restore_memory():
+    memory = Conversation()
+    generation = memory.generation
+    memory.clear()
+    memory.remember("Old topic", "Old answer", generation)
+    assert not memory.context("Чим вони відрізняються?")
+
+
+def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
+    app, ctl = controller(tmp_path)
+    window = ctl.ui
+    window.show()
+    window.config_mgr.set("reduce_motion", True)
+    window.apply_performance_mode("premium")
+    if window.window_mode.collapsed:
+        window.window_mode.expand_toggle()
+    page = window.tab_subscriptions
+    window.tabs.setCurrentWidget(page)
+    app.processEvents()
+    card, neighbor = page.cards[:2]
+    geometry = neighbor.geometry()
+    card.set_hover(1.0)
+    app.processEvents()
+    assert card.hover_animation.state() == card.hover_animation.State.Stopped
+    assert card.outer.contentsMargins().top() == 15
+    assert neighbor.geometry() == geometry
+    window.config_mgr.set("reduce_motion", False)
+    window.motion.system_reduced = False
+    window.apply_performance_mode("premium")
+    card.set_hover(0.0)
+    QTest.qWait(200)
+    card.set_hover(1.0)
+    QTest.qWait(200)
+    assert card.outer.contentsMargins().top() == 12
+    assert neighbor.geometry() == geometry
+    app.aboutToQuit.disconnect(ctl.shutdown)
+    window.deleteLater()
