@@ -658,7 +658,7 @@ class QtTests(unittest.TestCase):
             second, _ = controller.start_api.call_args.args
             second.task()
             controller.get_llm.return_value.generate_answer.assert_called_with(
-                "виправлене питання", "", on_text=ANY, mode="smart", request_id=ANY
+                "виправлене питання", "", on_text=ANY, mode="fast", request_id=ANY
             )
             self.assertEqual(controller.db.get_history(), [])
             app.aboutToQuit.disconnect(controller.shutdown)
