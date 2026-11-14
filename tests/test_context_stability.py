@@ -131,6 +131,7 @@ def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
     window.tabs.setCurrentWidget(page)
     app.processEvents()
     card, neighbor = page.cards[:2]
+    QTest.qWait(100)  # Settle the scroll area after its initial column reflow.
     geometry = neighbor.geometry()
     card.set_hover(1.0)
     app.processEvents()
@@ -140,6 +141,8 @@ def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
     window.config_mgr.set("reduce_motion", False)
     window.motion.system_reduced = False
     window.apply_performance_mode("premium")
+    QTest.qWait(100)
+    geometry = neighbor.geometry()
     card.set_hover(0.0)
     QTest.qWait(200)
     card.set_hover(1.0)
