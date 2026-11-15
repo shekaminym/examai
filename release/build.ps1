@@ -1,4 +1,4 @@
-param([string]$Version = "3.0.0-beta.1",
+param([string]$Version = "3.1.0-beta.1",
       [string]$BuildRoot = "release-build",
       [switch]$SkipInstaller)
 $ErrorActionPreference = "Stop"

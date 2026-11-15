@@ -1,13 +1,18 @@
 """Account and reporting controls driven by network workers."""
+import base64
+import os
+from pathlib import Path
+import platform
 import secrets
 from time import monotonic
 
 from PySide6.QtCore import QThread, QTimer, QUrl, Signal, Qt
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QComboBox, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
                                QPushButton, QVBoxLayout, QWidget)
 
 from examai.beta import BetaClient
+from examai.branding import VERSION
 from examai.windows.credentials import protect, reveal
 
 
@@ -34,6 +39,8 @@ class AccountPanel(QWidget):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.developer = os.getenv("EXAMAI_DEVELOPER") == "1"
+        self.server_url = os.getenv("EXAMAI_SERVER_URL", "").strip()
         self.job = None
         self.closing = False
         self.claim = ""
@@ -44,7 +51,9 @@ class AccountPanel(QWidget):
         except (ValueError, OSError):
             token = ""
         try:
-            self.client = BetaClient(config.get("server_url"), token)
+            saved_url = config.get("server_url")
+            url = (saved_url or self.server_url) if self.developer else (self.server_url or saved_url)
+            self.client = BetaClient(url, token if url == saved_url else "")
         except ValueError:
             self.client = BetaClient()
         layout = QVBoxLayout(self)
@@ -53,6 +62,7 @@ class AccountPanel(QWidget):
         if self.client.token:
             self.url.setReadOnly(True)
         layout.addWidget(self.url)
+        self.url.setVisible(self.developer)
         self.status = QLabel("EXAM AI Cloud")
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
@@ -68,19 +78,22 @@ class AccountPanel(QWidget):
         self.timer.timeout.connect(self.poll)
         self.plans = QComboBox()
         layout.addWidget(self.plans)
+        self.plans.setVisible(self.developer)
         self.checkout = QPushButton("Open sandbox checkout")
         self.checkout.setEnabled(False)
         self.checkout.clicked.connect(lambda: self.open_checkout())
         layout.addWidget(self.checkout)
-        self.button(layout, "Sandbox payment history", self.payment_history)
+        self.checkout.setVisible(self.developer)
+        self.button(layout, "Sandbox payment history", self.payment_history).setVisible(self.developer)
         layout.addStretch()
 
     def button(self, layout, text, callback):
         button = QPushButton(text)
         layout.addWidget(button)
         button.clicked.connect(callback)
+        return button
 
-    def launch(self, task, success):
+    def launch(self, task, success, error_label=None):
         if self.closing or self.job is not None:
             return
         worker = self.job = NetworkJob(task, self)
@@ -89,7 +102,7 @@ class AccountPanel(QWidget):
             if self.closing:
                 return
             if error:
-                self.status.setText(error)
+                (self.status if error_label is None else error_label).setText(error)
             else:
                 success(value)
         worker.result.connect(complete, Qt.ConnectionType.QueuedConnection)
@@ -99,7 +112,10 @@ class AccountPanel(QWidget):
     def sign_in(self):
         if self.job is not None:
             return
-        current = self.url.text().strip()
+        current = self.url.text().strip() if self.developer else self.client.url
+        if not current:
+            self.status.setText("EXAM AI Cloud is not configured in this build.")
+            return
         try:
             client = BetaClient(current)
             if self.client.token:
@@ -158,15 +174,15 @@ class AccountPanel(QWidget):
             status = f"{account['state']} · {account['seconds'] // 60}:{account['seconds'] % 60:02d} beta time"
             if account["until"]:
                 status += " · " + datetime.fromtimestamp(account["until"], timezone.utc).date().isoformat()
-        prices = " · ".join(f"{p['months']} mo / {p['price_uah']} UAH" for p in catalog["plans"])
+        if account:
+            status = "\n".join(filter(None, (account.get("email"), status, account.get("plan"))))
         self.plans.clear()
         for plan in catalog["plans"]:
             self.plans.addItem(f"{plan['months']} mo / {plan['price_uah']} UAH", plan["id"])
-        self.checkout.setEnabled(bool(account and catalog["checkout_available"]))
+        self.checkout.setEnabled(bool(self.developer and account and catalog["checkout_available"]))
         self.available_plans = {plan["id"]: plan for plan in catalog["plans"]}
         self.catalog_changed.emit()
-        label = "LiqPay sandbox checkout" if catalog["checkout_available"] else "Checkout unavailable"
-        self.status.setText(f"{status}\n{prices}\n{label}")
+        self.status.setText(status)
 
     def open_checkout(self, plan=None):
         plan = plan or self.plans.currentData()
@@ -260,21 +276,85 @@ class AccountPanel(QWidget):
     def reports_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        form = QWidget()
+        form.setVisible(False)
+        self.report_toggle = self.button(layout, "Report a Problem", lambda checked: form.setVisible(checked))
+        self.report_toggle.setCheckable(True)
+        layout.addWidget(form)
+        layout = QVBoxLayout(form)
         kind = QComboBox()
         kind.addItems(["Bug", "Suggestion"])
         layout.addWidget(kind)
         description = QPlainTextEdit()
         description.setPlaceholderText("Describe the problem. Do not include passwords or keys.")
         layout.addWidget(description)
+        screenshot = QLabel()
+        screenshot.setVisible(False)
+        screenshot_data = b""
+
+        def select_screenshot():
+            nonlocal screenshot_data
+            name, _ = QFileDialog.getOpenFileName(panel, "Select screenshot", "", "PNG (*.png)")
+            if not name:
+                return
+            try:
+                with Path(name).open("rb") as file:
+                    data = file.read(2_000_001)
+                if len(data) > 2_000_000 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise ValueError
+                preview = QPixmap()
+                if not preview.loadFromData(data, "PNG"):
+                    raise ValueError
+            except (OSError, ValueError):
+                status.setText("Choose a valid PNG screenshot up to 2 MB.")
+                return
+            screenshot_data = data
+            screenshot.setPixmap(preview.scaled(320, 180, Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation))
+            screenshot.setVisible(True)
+            remove.setVisible(True)
+            status.clear()
+
+        def clear_screenshot():
+            nonlocal screenshot_data
+            screenshot_data = b""
+            screenshot.clear()
+            screenshot.hide()
+            remove.hide()
+
+        self.button(layout, "Attach PNG screenshot", select_screenshot)
+        layout.addWidget(screenshot)
+        remove = self.button(layout, "Remove screenshot", clear_screenshot)
+        remove.hide()
+        diagnostics = QCheckBox("Include diagnostic summary")
+        layout.addWidget(diagnostics)
+        diagnostic_text = f"EXAM AI {VERSION}\nOS: {platform.system()} {platform.version()}"
+        preview = QLabel(diagnostic_text)
+        preview.hide()
+        diagnostics.toggled.connect(preview.setVisible)
+        layout.addWidget(preview)
         status = QLabel()
         status.setWordWrap(True)
         layout.addWidget(status)
         def submit():
-            body = {"kind": kind.currentText(), "description": description.toPlainText()[:4000]}
+            body = {"kind": kind.currentText(), "description": description.toPlainText().strip(),
+                    "screenshot": base64.b64encode(screenshot_data).decode("ascii"),
+                    "diagnostics": diagnostic_text if diagnostics.isChecked() else ""}
+            if not 5 <= len(body["description"]) <= 4000:
+                status.setText("Enter a description of 5 to 4000 characters.")
+                return
+
+            def sent(result):
+                description.clear()
+                clear_screenshot()
+                diagnostics.setChecked(False)
+                status.setText(f"#{result['id']} · {result['status']}")
+
             self.launch(lambda: self.client.request("POST", "/reports", body),
-                        lambda result: (description.clear(), status.setText(f"#{result['id']} · {result['status']}")))
+                        sent, status)
         self.button(layout, "Submit report", submit)
         self.button(layout, "My reports", lambda: self.launch(
             lambda: self.client.request("GET", "/reports"),
-            lambda rows: status.setText("\n".join(f"#{row['id']} · {row['status']}" for row in rows) or "No reports")))
+            lambda rows: status.setText("\n".join(f"#{row['id']} · {row['status']}" for row in rows) or "No reports"),
+            status))
         return panel
