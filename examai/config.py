@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     "resolved_profile": "",
     "theme": "midnight",
     "accent": "#8e93ff",
-    "system_blur": True,
+    "system_blur": False,
     "animation_intensity": "full",
     "reduce_motion": False,
     "window_mode": "docked",
@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "auto_send": True,
     "answer_mode": "fast",
     "save_answer_history": False,
+    "active_document_source": "",
     "audio_device_index": -1,
     "audio_mode": "loopback",
     "audio_backend": "pyaudiowpatch",
@@ -78,6 +79,7 @@ class ConfigManager:
             value = data.get(name)
             if type(value) is type(default):
                 config[name] = value
+        config["system_blur"] = False
         # SMART is retired. Keep the persisted field for old configs, but it
         # must never affect the active answer pipeline.
         config["answer_mode"] = "fast"
@@ -104,6 +106,7 @@ class ConfigManager:
     def save_config(self, new_config=None):
         updated = self.config | (new_config or {})
         updated["answer_mode"] = "fast"
+        updated["system_blur"] = False
         # Preserve keys already on disk while keeping newly entered keys session-only.
         try:
             original = json.loads(self.filepath.read_text(encoding="utf-8-sig"))

@@ -7,6 +7,7 @@ from time import perf_counter
 
 from PySide6.QtCore import QThread, Signal
 
+from examai.ai.document_profile import analyze_document, terms as topic_terms, topic_score
 from examai.ai.semantic_search import SemanticSearch
 
 
@@ -18,6 +19,7 @@ INTERACTIVE_SQLITE_BUDGET_SECONDS = 0.05
 RETRIEVAL_BUDGET_SECONDS = 0.100
 MAX_CONTEXT_CHARS = 3200
 MAX_CANDIDATES = 16
+DOCUMENT_REFERENCE = re.compile(r"\b(?:конспект\w*|лекц\w*|файл\w*|код\w*|документ\w*|pdf|notes?|file|code)\b", re.I)
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
 STOP_WORDS = set(
@@ -26,15 +28,34 @@ STOP_WORDS = set(
     "the and what how why does do is are of a an".split()
 )
 log = logging.getLogger("phantom.timing.rag")
-LINE_WORD = r"(?:ряд(?:ок|к\w*|ц\w*)|стр(?:ок|оч)\w*|lines?)\b"
+LINE_WORD = r"(?:ряд(?:ок|к\w*|ц\w*)|стр(?:ок|оч|іч)\w*|lines?)\b"
 RANGE_END = r"(?:\s*(?:[-–—]|to|до)\s*(\d{1,6})(?!\d))?"
 LINE_AFTER_NUMBER = re.compile(
-    r"(?<!\w)(\d{1,6})(?:[-‐‑–]?(?:й|ий|ій|му|го|та|th|st|nd|rd))?"
+    r"(?<!\w)(\d{1,6})(?:[-‐‑–—]?(?:ий|ій|ма|му|го|та|th|st|nd|rd|й|м|а|я|ю))?"
     + RANGE_END + r"\s*" + LINE_WORD, re.IGNORECASE,
 )
 LINE_BEFORE_NUMBER = re.compile(
     LINE_WORD + r"\s*(?:№|#|номер\s*)?(\d{1,6})(?!\d)" + RANGE_END,
     re.IGNORECASE,
+)
+ORDINAL_LINES = (
+    (1, r"перш\w*|перв\w*|first"),
+    (2, r"друг\w*|втор\w*|second"),
+    (3, r"трет\w*|third"),
+    (4, r"четверт\w*|fourth"),
+    (5, r"п['’]?ят\w*|пят\w*|fifth"),
+    (6, r"шост\w*|шест\w*|sixth"),
+    (7, r"сьом\w*|седьм\w*|seventh"),
+    (8, r"восьм\w*|eighth"),
+    (9, r"дев['’]?ят\w*|девят\w*|ninth"),
+    (10, r"десят\w*|tenth"),
+    (100, r"сот\w*|hundredth"),
+)
+ORDINAL_LINE_PATTERNS = tuple(
+    (number, re.compile(
+        r"(?<!\w)(?:" + ordinal + r")\b\s+" + LINE_WORD +
+        r"|" + LINE_WORD + r"\s+(?:" + ordinal + r")\b", re.IGNORECASE,
+    )) for number, ordinal in ORDINAL_LINES
 )
 FUNCTION_NAME = re.compile(r"(?:функц\w*|function)\s+([A-Za-z_][A-Za-z_0-9]*)", re.IGNORECASE)
 FILE_REFERENCE = re.compile(r"(?<![\w.])[\w.-]+\.(?:txt|pdf|docx)(?![\w.-])")
@@ -51,6 +72,9 @@ def requested_lines(question):
         if match:
             first = int(match[1])
             return first, int(match[2]) if match[2] else first
+    for number, pattern in ORDINAL_LINE_PATTERNS:
+        if pattern.search(question):
+            return number, number
     return None
 
 
@@ -111,14 +135,18 @@ class RAGEngine:
         self.db_mgr = db_mgr
         self.semantic = semantic if semantic is not None else SemanticSearch(db_mgr)
 
-    def index_file_sync(self, filepath):
+    def index_file_sync(self, filepath, *, return_source=False):
         path = Path(filepath)
         if path.stat().st_size > MAX_FILE_BYTES:
             raise ValueError("Файл перевищує 25 МіБ.")
         parts = []
         length = 0
-        for piece in self._read_text(path):
+        is_pdf = path.suffix.lower() == ".pdf"
+        page_count = 0
+        for page_count, piece in enumerate(self._read_text(path), 1):
             if piece is not None:
+                if is_pdf and piece.strip():
+                    piece = f"[Сторінка {page_count}]\n{piece}"
                 length += len(piece) + 1
                 if length > MAX_TEXT_CHARS:
                     raise ValueError("Документ перевищує 2 млн символів.")
@@ -144,10 +172,13 @@ class RAGEngine:
                 break
             start = end - OVERLAP
         chunks = [chunk for chunk in chunks if chunk]
-        self.db_mgr.replace_document(path.name, chunks, lines=lines,
-                                     is_code=looks_like_code(text) if lines is not None else False,
-                                     origin=os.path.normcase(str(path.resolve())) if path.name.casefold() == "requirements.txt" else None)
-        return len(chunks)
+        source = self.db_mgr.replace_document(
+            path.name, chunks, lines=lines,
+            is_code=looks_like_code(text) if lines is not None else False,
+            origin=os.path.normcase(str(path.resolve())),
+            profile=analyze_document(path.name, text, pages=page_count if is_pdf else 0),
+        )
+        return (len(chunks), source) if return_source else len(chunks)
 
     @staticmethod
     def _read_text(path):
@@ -207,12 +238,13 @@ class RAGEngine:
             return named[0]
         if len(named) > 1:
             raise ReferenceLookupError("Уточніть назву файлу: запит відповідає кільком документам.")
-        for entry in sources:
-            if entry[0] == source_hint:
-                return entry
         code_sources = [entry for entry in sources if entry[2]]
-        if len(code_sources) == 1 and any(word in lowered for word in ("код", "програм", "лаборатор", "code")):
+        hinted = next((entry for entry in sources if entry[0] == source_hint), None)
+        code_requested = any(word in lowered for word in ("код", "програм", "лаборатор", "code"))
+        if code_requested and len(code_sources) == 1 and (hinted is None or not hinted[2]):
             return code_sources[0]
+        if hinted:
+            return hinted
         if len(sources) == 1:
             return sources[0]
         raise ReferenceLookupError("Уточніть назву TXT-файлу або виберіть його в «Конспектах».")
@@ -305,7 +337,14 @@ class RAGEngine:
                     selected = source_hint
                 else:
                     raise ReferenceLookupError(f"Є кілька файлів «{name}». Виберіть потрібний у «Конспектах».")
-            text, truncated, exact = self.db_mgr.named_document_text(selected, budget)
+            topical = topic_terms(re.sub(re.escape(name), "", query, flags=re.I))[:12]
+            relevant = ([row[2] for row in self._lexical_rows(topical, source=selected)[:2]]
+                        if topical and name != "requirements.txt" else [])
+            if relevant:
+                text = "\n\n".join(relevant)[:budget]
+                truncated, exact = False, False
+            else:
+                text, truncated, exact = self.db_mgr.named_document_text(selected, budget)
             log.info("request_id=%s rag_document_resolved=%s exact_lines=%s truncated=%s",
                      request_id, selected, exact, truncated)
             if not text.strip():
@@ -326,34 +365,67 @@ class RAGEngine:
         if named_context is not None:
             return named_context
         code_context = self._code_context(query, source_hint, request_id)
-        words = dict.fromkeys(WORD.findall(query.casefold()))
-        terms = [word for word in words if len(word) >= 2 and word not in STOP_WORDS][:24]
-        if not terms or limit <= 0:
+        terms = list(dict.fromkeys(topic_terms(query)))[:24]
+        if limit <= 0:
             return code_context
-        lexical = self._lexical_rows(terms)
+        lexical = self._lexical_rows(terms) if terms else []
         lexical_done = perf_counter()
-        semantic, status = self.semantic.search(query, MAX_CANDIDATES, started + RETRIEVAL_BUDGET_SECONDS)
+        semantic, status = self.semantic.search(query, MAX_CANDIDATES, started + RETRIEVAL_BUDGET_SECONDS) if terms else ([], "not_needed")
 
-        # Reciprocal rank fusion avoids comparing raw BM25 and cosine scores.
-        scores = {}
-        rows = {}
+        profiles = self.db_mgr.get_document_profiles(timeout=INTERACTIVE_SQLITE_BUDGET_SECONDS)
+        scores = {source: topic_score(query, profile) for source, profile in profiles.items()}
+        for source in {row[1] for row in lexical}:
+            scores[source] = scores.get(source, 0) + 3
+        for source in {row[1] for row in semantic}:
+            scores[source] = scores.get(source, 0) + 2
+        fusion_scores = {}
+        fusion_rows = {}
         for ranking in (lexical, semantic):
             for rank, row in enumerate(ranking, start=1):
-                doc_id = row[0]
-                scores[doc_id] = scores.get(doc_id, 0) + 1 / (60 + rank)
-                rows[doc_id] = row
-        ordered = sorted(scores, key=scores.__getitem__, reverse=True)[:limit]
-        context = "\n\n".join(f"[{rows[doc_id][1]}]\n{rows[doc_id][2]}" for doc_id in ordered)
-        if code_context:
+                fusion_scores[row[0]] = fusion_scores.get(row[0], 0) + 1 / (60 + rank)
+                fusion_rows[row[0]] = row
+        best_fusion = {}
+        for doc_id, score in fusion_scores.items():
+            source = fusion_rows[doc_id][1]
+            best_fusion[source] = max(score, best_fusion.get(source, 0))
+        if source_hint in profiles:
+            scores[source_hint] += 1
+        mentioned = bool(DOCUMENT_REFERENCE.search(query))
+        if not terms and mentioned and source_hint not in profiles:
+            if len(profiles) == 1:
+                source_hint = next(iter(profiles))
+            elif len(profiles) > 1:
+                raise ReferenceLookupError("Виберіть потрібний файл у «Конспектах».")
+        selected = max(scores, key=lambda source: (scores[source], best_fusion.get(source, 0))) if scores else None
+        if selected and scores[selected] <= 1 and not mentioned:
+            selected = None
+        if selected and scores[selected] <= 1 and mentioned and source_hint in profiles:
+            selected = source_hint
+
+        rows = []
+        if selected:
+            ranked_ids = sorted((doc_id for doc_id, row in fusion_rows.items()
+                                 if row[1] == selected), key=fusion_scores.__getitem__, reverse=True)
+            rows = [fusion_rows[doc_id] for doc_id in ranked_ids[:limit]]
+        if not rows and selected and mentioned:
+            preview = profiles[selected]["preview"].strip()
+            if preview:
+                rows = [(0, selected, preview)]
+        context = "\n\n".join(f"[{source}]\n{content}"
+                               for _, source, content in rows)
+        if code_context and (not selected or f"Файл «{selected}»" in code_context):
             context = code_context + ("\n\n" + context if context else "")
         context = context[:min(MAX_CONTEXT_CHARS, limit * (CHUNK_SIZE + 50))]
-        log.info("request_id=%s lexical_ms=%.1f semantic_ms=%.1f semantic_status=%s lexical_hits=%d "
-                 "semantic_hits=%d context_chars=%d",
-                 request_id, (lexical_done - started) * 1000, (perf_counter() - lexical_done) * 1000,
+        log.info("request_id=%s rag_source=%s source_score=%d lexical_ms=%.1f semantic_ms=%.1f "
+                 "semantic_status=%s lexical_hits=%d semantic_hits=%d context_chars=%d",
+                 request_id, selected, scores.get(selected, 0),
+                 (lexical_done - started) * 1000, (perf_counter() - lexical_done) * 1000,
                  status, len(lexical), len(semantic), len(context))
         return context
 
-    def _lexical_rows(self, terms):
+    def _lexical_rows(self, terms, *, source=None):
+        if not terms:
+            return []
         expression = " OR ".join(f'"{term}"*' for term in terms)
         deadline = perf_counter() + INTERACTIVE_SQLITE_BUDGET_SECONDS
         with self.db_mgr.connection(timeout=INTERACTIVE_SQLITE_BUDGET_SECONDS) as conn:
@@ -361,9 +433,9 @@ class RAGEngine:
             return conn.execute("""
                 SELECT d.id, d.source, d.content FROM documents_fts
                 JOIN documents d ON d.id = documents_fts.rowid
-                WHERE documents_fts MATCH ?
+                WHERE documents_fts MATCH ? AND (? IS NULL OR d.source = ?)
                 ORDER BY bm25(documents_fts), d.id LIMIT ?
-            """, (expression, MAX_CANDIDATES)).fetchall()
+            """, (expression, source, source, MAX_CANDIDATES)).fetchall()
 
     def get_summary_context(self, source):
         with self.db_mgr.connection() as conn:
@@ -411,7 +483,7 @@ class FileIndexerThread(QThread):
     def run(self):
         filename = Path(self.filepath).name
         try:
-            count = self.rag_engine.index_file_sync(self.filepath)
+            count, filename = self.rag_engine.index_file_sync(self.filepath, return_source=True)
         except Exception:
             self.result.emit(filename, 0, "Перевірте формат, розмір та наявність тексту.")
         else:

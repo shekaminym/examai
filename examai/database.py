@@ -1,7 +1,9 @@
 import sqlite3
+import json
 from pathlib import Path
 from contextlib import closing, contextmanager
 
+from examai.ai.document_profile import analyze_document
 
 from examai.paths import data_root
 
@@ -51,6 +53,14 @@ class DatabaseManager:
             conn.execute("""CREATE TABLE IF NOT EXISTS document_origins (
                 source TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS document_profiles (
+                source TEXT PRIMARY KEY,
+                title_terms TEXT NOT NULL,
+                keywords TEXT NOT NULL,
+                preview TEXT NOT NULL,
+                char_count INTEGER NOT NULL,
+                page_count INTEGER NOT NULL DEFAULT 0
+            )""")
             conn.execute("CREATE INDEX IF NOT EXISTS documents_source ON documents(source)")
             conn.execute("CREATE INDEX IF NOT EXISTS document_lines_source ON document_lines(source, line_number)")
             existing = conn.execute(
@@ -99,6 +109,39 @@ class DatabaseManager:
             """)
             if line_fts_exists is None:
                 conn.execute("INSERT INTO document_lines_fts(document_lines_fts) VALUES ('rebuild')")
+            # Existing installations already have imported notes. Upgrade
+            # their topic index in place without asking users to upload again.
+            missing = conn.execute("""
+                SELECT DISTINCT d.source FROM documents AS d
+                LEFT JOIN document_profiles AS p ON p.source = d.source
+                WHERE p.source IS NULL ORDER BY d.source
+            """).fetchall()
+            for (source,) in missing:
+                text = "\n".join(row[0] for row in conn.execute(
+                    "SELECT content FROM documents WHERE source = ? ORDER BY id", (source,)
+                ))
+                self._write_profile(conn, source, analyze_document(source, text))
+
+    @staticmethod
+    def _write_profile(conn, source, profile):
+        conn.execute("""
+            INSERT OR REPLACE INTO document_profiles
+            (source, title_terms, keywords, preview, char_count, page_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (source, json.dumps(profile["title_terms"], ensure_ascii=False),
+              json.dumps(profile["keywords"], ensure_ascii=False), profile["preview"],
+              profile["char_count"], profile["page_count"]))
+
+    def get_document_profiles(self, *, timeout=0.05):
+        with self.connection(timeout=timeout) as conn:
+            rows = conn.execute("""
+                SELECT source, title_terms, keywords, preview, char_count, page_count
+                FROM document_profiles ORDER BY source
+            """)
+            return {source: {"title_terms": json.loads(title),
+                             "keywords": json.loads(keywords), "preview": preview,
+                             "char_count": chars, "page_count": pages}
+                    for source, title, keywords, preview, chars, pages in rows}
 
     def get_documents_list(self, *, timeout=3):
         with self.connection(timeout=timeout) as conn:
@@ -111,6 +154,7 @@ class DatabaseManager:
             conn.execute("DELETE FROM document_lines WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_meta WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_origins WHERE source = ?", (source_name,))
+            conn.execute("DELETE FROM document_profiles WHERE source = ?", (source_name,))
 
     def named_document_text(self, source, budget):
         with self.connection(timeout=0.05) as conn:
@@ -133,7 +177,9 @@ class DatabaseManager:
             text = "\n\n".join(content for content, in rows)
             return text[:budget], len(text) >= budget, False
 
-    def replace_document(self, source_name, chunks, *, lines=None, is_code=False, origin=None):
+    def replace_document(self, source_name, chunks, *, lines=None, is_code=False, origin=None,
+                         profile=None):
+        chunks = list(chunks)
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if origin is not None:
@@ -157,6 +203,7 @@ class DatabaseManager:
             conn.execute("DELETE FROM documents WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_lines WHERE source = ?", (source_name,))
             conn.execute("DELETE FROM document_meta WHERE source = ?", (source_name,))
+            conn.execute("DELETE FROM document_profiles WHERE source = ?", (source_name,))
             conn.executemany(
                 "INSERT INTO documents (content, source) VALUES (?, ?)",
                 ((chunk, source_name) for chunk in chunks),
@@ -170,6 +217,10 @@ class DatabaseManager:
                     "INSERT INTO document_meta (source, line_count, is_code) VALUES (?, ?, ?)",
                     (source_name, len(lines), int(is_code)),
                 )
+            self._write_profile(conn, source_name, profile or analyze_document(
+                source_name, "\n".join(chunks)
+            ))
+            return source_name
 
     def get_line_sources(self):
         with self.connection() as conn:
