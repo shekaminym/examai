@@ -3,7 +3,8 @@ from time import perf_counter
 from examai.performance import timing
 
 from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QRect, Qt
-from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtGui import (QColor, QGuiApplication, QIcon, QKeySequence,
+                           QPainter, QPainterPath, QPen, QPixmap, QShortcut)
 from PySide6.QtWidgets import QSizeGrip, QSizePolicy
 
 
@@ -14,6 +15,30 @@ def dock_geometry(area, anchor, width, height):
     x = {"left": area.left() + gap, "right": area.right() - width + 1 - gap}.get(
         anchor, area.left() + (area.width() - width) // 2)
     return QRect(x, area.top(), width, height)
+
+
+def pin_icon(color):
+    """Draw one crisp pushpin at the current theme's foreground color."""
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(color), 1.8, Qt.PenStyle.SolidLine,
+                        Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    pin = QPainterPath()
+    pin.moveTo(7, 5)
+    pin.lineTo(17, 5)
+    pin.lineTo(15, 9)
+    pin.lineTo(15, 13)
+    pin.lineTo(9, 13)
+    pin.lineTo(9, 9)
+    pin.closeSubpath()
+    painter.drawPath(pin)
+    painter.drawLine(6, 14, 18, 14)
+    painter.drawLine(12, 14, 12, 21)
+    painter.end()
+    return QIcon(pixmap)
 
 
 class WindowMode(QObject):
@@ -80,7 +105,15 @@ class WindowMode(QObject):
         self.window.activateWindow()
 
     def update_pin_label(self):
-        self.window.btn_pin.setText(self.window.tr.local("Відкріпити" if self.docked else "Закріпити"))
+        from examai.ui.appearance import THEMES
+        label = self.window.tr.local("Відкріпити" if self.docked else "Закріпити")
+        theme = self.config.get("theme")
+        color = THEMES.get(theme, THEMES["midnight"])[4]
+        button = self.window.btn_pin
+        button.setText("")
+        button.setIcon(pin_icon(color))
+        button.setToolTip(label)
+        button.setAccessibleName(label)
 
     def apply(self, animate=False):
         w = self.window

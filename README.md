@@ -122,6 +122,11 @@ Ghost Mode окно остаётся непрозрачным.
 `-c` отображаются как ссылки на другие файлы. Приложение их не читает с диска
 и не запускает установку зависимостей.
 
-## EXAM AI 3.1 Closed Beta
+## EXAM AI 3.2 Closed Beta
 
 [Desktop build, accounts and beta backend](docs/EXAMAI_3_BETA.md).
+[Integration map for Arseniy's source and the beta platform](docs/EXAMAI_3_2_INTEGRATION.md).
+
+## Участники
+
+- [shibuyatobel-bit](https://github.com/shibuyatobel-bit) — документация проекта.

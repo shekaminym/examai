@@ -99,17 +99,28 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
         probe = QTimer(interval=10)
         probe.timeout.connect(lambda: released.set() if "Перший фрагмент" in ctl.ui.txt_answer.toPlainText() else None)
         probe.start()
-        QTimer.singleShot(8500, loop.quit)
+        timeout = QTimer(singleShot=True, interval=12000)
+        timeout.timeout.connect(loop.quit)
+        timeout.start()
         try:
             loop.exec()
             app.processEvents()
-            assert released.is_set()
+            assert released.is_set(), ctl.ui.txt_answer.toPlainText()
             assert ctl.api is None and "завершення" in ctl.ui.txt_answer.toPlainText()
         finally:
+            probe.stop()
+            timeout.stop()
             released.set()
         return posted[-1]["contents"][0]["parts"][0]["text"]
 
     try:
+        for question in ("Інтеграл", "Що таке Диференціювання?"):
+            send(question, voice=cloud)
+        payload = send("В чому різниця між ними?", voice=cloud)
+        current_question, memory = payload.split(CONVERSATION_HEADER, 1)
+        assert "Інтеграл" in current_question and "Диференціювання" in current_question
+        assert "Інтеграл" in memory and "Диференціювання" in memory
+        ctl.on_clear_all()
         for question in ("Що таке диз'юнкція?", "Що таке кон'юнкція?"):
             send(question)
         payload = send("Чим вони відрізняються?")
@@ -126,6 +137,14 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
             else:
                 assert CONVERSATION_HEADER in payload
         assert CONVERSATION_HEADER not in send("Як створити таблицю в SQLite?")
+        ctl.on_clear_all()
+        from pathlib import Path
+        ctl.rag.index_file_sync(Path(__file__).parent / "fixtures" / "code.txt")
+        payload = send("Що робить 58-й рядок у code.txt?")
+        assert "58:" in payload and "double" in payload
+        for followup in ("Детальніше розкажи", "А для чого потрібна ця змінна?"):
+            payload = send(followup)
+            assert all(anchor in payload for anchor in (CONVERSATION_HEADER, "code.txt", "58:", "double"))
     finally:
         ctl.audio = None
         ctl.shutdown()

@@ -3,19 +3,15 @@
 from PySide6.QtCore import QEasingCurve, Qt, QVariantAnimation
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from examai.ui.appearance import blend
+from examai.ui.translator import TRANSLATIONS
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QSizePolicy, QVBoxLayout, QWidget,
 )
 
 
-PLANS = (
-    ("1 місяць", "149 грн"),
-    ("3 місяці", "399 грн"),
-    ("6 місяців", "699 грн"),
-    ("12 місяців", "1299 грн"),
-)
-FEATURES = ("Доступ до AI", "Аналіз екрана", "Робота з PDF", "Історія")
+PLANS = ((1, 149), (3, 399), (6, 699), (12, 1299))
+FEATURES = ("sub_feature_ai", "sub_feature_screen", "sub_feature_pdf", "sub_feature_history")
 
 
 class SubscriptionBackdrop(QWidget):
@@ -31,12 +27,17 @@ class CrownIcon(QWidget):
     def __init__(self):
         super().__init__()
         self.setFixedSize(30, 26)
+        self.color = QColor("#ac9cff")
+
+    def set_color(self, color):
+        self.color = QColor(color)
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor("#ac9cff"), 2.1, Qt.PenStyle.SolidLine,
+        painter.setPen(QPen(self.color, 2.1, Qt.PenStyle.SolidLine,
                             Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         crown = QPainterPath()
         crown.moveTo(3, 7)
@@ -54,37 +55,54 @@ class CheckIcon(QWidget):
     def __init__(self):
         super().__init__()
         self.setFixedSize(20, 20)
+        self.color = QColor("#b6d8ff")
+
+    def set_color(self, color):
+        self.color = QColor(color)
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#b6d8ff"), 1.9, Qt.PenStyle.SolidLine,
+        painter.setPen(QPen(self.color, 1.9, Qt.PenStyle.SolidLine,
                             Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         painter.drawLine(3, 10, 8, 15)
         painter.drawLine(8, 15, 17, 5)
 
 
 class PlanTile(QWidget):
-    def __init__(self, term, price, *, featured=False):
+    def __init__(self, months, price, *, featured=False):
         super().__init__()
+        self.months = months
+        self.price_uah = price
         self.featured = featured
         self.setMinimumWidth(145)
         self.setMinimumHeight(295)
         outer = QVBoxLayout(self)
         self.outer = outer
-        outer.setContentsMargins(0, 15, 0, 0)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        self.badge = None
+        if featured:
+            self.badge = QLabel()
+            self.badge.setObjectName("PlanBadge")
+            self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.badge.setFixedSize(128, 24)
+            outer.addWidget(self.badge, alignment=Qt.AlignmentFlag.AlignHCenter)
+        else:
+            outer.addSpacing(24)
         self.card = card = QFrame()
         card.setObjectName("PlanFeatured" if featured else "PlanCard")
-        outer.addWidget(card)
+        outer.addWidget(card, 1)
         body = QVBoxLayout(card)
         body.setContentsMargins(13, 17, 13, 12)
         body.setSpacing(8)
-        self.term_label = QLabel(term)
+        self.term_label = QLabel()
         self.term_label.setObjectName("PlanTerm")
         self.term_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.term_label.setWordWrap(True)
         body.addWidget(self.term_label)
-        self.price_label = QLabel(price)
+        self.price_label = QLabel()
         self.price_label.setObjectName("PlanPriceFeatured" if featured else "PlanPrice")
         self.price_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.price_label.setMinimumHeight(49)
@@ -96,35 +114,25 @@ class PlanTile(QWidget):
         self.hover_colors = None
         self.hover_value = 0.0
         self.features = []
-        for feature in FEATURES:
+        self.check_icons = []
+        for _feature in FEATURES:
             line = QHBoxLayout()
             line.setSpacing(6)
-            line.addWidget(CheckIcon())
-            label = QLabel(feature)
+            check = CheckIcon()
+            line.addWidget(check)
+            self.check_icons.append(check)
+            label = QLabel()
             label.setObjectName("PlanFeature")
             label.setWordWrap(True)
             line.addWidget(label, 1)
             body.addLayout(line)
             self.features.append(label)
         body.addStretch()
-        self.order_button = QPushButton("Оформити")
+        self.order_button = QPushButton()
         self.order_button.setObjectName("PlanOrderFeatured" if featured else "PlanOrder")
         self.order_button.setMinimumHeight(43)
         self.order_button.setEnabled(False)
-        self.order_button.setToolTip("Оформлення стане доступним пізніше")
         body.addWidget(self.order_button)
-        self.badge = None
-        if featured:
-            self.badge = QLabel("Найвигідніше", self)
-            self.badge.setObjectName("PlanBadge")
-            self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.badge.setFixedSize(126, 30)
-            self.badge.raise_()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.badge is not None:
-            self.badge.move((self.width() - self.badge.width()) // 2, 0)
 
 
     def paint_highlight(self, value):
@@ -133,12 +141,13 @@ class PlanTile(QWidget):
         self.hover_value = float(value)
         host = self.window()
         lift = round(3 * value) if hasattr(host, "motion_ms") and host.motion_ms(170) else 0
-        self.outer.setContentsMargins(0, 15 - lift, 0, lift)
+        self.outer.setContentsMargins(0, 3 - lift, 0, lift)
         surface, border, accent = self.hover_colors
         glow = blend(surface, accent, 0.12 * value)
         edge = blend(border, accent, value)
         self.card.setStyleSheet(
-            f"QFrame#{self.card.objectName()} {{ background: {glow}; border: 1px solid {edge}; border-radius: 16px; }}"
+            f"QFrame#{self.card.objectName()} {{ background: {glow}; border: "
+            f"{2 if self.featured else 1}px solid {edge}; border-radius: 16px; }}"
         )
 
     def set_hover(self, target):
@@ -177,6 +186,10 @@ class SubscriptionsPage(QScrollArea):
         self._built = False
         self.cards = []
         self._columns = 0
+        self.language = "UA"
+        self._theme = "midnight"
+        self._accent = "#8e93ff"
+        self._plan_prices = {months: price for months, price in PLANS}
 
     def _build(self):
         if self._built:
@@ -186,10 +199,10 @@ class SubscriptionsPage(QScrollArea):
         root = QVBoxLayout(self.backdrop)
         root.setContentsMargins(15, 14, 15, 10)
         root.setSpacing(10)
-        self.heading = QLabel("Підписки")
+        self.heading = QLabel()
         self.heading.setObjectName("SubscriptionHeading")
         root.addWidget(self.heading)
-        self.subtitle = QLabel("Обери оптимальний тариф для EXAM AI")
+        self.subtitle = QLabel()
         self.subtitle.setObjectName("SubscriptionSubtitle")
         self.subtitle.setWordWrap(True)
         root.addWidget(self.subtitle)
@@ -198,15 +211,16 @@ class SubscriptionsPage(QScrollArea):
         status_row = QHBoxLayout(status)
         status_row.setContentsMargins(16, 10, 16, 10)
         status_row.setSpacing(12)
-        status_row.addWidget(CrownIcon())
-        self.status_label = QLabel("Активна підписка:  відсутня")
+        self.crown = CrownIcon()
+        status_row.addWidget(self.crown)
+        self.status_label = QLabel()
         self.status_label.setObjectName("SubscriptionStatusText")
         self.status_label.setWordWrap(True)
         status_row.addWidget(self.status_label, 1)
         root.addWidget(status)
         root.addSpacing(4)
-        self.cards = [PlanTile(term, price, featured=index == 1)
-                      for index, (term, price) in enumerate(PLANS)]
+        self.cards = [PlanTile(months, price, featured=index == 1)
+                      for index, (months, price) in enumerate(PLANS)]
         self.cards_container = QWidget()
         self.cards_container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.grid = QGridLayout(self.cards_container)
@@ -224,9 +238,8 @@ class SubscriptionsPage(QScrollArea):
                 plan_id = str((1, 3, 6, 12)[index])
                 card.order_button.clicked.connect(lambda checked=False, plan=plan_id: self.account.open_checkout(plan))
             self.refresh_checkout()
-        config = getattr(self.window(), "config_mgr", None)
-        if config:
-            self.apply_theme(config.get("theme"), config.get("accent"))
+        self.set_language(self.language)
+        self.apply_theme(self._theme, self._accent)
 
     def refresh_checkout(self):
         if not self._built or self.account is None:
@@ -235,20 +248,23 @@ class SubscriptionsPage(QScrollArea):
         for months, card in zip((1, 3, 6, 12), self.cards):
             plan = catalog.get(str(months))
             if plan:
-                card.price_label.setText(f"{plan['price_uah']} грн")
+                self._plan_prices[months] = plan["price_uah"]
             enabled = bool(plan and self.account.checkout.isEnabled())
-            card.order_button.setText("LiqPay · тест" if enabled else "Недоступно")
             card.order_button.setEnabled(enabled)
-            card.order_button.setToolTip("Тестова оплата" if enabled else "Оформлення стане доступним пізніше")
+        self.set_language(self.language)
 
     def apply_theme(self, theme, accent):
+        self._theme, self._accent = theme, accent
         if not self._built:
             return
         from examai.ui.appearance import THEMES
         _, base, surface, border, fg, muted, active = THEMES.get(theme, THEMES["midnight"])
         if theme == "custom" and QColor(accent).isValid():
             active = accent
+        self.crown.set_color(active)
         for card in self.cards:
+            for check in card.check_icons:
+                check.set_color(active)
             card.hover_colors = surface, active if card.featured else border, active
             card.hover_animation.stop()
             card.paint_highlight(0.0)
@@ -265,6 +281,11 @@ class SubscriptionsPage(QScrollArea):
             #SubscriptionHeading {{ font-size: 23px; font-weight: 700; }}
             #SubscriptionSubtitle {{ color: {muted}; }}
             #PlanPrice, #PlanPriceFeatured {{ font-size: 20px; font-weight: 700; }}
+            #PlanBadge {{ background: {active}; color: {base}; border: 1px solid {active};
+                border-radius: 11px; font-size: 11px; font-weight: 700; }}
+            #PlanOrder, #PlanOrderFeatured {{ border-radius: 12px; padding: 6px; }}
+            #PlanOrder:disabled, #PlanOrderFeatured:disabled {{ color: {muted};
+                background: {surface}; border: 1px solid {border}; }}
         """)
 
     def _reflow(self, columns):
@@ -292,6 +313,24 @@ class SubscriptionsPage(QScrollArea):
             card.setMinimumHeight(height)
 
     def set_language(self, language):
-        # The mockup follows the supplied Ukrainian design in both UI locales.
-        if self._built:
-            self.heading.setText("Підписки")
+        self.language = language if language in TRANSLATIONS else "UA"
+        if not self._built:
+            return
+        words = TRANSLATIONS[self.language]
+        self.heading.setText(words["sub_title"])
+        self.subtitle.setText(words["sub_description"])
+        self.status_label.setText(words["sub_status"])
+        for card in self.cards:
+            card.term_label.setText(words[f"sub_month_{card.months}"])
+            card.price_label.setText(words["sub_price"].format(
+                amount=self._plan_prices[card.months]))
+            for key, label in zip(FEATURES, card.features):
+                label.setText(words[key])
+            if card.badge is not None:
+                card.badge.setText(words["sub_best"])
+            available = card.order_button.isEnabled()
+            card.order_button.setText(words["sub_checkout"] if available and self.account is None
+                                      else words["sub_test_checkout"] if available
+                                      else words["sub_unavailable"])
+            card.order_button.setToolTip(words["sub_test_checkout"] if available
+                                         else words["sub_tip_unavailable"])

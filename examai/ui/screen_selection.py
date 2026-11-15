@@ -29,7 +29,7 @@ def map_selection_to_pixels(selection: QRect, logical: QRect, pixmap: QPixmap) -
     return QRect(x0, y0, max(0, x1 - x0), max(0, y1 - y0))
 
 
-def encode_image(image: QImage) -> tuple[bytes, str]:
+def encode_image(image: QImage, *, max_bytes=MAX_INLINE_BYTES) -> tuple[bytes, str]:
     """Keep fine text lossless where possible, with a bounded inline payload."""
     if image.isNull():
         raise ValueError("Порожня виділена область.")
@@ -49,17 +49,24 @@ def encode_image(image: QImage) -> tuple[bytes, str]:
         return bytes(buffer.data())
 
     png = encode(image, "PNG")
-    if len(png) <= MAX_INLINE_BYTES:
+    if len(png) <= max_bytes:
         return png, "image/png"
     jpeg = encode(image, "JPEG", 92)
-    if len(jpeg) <= MAX_INLINE_BYTES:
+    if len(jpeg) <= max_bytes:
         return jpeg, "image/jpeg"
     factor = min(1.0, 3200 / max(image.width(), image.height()))
     smaller = image.scaled(round(image.width() * factor), round(image.height() * factor),
                            Qt.AspectRatioMode.KeepAspectRatio,
                            Qt.TransformationMode.SmoothTransformation)
     jpeg = encode(smaller, "JPEG", 88)
-    if len(jpeg) > MAX_INLINE_BYTES:
+    if len(jpeg) > max_bytes:
+        factor = min(.8, (max_bytes / len(jpeg)) ** .5 * .85)
+        smaller = smaller.scaled(max(1, round(smaller.width() * factor)),
+                                 max(1, round(smaller.height() * factor)),
+                                 Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+        jpeg = encode(smaller, "JPEG", 80)
+    if len(jpeg) > max_bytes:
         raise ValueError("Виділена область завелика для одного запиту.")
     return jpeg, "image/jpeg"
 

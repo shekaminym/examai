@@ -49,6 +49,7 @@ def test_hidden_settings_does_not_create_native_window(tmp_path):
         assert dialog.isVisible()
     app.removeEventFilter(privacy)
     app.aboutToQuit.disconnect(ctl.shutdown)
+    ctl.shutdown()
     window.deleteLater()
 
 
@@ -81,9 +82,10 @@ def test_followups_reach_existing_fast_engine_and_clear(tmp_path):
 
         def generate_answer(self, question, context, **_kwargs):
             requests.append((question, context))
-            if question.startswith("Чим"):
+            if question.startswith(("Чим", "Порівняй")):
                 if context:
                     assert "диз'юнкція" in context and "кон'юнкція" in context
+                    assert "диз'юнкція" in question and "кон'юнкція" in question
                     return "Диз'юнкція істинна, якщо істинний хоча б один операнд. Кон'юнкція — лише якщо істинні обидва."
                 return "Missing context"
             return "Логічна операція."
@@ -108,6 +110,7 @@ def test_followups_reach_existing_fast_engine_and_clear(tmp_path):
     ctl.on_clear_all()
     assert send("Чим вони відрізняються?") == "Missing context"
     app.aboutToQuit.disconnect(ctl.shutdown)
+    ctl.shutdown()
     ctl.ui.deleteLater()
 
 
@@ -136,7 +139,7 @@ def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
     card.set_hover(1.0)
     app.processEvents()
     assert card.hover_animation.state() == card.hover_animation.State.Stopped
-    assert card.outer.contentsMargins().top() == 15
+    assert card.outer.contentsMargins().top() == 3
     assert neighbor.geometry() == geometry
     window.config_mgr.set("reduce_motion", False)
     window.motion.system_reduced = False
@@ -147,7 +150,7 @@ def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
     QTest.qWait(200)
     card.set_hover(1.0)
     QTest.qWait(200)
-    assert card.outer.contentsMargins().top() == 12
+    assert card.outer.contentsMargins().top() == 0
     assert neighbor.geometry() == geometry
     app.aboutToQuit.disconnect(ctl.shutdown)
     window.deleteLater()

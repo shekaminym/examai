@@ -89,6 +89,16 @@ class RoundedWindowTests(unittest.TestCase):
         self.assertTrue(mask.contains(QPoint(700, 240)))
         self.assertFalse(mask.contains(QPoint(260, 600)))
 
+    def test_corner_follows_a_circle_without_long_polygon_facets(self):
+        window = self.window(radius=24)
+        mask = window.mask()
+        left_edges = [next(x for x in range(25) if mask.contains(QPoint(x, y)))
+                      for y in range(24)]
+        self.assertGreater(left_edges[0], 17)
+        self.assertEqual(left_edges[-1], 0)
+        self.assertTrue(all(a >= b for a, b in zip(left_edges, left_edges[1:])))
+        self.assertGreater(len(set(left_edges)), 10)
+
     def test_exposed_root_surface_is_dark_instead_of_white(self):
         window = self.window()
         self.assertTrue(window.autoFillBackground())
@@ -128,6 +138,7 @@ class RoundedWindowTests(unittest.TestCase):
         self.assertFalse(window.mask().contains(QPoint(0, 0)))
         self.assertTrue(window.mask().contains(window.rect().center()))
         self.assertIn("#141518", window.styleSheet())
+        self.assertIn("#BrandIcon {\n            background: transparent", window.styleSheet())
 
 
 if __name__ == "__main__":

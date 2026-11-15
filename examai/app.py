@@ -3,14 +3,15 @@ import os
 import sqlite3
 import sys
 import threading
+from hashlib import sha256
 from math import ceil
 from time import perf_counter
 from uuid import uuid4
 
 import keyboard
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QMenu, QMessageBox
-from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
+from PySide6.QtCore import QEventLoop, QObject, QThread, QTimer, Signal, Slot, Qt
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QMessageBox
+from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication, QKeySequence, QShortcut
 from examai.ui.appearance import THEMES
 from examai.ui.response_view import FormulaJobs
 
@@ -23,6 +24,7 @@ from examai.ui.developer_timing import DeveloperTimingWindow
 from examai.database import DatabaseManager
 from examai.ai.llm_engine import GenerationError, LLMEngine
 from examai.windows.privacy_qt import CapturePrivacy
+from examai.windows.taskbar import set_taskbar_hidden
 from examai.ui.rounded_window import configure_rounded_window
 from examai.ai.rag_engine import FILE_REFERENCE, FileIndexerThread, RAGEngine
 from examai.ai.rag_engine import ReferenceLookupError, requested_lines
@@ -41,6 +43,26 @@ CLOUD_FINAL_TIMEOUT_SECONDS = 0.65
 ANSWER_TARGET_SECONDS = 2.0
 MAX_RETIRED_ANSWERS = 2
 MAX_SESSION_ANSWERS = 30
+
+
+class BackgroundCall(QObject):
+    """Run startup I/O without starving Qt's loading animation."""
+
+    ready = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        self.task = task
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True, name="examai-startup").start()
+
+    def _run(self):
+        try:
+            self.ready.emit(self.task())
+        except Exception as exc:
+            self.failed.emit(exc)
 
 
 class ModernSpinner(QWidget):
@@ -113,11 +135,22 @@ class SplashScreen(QWidget):
 
         self.spinner = ModernSpinner(self.bg_frame, animated=not reduced_motion)
         self.spinner.accent = QColor(accent)
+        self.spinner.setVisible(not reduced_motion)
+        self.status_label = QLabel(
+            "Loading..." if config and config.get("language") == "ENG" else "Завантаження...",
+            self.bg_frame,
+        )
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet(
+            f"color: {foreground}; font-family: 'Segoe UI'; font-size: 12px; "
+            "background: transparent; border: none;"
+        )
 
         bg_layout.addStretch()
         bg_layout.addWidget(self.title_label)
         bg_layout.addSpacing(16)
         bg_layout.addWidget(self.spinner, alignment=Qt.AlignCenter)
+        bg_layout.addWidget(self.status_label, alignment=Qt.AlignCenter)
         bg_layout.addStretch()
 
         layout.addWidget(self.bg_frame)
@@ -139,6 +172,14 @@ class SplashScreen(QWidget):
         self.close()
         if self.main_window is not None:
             self.main_window.show()
+
+
+def pump_startup_splash(app, splash):
+    """Paint the loading indicator between GUI construction stages."""
+    if splash.isVisible():
+        if splash.spinner.timer.isActive():
+            splash.spinner.rotate()
+        app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
 
 class DecodeMailbox:
@@ -542,14 +583,18 @@ class MainController(QObject):
     hotkey = Signal()
     recover_window_hotkey = Signal()
 
-    def __init__(self, app, *, config=None):
+    def __init__(self, app, *, config=None, database=None, startup_devices=None,
+                 startup_pump=None):
         super().__init__()
         self.app = app
         self.config = config if config is not None else ConfigManager()
-        self.db = DatabaseManager()
+        self.db = database if database is not None else DatabaseManager()
         self.rag = RAGEngine(self.db)
         self.stt = self.stt_settings = None
-        self.ui = MainWindow(self.config, self.db)
+        self.ui = MainWindow(self.config, self.db, startup_devices=startup_devices,
+                             startup_pump=startup_pump)
+        if startup_pump:
+            startup_pump()
         self.formula_jobs = FormulaJobs(self.ui)
         for view in (self.ui.txt_answer, self.ui.live_cards.answer_text, self.ui.txt_docs_result):
             view.enable_background_formulas(self.formula_jobs)
@@ -568,7 +613,10 @@ class MainController(QObject):
         self._retired_answers = {}
         self._answer_history = []
         self.conversation = Conversation()
-        self.ui.account_panel.session_changed.connect(self.conversation.clear)
+        self.ui.account_panel.session_changed.connect(self._account_changed)
+        self._cancel_vision_shortcut = QShortcut(QKeySequence("Esc"), self.ui)
+        self._cancel_vision_shortcut.activated.connect(self._cancel_vision_answer)
+        self._cancel_vision_shortcut.setEnabled(False)
         self._history_index = -1
         self._current_question = ""
         self._current_answer_text = ""
@@ -581,6 +629,9 @@ class MainController(QObject):
         self._dev_speech_started_at = None
         self._dev_request_started_at = None
         self._last_imported_source = None
+        self._last_imported_at = None
+        self._recent_imports = {}
+        self._pending_import_selection = None
         self._voice_wait_at = None
         for timer in (self._answer_hint_timer, self._voice_timer, self._question_timer):
             timer.setSingleShot(True)
@@ -596,13 +647,13 @@ class MainController(QObject):
         self.closing = False
         self.hotkey_handle = None
         self.recover_hotkey_handle = None
+        self._taskbar_hidden = False
         self.privacy_enabled = False
         self.capture_privacy = CapturePrivacy(app, self)
         self.capture_privacy.register(self.ui)
         self.capture_privacy.register(self.ui.settings_window, require_hidden=False)
         self.capture_privacy.state_changed.connect(self.on_privacy_state)
-        self.ui.btn_ghost.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.ui.btn_ghost.customContextMenuRequested.connect(self.privacy_menu)
+        self.ui.btn_ghost.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
 
         self.meter = QTimer(self)
         self.meter.setInterval(50)
@@ -610,6 +661,7 @@ class MainController(QObject):
         self.ui.start_listening_signal.connect(self.start_listening)
         self.ui.stop_listening_signal.connect(self.stop_listening)
         self.ui.file_uploaded_signal.connect(self.handle_file_upload)
+        self.ui.list_docs.currentItemChanged.connect(self.on_active_document_changed)
         self.ui.file_deleted_signal.connect(self.handle_file_deletion)
         self.ui.ghost_toggled_signal.connect(self.apply_privacy)
         self.ui.taskbar_preference_changed.connect(self.apply_taskbar_preference)
@@ -632,11 +684,31 @@ class MainController(QObject):
             self.recover_hotkey_handle = keyboard.add_hotkey("ctrl+shift+f12", self.recover_window_hotkey.emit)
         except Exception:
             self.ui.window_mode.enable_local_recovery()
+            self._restore_fully_transparent_window()
+        self.ui.settings_window.finished.connect(self._restore_if_hotkey_unavailable)
         self.app.aboutToQuit.connect(self.shutdown)
+
+    def _restore_if_hotkey_unavailable(self, _result):
+        if self.recover_hotkey_handle is None:
+            self._restore_fully_transparent_window()
+
+    def _restore_fully_transparent_window(self):
+        if self.config.get("window_transparency", 0) < 100:
+            return
+        try:
+            self.config.set("window_transparency", 0)
+        except OSError:
+            pass
+        slider = self.ui.transparency_slider
+        blocked = slider.blockSignals(True)
+        slider.setValue(0)
+        slider.blockSignals(blocked)
+        self.ui.preview_transparency(0)
 
     @Slot()
     def recover_window(self):
         if not self.closing:
+            self._restore_fully_transparent_window()
             self.ui.window_mode.recover()
 
     def update_meter(self):
@@ -646,20 +718,18 @@ class MainController(QObject):
     def apply_taskbar_preference(self):
         if sys.platform != "win32":
             return
-        # A tool window is opt-in and requires a successfully registered
-        # global recovery shortcut before it can be removed from the switcher.
+        # Keep the existing HWND. Qt.setWindowFlags(Window -> Tool) recreates
+        # it after capture affinity has been installed and some capture paths
+        # display the replacement as a black rectangle.
         hide = (self.capture_privacy.requested and self.config.get("ghost_hide_taskbar")
                 and self.capture_privacy.verified and self.recover_hotkey_handle is not None)
-        window_type = Qt.WindowType.Tool if hide else Qt.WindowType.Window
-        if self.ui.windowType() == window_type:
+        if hide == self._taskbar_hidden:
             return
-        visible = self.ui.isVisible()
-        geometry = self.ui.geometry()
-        hints = self.ui.windowFlags() & ~Qt.WindowType.WindowType_Mask
-        self.ui.setWindowFlags(hints | window_type)
-        self.ui.setGeometry(geometry)
-        if visible:
-            self.ui.show()
+        if not set_taskbar_hidden(self.ui, hide):
+            self.ui.show_toast("Не вдалося змінити панель завдань без перестворення вікна")
+            return
+        self._taskbar_hidden = hide
+        self.capture_privacy._refresh()
 
     @Slot(bool)
     def apply_privacy(self, enabled, persist=True):
@@ -698,18 +768,6 @@ class MainController(QObject):
             self.ui.lbl_status.setText("Ghost Mode: Windows підтвердив виключення із захоплення.")
         else:
             self.ui.lbl_status.setText("Ghost Mode вимкнено.")
-
-    def privacy_menu(self, position):
-        menu = QMenu(self.ui)
-        action = menu.addAction("Скопіювати діагностику Ghost Mode")
-        action.triggered.connect(self.copy_privacy_diagnostics)
-        menu.exec(self.ui.btn_ghost.mapToGlobal(position))
-        menu.deleteLater()
-
-    @Slot()
-    def copy_privacy_diagnostics(self):
-        QApplication.clipboard().setText(self.capture_privacy.diagnostics())
-        self.ui.show_toast("Діагностику скопійовано. Ключі API не включені.")
 
     @Slot()
     def open_timing_window(self):
@@ -944,9 +1002,11 @@ class MainController(QObject):
         if not self._selecting_screen or self.closing:
             return
         try:
+            started = perf_counter()
             shots = [(screen, screen.grabWindow(0)) for screen in self.app.screens()]
             if not shots or any(pixmap.isNull() for _, pixmap in shots):
                 raise RuntimeError("screen capture unavailable")
+            timing.info("screen_capture_ms=%.1f screens=%d", (perf_counter() - started) * 1000, len(shots))
             # Capture every monitor before drawing any selection window.
             self._screen_overlays = [ScreenSelection(screen, pixmap) for screen, pixmap in shots]
             for overlay in self._screen_overlays:
@@ -1028,7 +1088,7 @@ class MainController(QObject):
                 cards.preview(question, new=cards.request_id is not None, status="")
             return
         recent = self._recent_voice_item
-        if (recent and not self._question_aggregator.pending
+        if (recent and self.api is not None and not self._question_aggregator.pending
                 and perf_counter() - recent[3] <= 4.0
                 and is_continuation_fragment(question)):
             self._question_aggregator.add_final(recent[0], recent[1], recent[2])
@@ -1105,6 +1165,7 @@ class MainController(QObject):
             self.ui.lbl_status.setText("Мережа затримує попередні запити. Повторіть спробу.")
             return
         llm = self.get_llm(mode)
+        self._cancel_vision_shortcut.setEnabled(has_image)
         self._dev_request_started_at = submitted
         self._answer_request_id = request_id
         self._current_question = question
@@ -1117,7 +1178,7 @@ class MainController(QObject):
         self._speech_ended_at = speech_ended_at
         self._answer_cleared = False
         self.ui.txt_answer.setPlainText("")
-        self.ui.lbl_status.setText("EXAM AI ···")
+        self.ui.lbl_status.setText("Аналіз зображення… Esc — скасувати" if has_image else "EXAM AI ···")
         target_from = submitted if speech_ended_at is None else speech_ended_at
         remaining_to_hint = target_from + ANSWER_TARGET_SECONDS - submitted
         if remaining_to_hint <= 0:
@@ -1128,15 +1189,18 @@ class MainController(QObject):
         cancelled = threading.Event()
         save_history = self.config.get("save_answer_history", False)
         selected_document = self.ui.list_docs.currentItem()
-        source_hint = selected_document.text() if selected_document else self._last_imported_source
-        # A recently imported file is a useful code hint, but is not a user
-        # selection when multiple files share an explicitly requested name.
-        retrieval_hint = (None if selected_document is None and FILE_REFERENCE.search(question.casefold())
-                          else source_hint)
+        source_hint = (selected_document.text() if selected_document else
+                       self.config.get("active_document_source", "") or self._last_imported_source)
+        retrieval_hint = source_hint
         memory_started = perf_counter()
-        prior = self.conversation.relevant_turns(question) if not has_image and requested_lines(question) is None else ()
+        exact_lines = requested_lines(question) if not has_image else None
+        prior = self.conversation.relevant_turns(question) if not has_image and exact_lines is None else ()
         memory = self.conversation.format_context(prior)
+        provider_question = self.conversation.resolve_comparison(question, prior)
+        remembered_reference = self.conversation.reference_context(question) if prior else ""
         conversation_id = self.conversation.session_id
+        token = self.ui.account_panel.client.token
+        account_scope = sha256(token.encode()).hexdigest() if token else ""
         timing.info("request_id=%s session=%s prior_turns=%d context_prep_ms=%.2f",
                     request_id, conversation_id, len(prior), (perf_counter() - memory_started) * 1000)
         memory_generation = self.conversation.generation
@@ -1162,7 +1226,10 @@ class MainController(QObject):
                     if requested_lines(question) is not None or FILE_REFERENCE.search(question.casefold()):
                         raise GenerationError("Не вдалося прочитати імпортований файл. Спробуйте ще раз.") from None
                     context = ""
-                if memory and requested_lines(question) is None:
+                if remembered_reference and not FILE_REFERENCE.search(question.casefold()):
+                    context = remembered_reference
+                worker.memory_evidence = context[:1400]
+                if memory:
                     context = "\n\n".join(filter(None, (context[:3500-len(memory)-2], memory)))
             requested = perf_counter()
             last_update = None
@@ -1192,14 +1259,21 @@ class MainController(QObject):
                         "cloud" if isinstance(llm, CloudEngine) else "byok")
             try:
                 if not has_image:
-                    answer = llm.generate_answer(question, context, on_text=on_text,
+                    answer = llm.generate_answer(provider_question, context, on_text=on_text,
                                                  mode=mode, request_id=request_id)
                 else:
+                    encode_started = perf_counter()
                     try:
-                        prepared_bytes, prepared_mime = (encode_image(image) if image is not None
+                        prepared_bytes, prepared_mime = (encode_image(image, max_bytes=2_600_000)
+                                                         if image is not None and isinstance(llm, CloudEngine)
+                                                         else encode_image(image) if image is not None
                                                          else (image_bytes, image_mime))
                     except ValueError as exc:
                         raise GenerationError(str(exc)) from None
+                    timing.info("request_id=%s vision_encode_ms=%.1f bytes=%d mime=%s", request_id,
+                                (perf_counter() - encode_started) * 1000, len(prepared_bytes or b""), prepared_mime)
+                    if cancelled.is_set():
+                        raise GenerationError("Запит скасовано.")
                     intent = image_intent(image_instruction)
                     image_context = ""
                     if intent == EXPLAIN_CODE and source_hint:
@@ -1212,7 +1286,7 @@ class MainController(QObject):
                     answer = llm.generate_image_answer(
                         prepared_bytes, prepared_mime, on_text=on_text,
                         mode=mode, request_id=request_id, user_instruction=image_instruction,
-                        context=image_context, intent=intent,
+                        context=image_context, intent=intent, cancelled=cancelled.is_set,
                     )
             except GenerationError:
                 if latest_text and not cancelled.is_set():
@@ -1221,18 +1295,21 @@ class MainController(QObject):
             timing.info("request_id=%s llm_complete_ms=%.1f", request_id, (perf_counter() - requested) * 1000)
             if cancelled.is_set():
                 raise GenerationError("Запит скасовано.")
+            status = "Готово"
+            if save_history and not has_image:
+                try:
+                    self.db.save_qa(question, answer, llm.used_model, session=conversation_id,
+                                    account=account_scope, reference=worker.memory_evidence)
+                except Exception:
+                    status = "Відповідь отримано. Історію не збережено."
             worker.answer_ready.emit(answer)
-            if not save_history or has_image:
-                return answer, "Готово"
-            try:
-                self.db.save_qa(question, answer, llm.used_model)
-            except Exception:
-                return answer, "Відповідь отримано. Історію не збережено."
-            return answer, "Готово"
+            return answer, status
 
         worker = TaskWorker(task, "Помилка обробки запиту AI.", request_id=request_id)
         worker.cancel_answer = cancelled
-        worker.memory_generation = memory_generation if not has_image else None
+        worker.memory_generation = memory_generation
+        worker.memory_question = question
+        worker.memory_evidence = ""
         worker.progress.connect(self.on_answer_progress)
         worker.answer_ready.connect(self._answer_ready)
         self.start_api(worker, self.on_answer)
@@ -1251,6 +1328,25 @@ class MainController(QObject):
         self._retired_answers[worker] = self.llm
         self.llm = self.llm_settings = None
         self.api = None
+        self._cancel_vision_shortcut.setEnabled(False)
+
+    @Slot()
+    def _cancel_vision_answer(self):
+        self._cancel_active_answer()
+        self._answer_hint_timer.stop()
+        self.ui.live_cards.clear()
+        self.ui.lbl_status.setText("Аналіз зображення скасовано.")
+        self._sync_history_controls()
+        self._start_pending_answer()
+
+    @Slot()
+    def _account_changed(self):
+        self.on_clear_all()
+        self._answer_history.clear()
+        self.ui.set_history_items([])
+        self.ui.txt_question.clear()
+        self.ui.txt_answer.clear()
+        self._sync_history_controls()
 
     def _accept_answer_signal(self):
         sender = self.sender()
@@ -1301,11 +1397,15 @@ class MainController(QObject):
     @Slot(str)
     def _answer_ready(self, answer):
         if self._accept_answer_signal():
+            memory_answer = answer
             answer = brand_answer(answer)
             self._answer_hint_timer.stop()
             self._current_answer_text = answer
-            generation = getattr(self.sender(), "memory_generation", None)
-            self.conversation.remember(self._current_question, answer, generation)
+            worker = self.sender()
+            generation = getattr(worker, "memory_generation", None)
+            self.conversation.remember(getattr(worker, "memory_question", self._current_question),
+                                       memory_answer, generation,
+                                       getattr(worker, "memory_evidence", ""))
             self._remember_answer(answer)
             self.ui.live_cards.ready(self._answer_request_id, self._current_question, answer)
             self.ui.txt_answer.show_response(answer)
@@ -1427,6 +1527,7 @@ class MainController(QObject):
         elif worker is not None and worker is self.api:
             worker.deleteLater()
             self.api = None
+            self._cancel_vision_shortcut.setEnabled(False)
             self._answer_hint_timer.stop()
             self._sync_history_controls()
             self._start_pending_answer()
@@ -1470,6 +1571,14 @@ class MainController(QObject):
     def on_doc_result(self, value, error):
         self.ui.txt_docs_result.setPlainText(error or value)
 
+    @Slot(object, object)
+    def on_active_document_changed(self, current, _previous):
+        if current is not None:
+            try:
+                self.config.set("active_document_source", current.text())
+            except OSError:
+                pass
+
     @Slot(str)
     def handle_file_upload(self, filepath):
         if self.docs_available():
@@ -1484,6 +1593,16 @@ class MainController(QObject):
         self.ui.txt_docs_result.setPlainText(message)
         if not error:
             self._last_imported_source = filename
+            try:
+                self.config.set("active_document_source", filename)
+            except OSError:
+                pass
+            self._last_imported_at = perf_counter()
+            self._recent_imports = {name: imported_at
+                                    for name, imported_at in self._recent_imports.items()
+                                    if self._last_imported_at - imported_at < 15 * 60}
+            self._recent_imports[filename] = self._last_imported_at
+            self._pending_import_selection = filename
 
     def start_docs(self, worker):
         self.docs = worker
@@ -1496,6 +1615,18 @@ class MainController(QObject):
         self.docs = None
         if not self.closing:
             self.ui.refresh_documents_list()
+            if self._pending_import_selection is not None:
+                items = self.ui.list_docs.findItems(self._pending_import_selection,
+                                                   Qt.MatchFlag.MatchExactly)
+                if items:
+                    self.ui.list_docs.setCurrentItem(items[0])
+                self._pending_import_selection = None
+            active = self.config.get("active_document_source", "")
+            if active and not self.ui.list_docs.findItems(active, Qt.MatchFlag.MatchExactly):
+                try:
+                    self.config.set("active_document_source", "")
+                except OSError:
+                    pass
         self.finish_close()
 
     @Slot()
@@ -1582,25 +1713,39 @@ def main():
     ))
     controller = None
 
-    def initialize():
+    def startup_failed(exc):
+        logging.getLogger("examai.startup").error("startup failed", exc_info=(type(exc), exc, exc.__traceback__))
+        splash.finish_splash()
+        if not smoke_test:
+            QMessageBox.critical(None, "EXAM AI · помилка запуску", f"{type(exc).__name__}: {exc}")
+        app.exit(1)
+
+    def initialize(database):
         nonlocal controller
         try:
-            controller = MainController(app, config=config)
+            controller = MainController(app, config=config, database=database,
+                                        startup_devices=[],
+                                        startup_pump=lambda: pump_startup_splash(app, splash))
             if config.get("privacy_mode"):
                 controller.apply_privacy(True, persist=False)
             controller.ui.show()
+            controller._startup_audio_scan = BackgroundCall(AudioCapturer.get_available_devices)
+            controller._startup_audio_scan.ready.connect(controller.ui.refresh_audio_devices)
+            controller._startup_audio_scan.failed.connect(
+                lambda _exc: controller.ui.lbl_status.setText("Не вдалося отримати список аудіопристроїв.")
+            )
+            controller._startup_audio_scan.start()
             if smoke_test:
                 QTimer.singleShot(1800, controller.request_close)
         except Exception as exc:
-            logging.getLogger("examai.startup").exception("startup failed")
-            splash.finish_splash()
-            if not smoke_test:
-                QMessageBox.critical(None, "EXAM AI · помилка запуску", f"{type(exc).__name__}: {exc}")
-            app.exit(1)
+            startup_failed(exc)
             return
         splash.finish_splash()
 
+    app._startup_preparation = BackgroundCall(DatabaseManager, app)
+    app._startup_preparation.ready.connect(initialize)
+    app._startup_preparation.failed.connect(startup_failed)
     splash.show_loading()
     splash.repaint()
-    QTimer.singleShot(0, initialize)
+    QTimer.singleShot(0, app._startup_preparation.start)
     return app.exec()

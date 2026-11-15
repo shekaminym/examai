@@ -11,7 +11,7 @@ from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
                                QPushButton, QVBoxLayout, QWidget)
 
-from examai.beta import BetaClient
+from examai.beta import BetaClient, distribution_url
 from examai.branding import VERSION
 from examai.windows.credentials import protect, reveal
 
@@ -40,7 +40,7 @@ class AccountPanel(QWidget):
         super().__init__()
         self.config = config
         self.developer = os.getenv("EXAMAI_DEVELOPER") == "1"
-        self.server_url = os.getenv("EXAMAI_SERVER_URL", "").strip()
+        self.server_url = (os.getenv("EXAMAI_SERVER_URL") or distribution_url()).strip().rstrip("/")
         self.job = None
         self.closing = False
         self.claim = ""
@@ -51,7 +51,7 @@ class AccountPanel(QWidget):
         except (ValueError, OSError):
             token = ""
         try:
-            saved_url = config.get("server_url")
+            saved_url = config.get("server_url").rstrip("/")
             url = (saved_url or self.server_url) if self.developer else (self.server_url or saved_url)
             self.client = BetaClient(url, token if url == saved_url else "")
         except ValueError:
@@ -63,17 +63,17 @@ class AccountPanel(QWidget):
             self.url.setReadOnly(True)
         layout.addWidget(self.url)
         self.url.setVisible(self.developer)
-        self.status = QLabel("EXAM AI Cloud")
+        self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status)
-        self.button(layout, "Continue with Google", self.sign_in)
-        self.button(layout, "Refresh account and plans", self.refresh)
-        self.button(layout, "Sign out", self.sign_out)
+        self.google_button = self.button(layout, "Continue with Google", self.sign_in)
+        self.refresh_button = self.button(layout, "Refresh account and plans", self.refresh)
+        self.signout_button = self.button(layout, "Sign out", self.sign_out)
         self.invite = QLineEdit()
         self.invite.setPlaceholderText("Closed beta invite")
         layout.addWidget(self.invite)
-        self.button(layout, "Redeem invite", self.redeem)
+        self.redeem_button = self.button(layout, "Redeem invite", self.redeem)
         self.timer = QTimer(self, interval=1600)
         self.timer.timeout.connect(self.poll)
         self.plans = QComboBox()
@@ -86,6 +86,27 @@ class AccountPanel(QWidget):
         self.checkout.setVisible(self.developer)
         self.button(layout, "Sandbox payment history", self.payment_history).setVisible(self.developer)
         layout.addStretch()
+        self.update_controls()
+
+    def update_controls(self):
+        configured = bool(self.client.url)
+        signed_in = configured and bool(self.client.token)
+        self.google_button.setVisible((configured or self.developer) and not signed_in)
+        for widget in (self.refresh_button, self.signout_button, self.invite, self.redeem_button):
+            widget.setVisible(signed_in)
+        if not configured:
+            self.status.setText("EXAM AI Cloud is unavailable. You can use your Gemini key in AI & Models.")
+        elif not signed_in:
+            self.status.setText("Sign in to EXAM AI Cloud")
+
+    def report_available(self, label):
+        if not self.client.url:
+            label.setText("Online reports are unavailable in this build.")
+        elif not self.client.token:
+            label.setText("Sign in to EXAM AI Cloud to send or view reports.")
+        else:
+            return True
+        return False
 
     def button(self, layout, text, callback):
         button = QPushButton(text)
@@ -110,7 +131,7 @@ class AccountPanel(QWidget):
         worker.start()
 
     def sign_in(self):
-        if self.job is not None:
+        if self.job is not None or self.timer.isActive():
             return
         current = self.url.text().strip() if self.developer else self.client.url
         if not current:
@@ -130,13 +151,16 @@ class AccountPanel(QWidget):
 
     def open_browser(self, result):
         url = QUrl(result["url"])
-        if url.scheme() != "https" or url.host() != "accounts.google.com":
+        if (url.scheme() != "https" or url.host() != "accounts.google.com"
+                or url.port() not in (-1, 443) or url.userInfo()):
             self.status.setText("Unexpected Google sign-in address.")
             return
         self.claim = result["claim"]
         self.timeout = monotonic() + 300
-        QDesktopServices.openUrl(url)
-        self.timer.start()
+        if QDesktopServices.openUrl(url):
+            self.timer.start()
+        else:
+            self.status.setText("Could not open Google Sign-In in your browser.")
 
     def poll(self):
         if monotonic() >= self.timeout:
@@ -150,6 +174,7 @@ class AccountPanel(QWidget):
             return
         self.timer.stop()
         self.client.token = result["token"]
+        self.update_controls()
         self.session_changed.emit()
         self.url.setReadOnly(True)
         try:
@@ -213,6 +238,7 @@ class AccountPanel(QWidget):
             self.session_changed.emit()
             self.url.setReadOnly(False)
             self.checkout.setEnabled(False)
+            self.update_controls()
             try:
                 self.config.set("account_session", "")
             except OSError:
@@ -337,6 +363,8 @@ class AccountPanel(QWidget):
         status.setWordWrap(True)
         layout.addWidget(status)
         def submit():
+            if not self.report_available(status):
+                return
             body = {"kind": kind.currentText(), "description": description.toPlainText().strip(),
                     "screenshot": base64.b64encode(screenshot_data).decode("ascii"),
                     "diagnostics": diagnostic_text if diagnostics.isChecked() else ""}
@@ -353,8 +381,11 @@ class AccountPanel(QWidget):
             self.launch(lambda: self.client.request("POST", "/reports", body),
                         sent, status)
         self.button(layout, "Submit report", submit)
-        self.button(layout, "My reports", lambda: self.launch(
-            lambda: self.client.request("GET", "/reports"),
-            lambda rows: status.setText("\n".join(f"#{row['id']} · {row['status']}" for row in rows) or "No reports"),
-            status))
+        def my_reports():
+            if self.report_available(status):
+                self.launch(lambda: self.client.request("GET", "/reports"),
+                            lambda rows: status.setText("\n".join(
+                                f"#{row['id']} · {row['status']}" for row in rows) or "No reports"), status)
+
+        self.button(layout, "My reports", my_reports)
         return panel
