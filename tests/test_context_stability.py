@@ -49,6 +49,7 @@ def test_hidden_settings_does_not_create_native_window(tmp_path):
         assert dialog.isVisible()
     app.removeEventFilter(privacy)
     app.aboutToQuit.disconnect(ctl.shutdown)
+    ctl.shutdown()
     window.deleteLater()
 
 
@@ -109,6 +110,7 @@ def test_followups_reach_existing_fast_engine_and_clear(tmp_path):
     ctl.on_clear_all()
     assert send("Чим вони відрізняються?") == "Missing context"
     app.aboutToQuit.disconnect(ctl.shutdown)
+    ctl.shutdown()
     ctl.ui.deleteLater()
 
 

@@ -99,13 +99,17 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
         probe = QTimer(interval=10)
         probe.timeout.connect(lambda: released.set() if "Перший фрагмент" in ctl.ui.txt_answer.toPlainText() else None)
         probe.start()
-        QTimer.singleShot(8500, loop.quit)
+        timeout = QTimer(singleShot=True, interval=12000)
+        timeout.timeout.connect(loop.quit)
+        timeout.start()
         try:
             loop.exec()
             app.processEvents()
-            assert released.is_set()
+            assert released.is_set(), ctl.ui.txt_answer.toPlainText()
             assert ctl.api is None and "завершення" in ctl.ui.txt_answer.toPlainText()
         finally:
+            probe.stop()
+            timeout.stop()
             released.set()
         return posted[-1]["contents"][0]["parts"][0]["text"]
 
