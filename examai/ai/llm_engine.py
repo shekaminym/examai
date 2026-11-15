@@ -88,6 +88,7 @@ class LLMEngine:
         self._model_blocked_until = {}
         self._model_blocked_code = {}
         self._basic_models = set()
+        self.usage_callback = None
 
     def close(self):
         self.clients.close()
@@ -355,13 +356,16 @@ class LLMEngine:
         stream = self.gemini_client.models.generate_content_stream(
             model=model, contents=prompt, config=config,
         )
+        usage = None
         try:
             finished = False
             first_text = True
 
             def deltas():
-                nonlocal finished, first_text
+                nonlocal finished, first_text, usage
                 for chunk in stream:
+                    if self.usage_callback is not None and getattr(chunk, "usage_metadata", None):
+                        usage = chunk.usage_metadata
                     if cancelled and cancelled():
                         raise GenerationError("Запит скасовано.")
                     if deadline is not None and perf_counter() >= deadline:
@@ -380,4 +384,9 @@ class LLMEngine:
                 raise PartialGenerationError("Потік Gemini завершився без підтвердження.")
             return answer
         finally:
-            stream.close()
+            try:
+                stream.close()
+            finally:
+                if usage is not None and usage.prompt_token_count is not None:
+                    self.usage_callback(usage.prompt_token_count,
+                                        (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0))

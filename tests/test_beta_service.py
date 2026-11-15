@@ -202,3 +202,41 @@ def test_cloud_requires_lease_and_streams_once(tmp_path, monkeypatch):
         {"text": "First fragment"}, {"final": "First fragment and rest"},
     ]
     assert calls == [("What is RAG?", "fixture")]
+
+
+def test_cloud_budget_meters_tokens_and_stops_before_next_provider_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAMAI_CLOUD_GEMINI_KEY", "test-only")
+    monkeypatch.setenv("EXAMAI_CLOUD_DAILY_BUDGET_MICROUSD", "20")
+    monkeypatch.setenv("EXAMAI_CLOUD_RESERVE_MICROUSD", "12")
+    monkeypatch.setenv("EXAMAI_CLOUD_INPUT_USD_PER_MILLION", "0.5")
+    monkeypatch.setenv("EXAMAI_CLOUD_OUTPUT_USD_PER_MILLION", "2")
+    path = tmp_path / "budget.sqlite"
+    client = TestClient(create_app(path))
+    store = Store(path)
+    with store.transaction() as db:
+        headers = bearer(store.issue(db, "beta", "device"))
+        db.execute("INSERT INTO invite(code) VALUES(?)", (digest("example"),))
+        store.redeem(db, "beta", "example")
+
+    class Engine:
+        calls = 0
+
+        def __init__(self, key):
+            pass
+
+        def close(self):
+            pass
+
+        def generate_answer(self, question, context, on_text):
+            Engine.calls += 1
+            self.usage_callback(4, 4)
+            return "Done"
+
+    monkeypatch.setattr("server.api.LLMEngine", Engine)
+    assert client.post("/activity/start", headers=headers).json()["granted"]
+    assert client.post("/answer", json={"question": "first"}, headers=headers).is_success
+    assert client.post("/answer", json={"question": "second"}, headers=headers).status_code == 429
+    assert Engine.calls == 1
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT input_tokens,output_tokens,micro_usd FROM cloud_charge").fetchone()) == (4, 4, 10)
+        assert db.execute("SELECT requests FROM usage").fetchone()[0] == 1

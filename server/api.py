@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 from urllib.parse import urlencode, urlsplit
@@ -16,6 +17,7 @@ from google.oauth2.id_token import verify_oauth2_token
 from pydantic import BaseModel, Field
 
 from examai.ai.llm_engine import GenerationError, LLMEngine
+from server.cloud_budget import CloudBudget
 from server.payments import mount as mount_payments
 from server.store import Denied, Store, digest
 
@@ -23,6 +25,7 @@ from server.store import Denied, Store, digest
 PLANS = tuple(dict(id=str(months), months=months, price_uah=price)
               for months, price in ((1, 149), (3, 399), (6, 699), (12, 1299)))
 STATUSES = {"Received", "Reviewing", "Confirmed", "Fixed", "Closed"}
+log = logging.getLogger("uvicorn.error")
 
 
 class Device(BaseModel):
@@ -68,6 +71,8 @@ def create_app(path=None):
     client_id = os.getenv("EXAMAI_GOOGLE_CLIENT_ID", "")
     client_secret = os.getenv("EXAMAI_GOOGLE_CLIENT_SECRET", "")
     base = os.getenv("EXAMAI_PUBLIC_URL", "").rstrip("/")
+    budget = (CloudBudget() if os.getenv("EXAMAI_CLOUD_DAILY_BUDGET_MICROUSD")
+              or (urlsplit(base).scheme == "https" and os.getenv("EXAMAI_CLOUD_GEMINI_KEY")) else None)
     redirect = base + "/oauth/callback"
     inflight = set()
     inflight_lock = Lock()
@@ -97,6 +102,8 @@ def create_app(path=None):
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
         with db.transaction() as tx:
             tx.execute("DELETE FROM oauth WHERE until <= ?", (db.now(),))
+            if tx.execute("SELECT count(*) FROM oauth").fetchone()[0] >= 256:
+                raise HTTPException(429, "Too many sign-in attempts. Try again shortly.")
             tx.execute("INSERT INTO oauth VALUES (?,?,?,?,?,?,NULL)",
                        (state, verifier, nonce, digest(claim), body.device, db.now() + 300))
         query = urlencode(dict(client_id=client_id, redirect_uri=redirect, response_type="code",
@@ -193,6 +200,13 @@ def create_app(path=None):
     def health():
         return {"ok": True}
 
+    @app.get("/ready")
+    def ready(response: Response):
+        oauth = bool(client_id and client_secret and urlsplit(base).scheme == "https")
+        cloud = bool(os.getenv("EXAMAI_CLOUD_GEMINI_KEY") and budget)
+        response.status_code = 200 if oauth and cloud else 503
+        return {"ready": oauth and cloud, "oauth_configured": oauth, "cloud_configured": cloud}
+
     @app.get("/plans")
     def plans():
         return {"plans": PLANS, "checkout_available": checkout_enabled}
@@ -211,6 +225,10 @@ def create_app(path=None):
                                (sub, db.now() - 86400)).fetchone()[0]
             if count >= 10:
                 raise HTTPException(429, "Daily report limit reached")
+            if screenshot or body.diagnostics:
+                used = tx.execute("SELECT coalesce(sum(length(content)),0) FROM report_attachment").fetchone()[0]
+                if used + len(screenshot) + len(body.diagnostics.encode()) > 64 * 1024 * 1024:
+                    raise HTTPException(413, "Attachment storage is full. Send the report without attachments.")
             row = tx.execute("INSERT INTO report(sub,kind,description,created) VALUES(?,?,?,?)",
                              (sub, body.kind, body.description, db.now()))
             for kind, content in (("screenshot", screenshot), ("diagnostics", body.diagnostics.encode())):
@@ -240,6 +258,10 @@ def create_app(path=None):
                 "audit": [dict(row) for row in tx.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 100")],
                 "usage": [dict(row) for row in tx.execute(
                     "SELECT day,sum(requests) AS requests,sum(units) AS units FROM usage "
+                    "GROUP BY day ORDER BY day DESC LIMIT 30")],
+                "cloud_cost": [dict(row) for row in tx.execute(
+                    "SELECT day,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,"
+                    "sum(micro_usd) AS reserved_or_estimated_micro_usd FROM cloud_charge "
                     "GROUP BY day ORDER BY day DESC LIMIT 30")],
             }
 
@@ -331,27 +353,33 @@ def create_app(path=None):
             picture = base64.b64decode(body.image, validate=True) if body.image else None
         except ValueError:
             raise HTTPException(422, "Invalid image") from None
-        with db.transaction() as tx:
-            sub = subject(tx, token)
-            active = tx.execute("SELECT until FROM lease WHERE sub=? AND token=?",
-                                (sub, digest(token))).fetchone()
-            if not active or active[0] <= db.now():
-                raise HTTPException(403, "Start an active beta session first")
-            with inflight_lock:
+        request_id = secrets.token_hex(12)
+        with inflight_lock:
+            with db.transaction() as tx:
+                sub = subject(tx, token)
                 if sub in inflight:
                     raise HTTPException(409, "A cloud request is already running")
+                active = tx.execute("SELECT until FROM lease WHERE sub=? AND token=?",
+                                    (sub, digest(token))).fetchone()
+                if not active or active[0] <= db.now():
+                    raise HTTPException(403, "Start an active beta session first")
                 status = db.access(tx, sub, token=digest(token), units=2 if picture else 1)
-                if status["granted"]:
-                    inflight.add(sub)
-        if not status["granted"]:
-            raise HTTPException(403, "Access or daily request limit reached")
+                if not status["granted"]:
+                    raise HTTPException(403, "Access or daily request limit reached")
+                if budget and not budget.reserve(tx, request_id, int(db.now() // 86400)):
+                    raise HTTPException(429, "Cloud daily budget reached")
+            inflight.add(sub)
         from queue import Queue
 
         queue = Queue()
         cancelled = Event()
         def generate():
+            usage = []
+            complete = False
             try:
                 engine = LLMEngine(api_key)
+                if budget:
+                    engine.usage_callback = lambda prompt, output: usage.append((prompt, output))
                 try:
                     def progress(text):
                         if cancelled.is_set():
@@ -367,11 +395,20 @@ def create_app(path=None):
                 finally:
                     engine.close()
                 terminal = {"final": final}
+                complete = True
             except GenerationError as exc:
                 terminal = {"error": str(exc)}
-            except Exception:
+            except Exception as exc:
+                log.warning("Cloud generation failed: %s", type(exc).__name__)
                 terminal = {"error": "Cloud request failed"}
             finally:
+                if budget:
+                    try:
+                        with db.transaction() as tx:
+                            budget.settle(tx, request_id, sum(x for x, _ in usage),
+                                          sum(y for _, y in usage), complete, bool(usage))
+                    except Exception as exc:
+                        log.error("Cloud usage settlement failed: %s", type(exc).__name__)
                 with inflight_lock:
                     inflight.discard(sub)
             queue.put(terminal)
