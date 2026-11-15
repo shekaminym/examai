@@ -1,4 +1,4 @@
-# EXAM AI 3.1 Closed Beta
+# EXAM AI 3.2 Closed Beta
 
 Windows x64. The beta keeps the archived FAST-only desktop pipeline. The original source launcher still works with `python main.py`.
 
@@ -11,7 +11,7 @@ python -m pip install -r requirements.txt -r requirements-rag.txt pyinstaller==6
 .\release\build.ps1
 ```
 
-Use `release-build/EXAM-AI-Setup.exe`. The build defaults to `3.1.0-beta.1`. Pass `-SkipInstaller` to build only the standalone folder and keep the entire `EXAM AI` folder together when redistributing it. The frozen app writes its configuration and notes database under `%LOCALAPPDATA%\EXAM AI`. Source mode continues to use the working directory. To migrate legacy notes, close both versions, back up the old SQLite database (including any WAL sidecars), then import materials or copy the checkpointed database to the new data directory. Setup preserves application data on update and uninstall.
+Use `release-build/EXAM-AI-Setup.exe`. The build defaults to `3.2.0-beta.1`. Pass `-SkipInstaller` to build only the standalone folder and keep the entire `EXAM AI` folder together when redistributing it. The frozen app writes its configuration and notes database under `%LOCALAPPDATA%\EXAM AI`. Source mode continues to use the working directory. To migrate legacy notes, close both versions, back up the old SQLite database (including any WAL sidecars), then import materials or copy the checkpointed database to the new data directory. Setup preserves application data on update and uninstall.
 
 ## Backend
 
@@ -40,7 +40,7 @@ In Settings → Diagnostics → Report a Problem, the reporter can preview a sel
 Configure `EXAMAI_UPDATE_URL` with the HTTPS directory that hosts manifests, and `EXAMAI_UPDATE_PUBLIC_KEY` with the trusted base64 Ed25519 public key. The private release key stays offline. Sign the completed installer with:
 
 ```powershell
-python release/sign_manifest.py beta 3.1.0-beta.2 https://downloads.example/EXAM-AI-Setup.exe .\release-build\EXAM-AI-Setup.exe PATH_TO_OFFLINE_PRIVATE_KEY
+python release/sign_manifest.py beta 3.2.0-beta.2 https://downloads.example/EXAM-AI-Setup.exe .\release-build\EXAM-AI-Setup.exe PATH_TO_OFFLINE_PRIVATE_KEY
 ```
 
 Publish the result as `beta.json` or `stable.json`. In Settings → Diagnostics, check the selected channel and accept installation. The updater checks signature, channel, version, size and SHA-256 before opening Setup. Keep the previously tested installer for manual recovery. Automatic rollback and Authenticode signing are pending.

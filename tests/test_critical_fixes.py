@@ -182,26 +182,46 @@ class ImageAndHistoryTests(unittest.TestCase):
         return controller
 
     @unittest.skipUnless(sys.platform == "win32", "Windows taskbar behavior")
-    def test_ghost_tool_window_can_be_restored_and_disabled(self):
+    def test_ghost_taskbar_change_keeps_native_window_and_can_be_restored(self):
         controller = self._controller()
+        self.assertEqual(controller.ui.btn_ghost.contextMenuPolicy(),
+                         Qt.ContextMenuPolicy.NoContextMenu)
         controller.config.set("ghost_hide_taskbar", True)
         controller.recover_hotkey_handle = 1
         controller.capture_privacy._apply_api = lambda _hwnd, enabled: AffinityResult(
             True, WDA_EXCLUDEFROMCAPTURE if enabled else WDA_NONE
         )
         controller.ui.show()
-        controller.apply_privacy(True, persist=False)
+        original_hwnd = int(controller.ui.winId())
+        with patch("examai.app.set_taskbar_hidden", return_value=True) as taskbar:
+            controller.apply_privacy(True, persist=False)
+            taskbar.assert_called_with(controller.ui, True)
+            self.assertEqual(int(controller.ui.winId()), original_hwnd)
+            self.assertEqual(controller.ui.windowType(), Qt.WindowType.Window)
+            controller.ui.hide()
+            controller.recover_window_hotkey.emit()
+            self.app.processEvents()
+            self.assertTrue(controller.ui.isVisible())
+            controller.apply_privacy(False, persist=False)
+            taskbar.assert_called_with(controller.ui, False)
         self.app.processEvents()
-        self.assertTrue(controller.capture_privacy.verified)
-        self.assertEqual(controller.ui.windowType(), Qt.WindowType.Tool)
-        controller.ui.hide()
-        controller.recover_window_hotkey.emit()
-        self.app.processEvents()
-        self.assertTrue(controller.ui.isVisible())
-        controller.apply_privacy(False, persist=False)
-        self.app.processEvents()
+        self.assertEqual(int(controller.ui.winId()), original_hwnd)
         self.assertEqual(controller.ui.windowType(), Qt.WindowType.Window)
         self.assertFalse(controller.capture_privacy.requested)
+
+    def test_recovery_hotkey_restores_fully_transparent_window(self):
+        controller = self._controller()
+        controller.config.set("window_transparency", 100)
+        controller.ui.preview_transparency(100)
+        self.assertEqual(controller.ui.windowOpacity(), 0.0)
+        controller.recover_window()
+        self.assertEqual(controller.config.get("window_transparency"), 0)
+        self.assertEqual(controller.ui.transparency_slider.value(), 0)
+        self.assertEqual(controller.ui.windowOpacity(), 1.0)
+        controller.config.set("window_transparency", 100)
+        controller.ui.preview_transparency(100)
+        controller._restore_if_hotkey_unavailable(0)
+        self.assertEqual(controller.ui.windowOpacity(), 1.0)
 
     def test_screen_selection_passes_previous_user_instruction(self):
         controller = self._controller()

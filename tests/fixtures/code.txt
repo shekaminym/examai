@@ -1,0 +1,102 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+
+#define MAX_DEGREE 1000
+
+int create_array(int n, double **a)
+{
+    *a = malloc((n + 1) * sizeof **a);
+    return *a == NULL ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+int fill_array(double a[], int n)
+{
+    for (int i = 0; i <= n; ++i) {
+        printf("a[%d] = ", i);
+        if (scanf("%lf", &a[i]) != 1 || !isfinite(a[i])) {
+            return EXIT_FAILURE;
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
+void print_array(const double a[], int n)
+{
+    printf("Coefficients a[0..%d]:", n);
+    for (int i = 0; i <= n; ++i) {
+        printf(" %.12g", a[i]);
+    }
+    putchar('\n');
+}
+
+void horner_iter(const double a[], int n,
+                 double x, double *result)
+{
+    *result = a[n];
+    for (int i = n - 1; i >= 0; --i) {
+        *result = *result * x + a[i];
+    }
+}
+
+void horner_rec(const double a[], int n, int i,
+                double x, double *result)
+{
+    if (i == n) {
+        *result = a[n];
+    } else {
+        horner_rec(a, n, i + 1, x, result);
+        *result = *result * x + a[i];
+    }
+}
+
+int main(void)
+{
+    int n;
+    double *a;
+    double x, iterative, recursive;
+
+    printf("Degree (0..%d): ", MAX_DEGREE);
+    if (scanf("%9d", &n) != 1 || n < 0 || n > MAX_DEGREE) {
+        puts("Invalid degree.");
+        return EXIT_FAILURE;
+    }
+
+    if (create_array(n, &a) != EXIT_SUCCESS) {
+        puts("Memory allocation failed.");
+        return EXIT_FAILURE;
+    }
+
+    if (fill_array(a, n) != EXIT_SUCCESS) {
+        puts("Invalid coefficient.");
+        free(a);
+        return EXIT_FAILURE;
+    }
+
+    printf("x = ");
+    if (scanf("%lf", &x) != 1 || !isfinite(x)) {
+        puts("Invalid x.");
+        free(a);
+        return EXIT_FAILURE;
+    }
+
+    print_array(a, n);
+    horner_iter(a, n, x, &iterative);
+    horner_rec(a, n, 0, x, &recursive);
+    free(a);
+
+    if (!isfinite(iterative) || !isfinite(recursive)) {
+        puts("Result is outside the finite double range.");
+        return EXIT_FAILURE;
+    }
+
+    printf("Iterative p(x) = %.12g\n", iterative);
+    printf("Recursive p(x) = %.12g\n", recursive);
+    if (iterative != recursive) {
+        puts("Equivalence: FAIL");
+        return EXIT_FAILURE;
+    }
+    puts("Equivalence: OK");
+    return EXIT_SUCCESS;
+}

@@ -69,9 +69,12 @@ def test_subscription_layout_matches_reference_and_has_no_billing(tmp_path):
         app.processEvents()
         assert page._columns == 4
         assert page.verticalScrollBar().maximum() == 0
-        assert [(card.term_label.text(), card.price_label.text()) for card in page.cards] == list(PLANS)
+        assert [(card.months, card.price_uah) for card in page.cards] == list(PLANS)
+        assert [card.price_label.text() for card in page.cards] == [
+            f"{price} грн" for _, price in PLANS]
         assert page.cards[1].badge.text() == "Найвигідніше"
-        assert all([label.text() for label in card.features] == list(FEATURES)
+        assert all([label.text() for label in card.features] == [
+            "Доступ до AI", "Аналіз екрана", "Робота з PDF", "Історія"]
                    for card in page.cards)
         assert all(not card.order_button.isEnabled() for card in page.cards)
         assert not any("API-ключ користувача" in label.text()
@@ -163,7 +166,8 @@ def test_minimal_splash_shows_ready_window_without_fixed_wait():
     assert done == [True]
     assert main.isVisible()
     assert not splash.spinner.timer.isActive()
-    assert [label.text() for label in splash.findChildren(QLabel)] == ["EXAM AI"]
+    assert [label.text() for label in splash.findChildren(QLabel)] == ["EXAM AI", "Завантаження..."]
+    assert not splash.spinner.isVisible()
     main.close()
     splash.close()
 

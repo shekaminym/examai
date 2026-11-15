@@ -136,7 +136,7 @@ def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
     card.set_hover(1.0)
     app.processEvents()
     assert card.hover_animation.state() == card.hover_animation.State.Stopped
-    assert card.outer.contentsMargins().top() == 15
+    assert card.outer.contentsMargins().top() == 3
     assert neighbor.geometry() == geometry
     window.config_mgr.set("reduce_motion", False)
     window.motion.system_reduced = False
@@ -147,7 +147,7 @@ def test_subscription_hover_keeps_neighbor_layout_and_honors_off(tmp_path):
     QTest.qWait(200)
     card.set_hover(1.0)
     QTest.qWait(200)
-    assert card.outer.contentsMargins().top() == 12
+    assert card.outer.contentsMargins().top() == 0
     assert neighbor.geometry() == geometry
     app.aboutToQuit.disconnect(ctl.shutdown)
     window.deleteLater()

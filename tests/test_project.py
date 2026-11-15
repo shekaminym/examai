@@ -106,12 +106,15 @@ class StorageTests(unittest.TestCase):
             writer.write(source)
         self.assertEqual(rag.index_file_sync(source), 1)
         self.assertIn("Linear algebra", rag.retrieve_relevant_context("algebra"))
+        self.assertIn("[Сторінка 1]", rag.retrieve_relevant_context("algebra"))
+        self.assertEqual(rag.db_mgr.get_document_profiles()["lecture.pdf"]["page_count"], 1)
         with PdfWriter() as writer:
             writer.add_blank_page(width=300, height=200)
             writer.write(source)
         with self.assertRaises(ValueError):
             rag.index_file_sync(source)
         self.assertIn("Linear algebra", rag.get_summary_context(source.name))
+        self.assertEqual(rag.db_mgr.get_document_profiles()["lecture.pdf"]["page_count"], 1)
 
     def test_summary_bounded_and_samples_both_ends(self):
         db = DatabaseManager(self.root / "notes.db")

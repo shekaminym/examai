@@ -122,7 +122,8 @@ def test_sandbox_requires_signature_and_records_callback_once(tmp_path, monkeypa
         assert db.execute("SELECT count(*) FROM audit").fetchone()[0] == 1
 
 
-def test_update_manifest_rejects_tampering_and_wrong_channel():
+def test_update_manifest_rejects_tampering_and_wrong_channel(monkeypatch):
+    monkeypatch.setattr("examai.updates.VERSION", "3.1.0b1")
     key = Ed25519PrivateKey.generate()
     raw = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     public = base64.b64encode(raw).decode()
