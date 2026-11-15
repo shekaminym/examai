@@ -26,7 +26,7 @@ class BetaClient:
 
     def request(self, method, route, body=None):
         if not self.url:
-            raise GenerationError("Set the EXAM AI server URL in Subscriptions.")
+            raise GenerationError("EXAM AI Cloud is not configured in this build.")
         try:
             response = httpx.request(method, self.url + route, json=body,
                                      headers=self.headers(), timeout=8)

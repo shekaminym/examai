@@ -6,10 +6,11 @@ import os
 import secrets
 from urllib.parse import urlencode, urlsplit
 from threading import Event, Lock, Thread
+from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from google.auth.transport.requests import Request
 from google.oauth2.id_token import verify_oauth2_token
 from pydantic import BaseModel, Field
@@ -39,6 +40,8 @@ class Invite(BaseModel):
 class Problem(BaseModel):
     kind: str = Field(pattern="^(Bug|Suggestion)$")
     description: str = Field(min_length=5, max_length=4000)
+    screenshot: str = Field(default="", max_length=2_800_000)
+    diagnostics: str = Field(default="", max_length=4096)
 
 
 class Question(BaseModel):
@@ -50,10 +53,12 @@ class Question(BaseModel):
 
 class AdminAction(BaseModel):
     sub: str = Field(min_length=1, max_length=128)
-    action: str = Field(pattern="^(invite|minutes|days|suspend|report)$")
+    action: str = Field(pattern="^(invite|minutes|days|suspend|restore|report)$")
     amount: int = Field(default=0, ge=0, le=365)
     report_id: int = 0
     status: str = ""
+    invite_days: int = Field(default=7, ge=1, le=30)
+    operation_id: UUID | None = None
 
 
 def create_app(path=None):
@@ -95,7 +100,7 @@ def create_app(path=None):
             tx.execute("INSERT INTO oauth VALUES (?,?,?,?,?,?,NULL)",
                        (state, verifier, nonce, digest(claim), body.device, db.now() + 300))
         query = urlencode(dict(client_id=client_id, redirect_uri=redirect, response_type="code",
-                               scope="openid", state=state, nonce=nonce, code_challenge=challenge,
+                               scope="openid email", state=state, nonce=nonce, code_challenge=challenge,
                                code_challenge_method="S256"))
         return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + query, "claim": claim}
 
@@ -118,7 +123,13 @@ def create_app(path=None):
         except (httpx.HTTPError, ValueError, KeyError):
             raise HTTPException(400, "Google authentication failed") from None
         with db.transaction() as tx:
-            tx.execute("UPDATE oauth SET sub=? WHERE state=?", (claims["sub"], state))
+            changed = tx.execute("UPDATE oauth SET sub=? WHERE state=? AND until>?",
+                                 (claims["sub"], state, db.now())).rowcount
+            if not changed:
+                raise HTTPException(410, "Login expired")
+            if claims.get("email_verified") is True and isinstance(claims.get("email"), str):
+                tx.execute("INSERT OR REPLACE INTO profile VALUES(?,?)",
+                           (claims["sub"], claims["email"]))
         return "EXAM AI: sign-in confirmed. Return to the desktop app."
 
     @app.post("/oauth/claim")
@@ -149,7 +160,13 @@ def create_app(path=None):
     def account(token=Depends(bearer)):
         with db.transaction() as tx:
             sub = subject(tx, token)
-            return db.access(tx, sub, token=digest(token))
+            account = db.access(tx, sub, token=digest(token))
+            profile = tx.execute("SELECT email FROM profile WHERE sub=?", (sub,)).fetchone()
+            account["email"] = profile["email"] if profile else None
+            account["plan"] = {"BETA": "Closed Beta", "TRIAL": "Trial",
+                               "ACTIVE": "Granted access"}.get(account["state"])
+            account["auto_renew"] = False
+            return account
 
     @app.post("/invite")
     def invite(body: Invite, token=Depends(bearer)):
@@ -182,6 +199,12 @@ def create_app(path=None):
 
     @app.post("/reports")
     def report(body: Problem, token=Depends(bearer)):
+        try:
+            screenshot = base64.b64decode(body.screenshot, validate=True)
+        except ValueError:
+            raise HTTPException(422, "Invalid screenshot") from None
+        if screenshot and (len(screenshot) > 2_000_000 or not screenshot.startswith(b"\x89PNG\r\n\x1a\n")):
+            raise HTTPException(422, "Use a PNG screenshot up to 2 MB")
         with db.transaction() as tx:
             sub = subject(tx, token)
             count = tx.execute("SELECT count(*) FROM report WHERE sub=? AND created>?",
@@ -190,6 +213,9 @@ def create_app(path=None):
                 raise HTTPException(429, "Daily report limit reached")
             row = tx.execute("INSERT INTO report(sub,kind,description,created) VALUES(?,?,?,?)",
                              (sub, body.kind, body.description, db.now()))
+            for kind, content in (("screenshot", screenshot), ("diagnostics", body.diagnostics.encode())):
+                if content:
+                    tx.execute("INSERT INTO report_attachment VALUES(?,?,?)", (row.lastrowid, kind, content))
             return {"id": row.lastrowid, "status": "Received"}
 
     @app.get("/reports")
@@ -205,10 +231,31 @@ def create_app(path=None):
             admin_subject(tx, token)
             return {
                 "users": [dict(row) for row in tx.execute(
-                    "SELECT * FROM account WHERE instr(sub, ?) > 0 ORDER BY sub LIMIT 100", (q,))],
-                "reports": [dict(row) for row in tx.execute("SELECT * FROM report ORDER BY id DESC LIMIT 100")],
+                    "SELECT account.*,profile.email FROM account LEFT JOIN profile USING(sub) "
+                    "WHERE instr(sub,?) > 0 OR instr(lower(coalesce(email,'')),lower(?)) > 0 "
+                    "ORDER BY sub LIMIT 100", (q, q))],
+                "reports": [dict(row) for row in tx.execute(
+                    "SELECT report.*, (SELECT group_concat(kind) FROM report_attachment "
+                    "WHERE report_id=report.id) AS attachments FROM report ORDER BY id DESC LIMIT 100")],
                 "audit": [dict(row) for row in tx.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 100")],
+                "usage": [dict(row) for row in tx.execute(
+                    "SELECT day,sum(requests) AS requests,sum(units) AS units FROM usage "
+                    "GROUP BY day ORDER BY day DESC LIMIT 30")],
             }
+
+    @app.get("/admin/reports/{report_id}/{kind}")
+    def report_attachment(report_id: int, kind: str, token=Depends(bearer)):
+        with db.transaction() as tx:
+            admin_subject(tx, token)
+            row = tx.execute("SELECT content FROM report_attachment WHERE report_id=? AND kind=?",
+                             (report_id, kind)).fetchone()
+        if row is None:
+            raise HTTPException(404)
+        name = "screenshot.png" if kind == "screenshot" else "diagnostics.txt"
+        return Response(row["content"], media_type="application/octet-stream", headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store",
+        })
 
     @app.post("/admin/action")
     def admin_action(body: AdminAction, token=Depends(bearer)):
@@ -216,9 +263,23 @@ def create_app(path=None):
         with db.transaction() as tx:
             actor = admin_subject(tx, token)
             result = {"ok": True}
+            if action in {"minutes", "days"}:
+                if body.operation_id is None:
+                    raise HTTPException(422, "An operation ID is required for grants")
+                operation_id = str(body.operation_id)
+                payload = body.model_dump_json(exclude={"operation_id"})
+                previous = tx.execute("SELECT actor,payload FROM admin_operation WHERE id=?",
+                                      (operation_id,)).fetchone()
+                if previous:
+                    if (previous["actor"], previous["payload"]) != (actor, payload):
+                        raise HTTPException(409, "Operation ID already used")
+                    return result
+                tx.execute("INSERT INTO admin_operation VALUES(?,?,?)", (operation_id, actor, payload))
             if action == "invite":
                 code = secrets.token_urlsafe(24)
                 tx.execute("INSERT INTO invite(code,sub) VALUES(?,?)", (digest(code), sub))
+                tx.execute("INSERT INTO invite_expiry VALUES(?,?)",
+                           (digest(code), db.now() + body.invite_days * 86400))
                 result["code"] = code
             elif action == "report" and body.status in STATUSES:
                 changed = tx.execute("UPDATE report SET status=? WHERE id=? AND sub=?",
@@ -226,18 +287,29 @@ def create_app(path=None):
                 if not changed:
                     raise HTTPException(404, "Report not found")
             else:
-                if not tx.execute("SELECT 1 FROM account WHERE sub=?", (sub,)).fetchone():
+                account = tx.execute("SELECT state FROM account WHERE sub=?", (sub,)).fetchone()
+                if not account:
                     raise HTTPException(404, "Account not found")
                 db.access(tx, sub)
+                if action in {"minutes", "days"} and account["state"] == "SUSPENDED":
+                    raise HTTPException(409, "Restore access before granting time")
                 if action == "minutes" and body.amount:
-                    tx.execute("UPDATE account SET remaining=remaining+?, state=CASE WHEN state='ACTIVE' "
-                               "THEN state ELSE 'BETA' END WHERE sub=?", (body.amount * 60, sub))
+                    tx.execute("UPDATE account SET remaining=remaining+?, "
+                               "until=CASE WHEN state='ACTIVE' AND until>? THEN until ELSE NULL END, "
+                               "state=CASE WHEN state='ACTIVE' AND until>? THEN state ELSE 'BETA' END "
+                               "WHERE sub=?", (body.amount * 60, db.now(), db.now(), sub))
                 elif action == "days" and body.amount:
                     tx.execute("UPDATE account SET state='ACTIVE', until=max(?,coalesce(until,0))+? WHERE sub=?",
                                (db.now(), body.amount * 86400, sub))
                 elif action == "suspend":
+                    if account["state"] != "SUSPENDED":
+                        tx.execute("INSERT INTO suspended_access VALUES(?,?)", (sub, account["state"]))
                     tx.execute("UPDATE account SET state='SUSPENDED' WHERE sub=?", (sub,))
                     tx.execute("DELETE FROM lease WHERE sub=?", (sub,))
+                elif action == "restore" and account["state"] == "SUSPENDED":
+                    original = tx.execute("SELECT state FROM suspended_access WHERE sub=?", (sub,)).fetchone()
+                    tx.execute("UPDATE account SET state=? WHERE sub=?", (original["state"] if original else "EXPIRED", sub))
+                    tx.execute("DELETE FROM suspended_access WHERE sub=?", (sub,))
                 else:
                     raise HTTPException(422, "Invalid admin action")
             db.audit(tx, actor, sub, f"{action} {body.amount} {body.report_id} {body.status}")

@@ -22,6 +22,13 @@ CREATE TABLE IF NOT EXISTS report (id INTEGER PRIMARY KEY, sub TEXT, kind TEXT, 
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, actor TEXT, subject TEXT, action TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS oauth (state TEXT PRIMARY KEY, verifier TEXT, nonce TEXT, claim TEXT,
     device TEXT, until REAL, sub TEXT);
+CREATE TABLE IF NOT EXISTS profile (sub TEXT PRIMARY KEY, email TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS invite_expiry (code TEXT PRIMARY KEY, until REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS suspended_access (sub TEXT PRIMARY KEY, state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admin_operation (id TEXT PRIMARY KEY, actor TEXT NOT NULL,
+    payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS report_attachment (report_id INTEGER NOT NULL, kind TEXT NOT NULL,
+    content BLOB NOT NULL, PRIMARY KEY(report_id,kind));
 """
 
 
@@ -66,13 +73,17 @@ class Store:
         return row["sub"]
 
     def redeem(self, db, sub, token):
-        row = db.execute("SELECT sub, used FROM invite WHERE code=?", (digest(token),)).fetchone()
+        row = db.execute(
+            "SELECT sub,used,until FROM invite LEFT JOIN invite_expiry USING(code) WHERE code=?",
+            (digest(token),),
+        ).fetchone()
         account = db.execute("SELECT invited, state FROM account WHERE sub=?", (sub,)).fetchone()
         if (not row or row["used"] or row["sub"] not in (sub, None)
-                or account["invited"] or account["state"] == "SUSPENDED"):
+                or (row["until"] is not None and row["until"] <= self.now())
+                or account["invited"] or account["state"] in {"ACTIVE", "SUSPENDED"}):
             raise Denied("Invite unavailable")
         db.execute("UPDATE invite SET used=1 WHERE code=?", (digest(token),))
-        db.execute("UPDATE account SET invited=1, state='BETA', remaining=?, until=NULL WHERE sub=?",
+        db.execute("UPDATE account SET invited=1, state='BETA', remaining=remaining+?, until=NULL WHERE sub=?",
                    (BETA_SECONDS, sub))
         self.audit(db, sub, sub, "redeemed beta invite")
 

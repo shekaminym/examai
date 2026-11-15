@@ -3,15 +3,22 @@
 <style>body{color:#f0efff;background:#15131c;font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,select,button{font:inherit;padding:8px;background:#242030;color:inherit;border:1px solid #71618b;border-radius:6px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#211c2b;padding:16px}form{display:flex;gap:8px;flex-wrap:wrap}</style>
 <h1>EXAM AI beta administration</h1>
 <p>Sign in using an authorized Google account. The session stays in this page.</p>
-<button id="sign-in">Continue with Google</button><button id="sign-out">Sign out</button><input id="query" placeholder="Google account subject">
+<button id="sign-in">Continue with Google</button><button id="sign-out">Sign out</button><input id="query" placeholder="Email or Google subject">
 <button id="load">Load users and reports</button>
 <h2>Account action</h2>
 <form id="action"><input name="sub" required placeholder="Google account subject"><select name="action">
-<option>invite</option><option>minutes</option><option>days</option><option>suspend</option><option>report</option>
+<option>invite</option><option>minutes</option><option>days</option><option>suspend</option><option>restore</option><option>report</option>
 </select><input name="amount" type="number" min="0" max="365" placeholder="Minutes or days">
+<label>Invite validity (days) <input name="invite_days" type="number" min="1" max="30" value="7" required></label>
 <input name="report_id" type="number" min="0" placeholder="Report ID"><select name="status">
 <option>Received</option><option>Reviewing</option><option>Confirmed</option><option>Fixed</option><option>Closed</option></select>
-<button>Apply</button></form><pre id="result" aria-live="polite"></pre>
+<button>Apply</button></form>
+<p><button data-minutes="10">+10 min</button> <button data-minutes="30">+30 min</button>
+<button data-minutes="60">+60 min</button> <button data-days="7">+7 days</button>
+<button data-days="30">+30 days</button></p><pre id="result" aria-live="polite"></pre>
+<form id="attachment"><input name="report_id" type="number" min="1" required placeholder="Report ID">
+<select name="kind"><option>screenshot</option><option>diagnostics</option></select>
+<button>Download attachment</button></form>
 <script>
 let token = '';
 let device = localStorage.getItem('examaiAdminDevice') || crypto.randomUUID();
@@ -47,8 +54,54 @@ async function call(path, body) {
  try {
   const response = await fetch(path, {method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
   result.textContent = JSON.stringify(await response.json(), null, 2);
- } catch (_) { result.textContent = 'Request failed.'; }
+  return response.status;
+ } catch (_) { result.textContent = 'Request failed. Apply again to retry.'; return 0; }
 }
 document.getElementById('load').onclick = () => call('/admin/data?q='+encodeURIComponent(document.getElementById('query').value));
-document.getElementById('action').onsubmit = e => {e.preventDefault(); const b=Object.fromEntries(new FormData(e.target)); b.amount=Number(b.amount); b.report_id=Number(b.report_id); call('/admin/action',b);};
+const form = document.getElementById('action');
+document.getElementById('attachment').onsubmit = async e => {
+ e.preventDefault();
+ const fields = new FormData(e.target);
+ const id = Number(fields.get('report_id'));
+ const kind = fields.get('kind');
+ try {
+  const response = await fetch(`/admin/reports/${id}/${kind}`, {headers:{Authorization:'Bearer '+token}});
+  if (!response.ok) throw Error();
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = kind === 'screenshot' ? 'screenshot.png' : 'diagnostics.txt';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+ } catch (_) { document.getElementById('result').textContent = 'Attachment unavailable.'; }
+};
+for (const button of document.querySelectorAll('[data-minutes], [data-days]')) {
+ button.onclick = () => {
+  const action = button.dataset.minutes ? 'minutes' : 'days';
+  form.elements.action.value = action;
+  form.elements.amount.value = button.dataset[action];
+ };
+}
+let pendingGrant;
+form.onsubmit = async e => {
+ e.preventDefault();
+ const apply = form.querySelector('button');
+ if (apply.disabled) return;
+ const body = Object.fromEntries(new FormData(form));
+ for (const field of ['amount', 'invite_days', 'report_id']) body[field] = Number(body[field]);
+ if (['minutes', 'days'].includes(body.action)) {
+  const payload = JSON.stringify(body);
+  if (pendingGrant && pendingGrant.payload !== payload) {
+   document.getElementById('result').textContent = 'Retry the previous grant before submitting another.';
+   return;
+  }
+  pendingGrant ??= {payload, id:crypto.randomUUID()};
+  body.operation_id = pendingGrant.id;
+ }
+ apply.disabled = true;
+ try {
+  const status = await call('/admin/action', body);
+  if (body.operation_id && status >= 200 && status < 500) pendingGrant = undefined;
+ } finally { apply.disabled = false; }
+};
 </script></html>

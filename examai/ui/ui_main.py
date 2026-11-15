@@ -3,7 +3,7 @@ import math
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
     QPushButton, QComboBox, QTabWidget, QFileDialog, QProgressBar, QLineEdit,
-    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QDialog, QStackedWidget, QApplication, QColorDialog, QSlider,
+    QListWidget, QGraphicsOpacityEffect, QCheckBox, QSizePolicy, QScrollArea, QFrame, QStackedWidget, QApplication, QColorDialog, QSlider,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem
 )
 from PySide6.QtCore import QEvent, Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSize
@@ -19,6 +19,7 @@ from examai.ui.motion import MotionManager
 from examai.ui.account import AccountPanel
 from examai.windows.credentials import protect
 from examai.ui.subscriptions import SubscriptionsPage
+from examai.ui.settings_window import SettingsWindow
 
 from examai.branding import VERSION
 
@@ -629,6 +630,9 @@ class MainWindow(QMainWindow):
         self.toast_anim_out.start()
 
     def retranslate_ui(self):
+        self.account_panel.report_toggle.setText(
+            "Повідомити про помилку" if self.tr.current_lang == "UA" else "Report a Problem"
+        )
         self.tab_subscriptions.set_language(self.tr.current_lang)
         self.retranslate_panels()
         self.live_cards.retranslate()
@@ -815,6 +819,11 @@ class MainWindow(QMainWindow):
         if not self.isVisible() or self.isMinimized():
             return
         first_show = not self.settings_window.isVisible()
+        if first_show:
+            # Create the HWND while hidden so its first frame uses the theme.
+            self.settings_window.winId()
+            if self.account_panel.client.token:
+                self.account_panel.refresh()
         self.settings_window.show()
         if first_show:
             self.position_settings()
@@ -847,7 +856,8 @@ class MainWindow(QMainWindow):
 
     def init_settings_window(self):
         self._settings_positioned = False
-        window = self.settings_window = QDialog(self)
+        window = self.settings_window = SettingsWindow(self)
+        window.setWindowIcon(QApplication.windowIcon())
         window.setWindowTitle("EXAM AI · Налаштування")
         window.setObjectName("SettingsWindow")
         window.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
@@ -1626,6 +1636,9 @@ class MainWindow(QMainWindow):
         ).replace("stop:0 " + blend(base, THEMES.get(theme, THEMES["midnight"])[4], .055),
                   "stop:0 " + glass, 1))
         self.settings_window.setStyleSheet(self.styleSheet())
+        self.settings_window.set_caption_colors(
+            glass, THEMES.get(theme, THEMES["midnight"])[4], theme != "frosted_light"
+        )
         self.tab_subscriptions.apply_theme(theme, self.config_mgr.get("accent"))
         foreground = "#192337" if theme == "frosted_light" else "#f4f4f4"
         self.live_cards.update_icons(QColor(foreground))
