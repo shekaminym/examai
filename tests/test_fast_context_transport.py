@@ -126,6 +126,14 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
             else:
                 assert CONVERSATION_HEADER in payload
         assert CONVERSATION_HEADER not in send("Як створити таблицю в SQLite?")
+        ctl.on_clear_all()
+        from pathlib import Path
+        ctl.rag.index_file_sync(Path(__file__).parent / "fixtures" / "code.txt")
+        payload = send("Що робить 58-й рядок у code.txt?")
+        assert "58:" in payload and "double" in payload
+        for followup in ("Детальніше розкажи", "А для чого потрібна ця змінна?"):
+            payload = send(followup)
+            assert all(anchor in payload for anchor in (CONVERSATION_HEADER, "code.txt", "58:", "double"))
     finally:
         ctl.audio = None
         ctl.shutdown()

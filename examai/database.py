@@ -43,6 +43,10 @@ class DatabaseManager:
                     UNIQUE(source, line_number)
                 )
             """)
+            conn.execute("""CREATE TABLE IF NOT EXISTS history_session (
+                history_id INTEGER PRIMARY KEY, session TEXT NOT NULL,
+                account TEXT NOT NULL, reference TEXT NOT NULL
+            )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS document_meta (
                     source TEXT PRIMARY KEY,
@@ -249,17 +253,21 @@ class DatabaseManager:
                 ORDER BY bm25(document_lines_fts), d.id LIMIT ?
             """, (expression, source, source, limit)).fetchall()
 
-    def save_qa(self, question, answer, model):
+    def save_qa(self, question, answer, model, *, session=None, account="", reference=""):
         with self.connection() as conn:
-            conn.execute(
+            row = conn.execute(
                 "INSERT INTO history (question, answer, model) VALUES (?, ?, ?)",
                 (question, answer, model),
             )
+            if session:
+                conn.execute("INSERT INTO history_session VALUES (?, ?, ?, ?)",
+                             (row.lastrowid, session, account, reference))
 
-    def get_history(self, limit=10):
+    def get_history(self, limit=10, *, account="", session=None):
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT question, answer FROM history ORDER BY id DESC LIMIT ?",
-                (max(0, limit),),
+                "SELECT question, answer FROM history LEFT JOIN history_session ON history.id=history_id "
+                "WHERE coalesce(account, '')=? AND (? IS NULL OR session=?) ORDER BY id DESC LIMIT ?",
+                (account, session, session, max(0, limit)),
             )
             return [{"question": question, "answer": answer} for question, answer in rows]

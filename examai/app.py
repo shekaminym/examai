@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import threading
+from hashlib import sha256
 from math import ceil
 from time import perf_counter
 from uuid import uuid4
@@ -10,7 +11,7 @@ from uuid import uuid4
 import keyboard
 from PySide6.QtCore import QEventLoop, QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QMessageBox
-from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
+from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication, QKeySequence, QShortcut
 from examai.ui.appearance import THEMES
 from examai.ui.response_view import FormulaJobs
 
@@ -612,7 +613,10 @@ class MainController(QObject):
         self._retired_answers = {}
         self._answer_history = []
         self.conversation = Conversation()
-        self.ui.account_panel.session_changed.connect(self.conversation.clear)
+        self.ui.account_panel.session_changed.connect(self._account_changed)
+        self._cancel_vision_shortcut = QShortcut(QKeySequence("Esc"), self.ui)
+        self._cancel_vision_shortcut.activated.connect(self._cancel_vision_answer)
+        self._cancel_vision_shortcut.setEnabled(False)
         self._history_index = -1
         self._current_question = ""
         self._current_answer_text = ""
@@ -998,9 +1002,11 @@ class MainController(QObject):
         if not self._selecting_screen or self.closing:
             return
         try:
+            started = perf_counter()
             shots = [(screen, screen.grabWindow(0)) for screen in self.app.screens()]
             if not shots or any(pixmap.isNull() for _, pixmap in shots):
                 raise RuntimeError("screen capture unavailable")
+            timing.info("screen_capture_ms=%.1f screens=%d", (perf_counter() - started) * 1000, len(shots))
             # Capture every monitor before drawing any selection window.
             self._screen_overlays = [ScreenSelection(screen, pixmap) for screen, pixmap in shots]
             for overlay in self._screen_overlays:
@@ -1159,6 +1165,7 @@ class MainController(QObject):
             self.ui.lbl_status.setText("Мережа затримує попередні запити. Повторіть спробу.")
             return
         llm = self.get_llm(mode)
+        self._cancel_vision_shortcut.setEnabled(has_image)
         self._dev_request_started_at = submitted
         self._answer_request_id = request_id
         self._current_question = question
@@ -1171,7 +1178,7 @@ class MainController(QObject):
         self._speech_ended_at = speech_ended_at
         self._answer_cleared = False
         self.ui.txt_answer.setPlainText("")
-        self.ui.lbl_status.setText("EXAM AI ···")
+        self.ui.lbl_status.setText("Аналіз зображення… Esc — скасувати" if has_image else "EXAM AI ···")
         target_from = submitted if speech_ended_at is None else speech_ended_at
         remaining_to_hint = target_from + ANSWER_TARGET_SECONDS - submitted
         if remaining_to_hint <= 0:
@@ -1186,9 +1193,13 @@ class MainController(QObject):
                        self.config.get("active_document_source", "") or self._last_imported_source)
         retrieval_hint = source_hint
         memory_started = perf_counter()
-        prior = self.conversation.relevant_turns(question) if not has_image and requested_lines(question) is None else ()
+        exact_lines = requested_lines(question) if not has_image else None
+        prior = self.conversation.relevant_turns(question) if not has_image and exact_lines is None else ()
         memory = self.conversation.format_context(prior)
+        remembered_reference = self.conversation.reference_context(question) if prior else ""
         conversation_id = self.conversation.session_id
+        token = self.ui.account_panel.client.token
+        account_scope = sha256(token.encode()).hexdigest() if token else ""
         timing.info("request_id=%s session=%s prior_turns=%d context_prep_ms=%.2f",
                     request_id, conversation_id, len(prior), (perf_counter() - memory_started) * 1000)
         memory_generation = self.conversation.generation
@@ -1214,7 +1225,10 @@ class MainController(QObject):
                     if requested_lines(question) is not None or FILE_REFERENCE.search(question.casefold()):
                         raise GenerationError("Не вдалося прочитати імпортований файл. Спробуйте ще раз.") from None
                     context = ""
-                if memory and requested_lines(question) is None:
+                if remembered_reference and not FILE_REFERENCE.search(question.casefold()):
+                    context = remembered_reference
+                worker.memory_evidence = context[:1400]
+                if memory:
                     context = "\n\n".join(filter(None, (context[:3500-len(memory)-2], memory)))
             requested = perf_counter()
             last_update = None
@@ -1247,11 +1261,18 @@ class MainController(QObject):
                     answer = llm.generate_answer(question, context, on_text=on_text,
                                                  mode=mode, request_id=request_id)
                 else:
+                    encode_started = perf_counter()
                     try:
-                        prepared_bytes, prepared_mime = (encode_image(image) if image is not None
+                        prepared_bytes, prepared_mime = (encode_image(image, max_bytes=2_600_000)
+                                                         if image is not None and isinstance(llm, CloudEngine)
+                                                         else encode_image(image) if image is not None
                                                          else (image_bytes, image_mime))
                     except ValueError as exc:
                         raise GenerationError(str(exc)) from None
+                    timing.info("request_id=%s vision_encode_ms=%.1f bytes=%d mime=%s", request_id,
+                                (perf_counter() - encode_started) * 1000, len(prepared_bytes or b""), prepared_mime)
+                    if cancelled.is_set():
+                        raise GenerationError("Запит скасовано.")
                     intent = image_intent(image_instruction)
                     image_context = ""
                     if intent == EXPLAIN_CODE and source_hint:
@@ -1264,7 +1285,7 @@ class MainController(QObject):
                     answer = llm.generate_image_answer(
                         prepared_bytes, prepared_mime, on_text=on_text,
                         mode=mode, request_id=request_id, user_instruction=image_instruction,
-                        context=image_context, intent=intent,
+                        context=image_context, intent=intent, cancelled=cancelled.is_set,
                     )
             except GenerationError:
                 if latest_text and not cancelled.is_set():
@@ -1273,18 +1294,20 @@ class MainController(QObject):
             timing.info("request_id=%s llm_complete_ms=%.1f", request_id, (perf_counter() - requested) * 1000)
             if cancelled.is_set():
                 raise GenerationError("Запит скасовано.")
+            status = "Готово"
+            if save_history and not has_image:
+                try:
+                    self.db.save_qa(question, answer, llm.used_model, session=conversation_id,
+                                    account=account_scope, reference=worker.memory_evidence)
+                except Exception:
+                    status = "Відповідь отримано. Історію не збережено."
             worker.answer_ready.emit(answer)
-            if not save_history or has_image:
-                return answer, "Готово"
-            try:
-                self.db.save_qa(question, answer, llm.used_model)
-            except Exception:
-                return answer, "Відповідь отримано. Історію не збережено."
-            return answer, "Готово"
+            return answer, status
 
         worker = TaskWorker(task, "Помилка обробки запиту AI.", request_id=request_id)
         worker.cancel_answer = cancelled
-        worker.memory_generation = memory_generation if not has_image else None
+        worker.memory_generation = memory_generation
+        worker.memory_evidence = ""
         worker.progress.connect(self.on_answer_progress)
         worker.answer_ready.connect(self._answer_ready)
         self.start_api(worker, self.on_answer)
@@ -1303,6 +1326,25 @@ class MainController(QObject):
         self._retired_answers[worker] = self.llm
         self.llm = self.llm_settings = None
         self.api = None
+        self._cancel_vision_shortcut.setEnabled(False)
+
+    @Slot()
+    def _cancel_vision_answer(self):
+        self._cancel_active_answer()
+        self._answer_hint_timer.stop()
+        self.ui.live_cards.clear()
+        self.ui.lbl_status.setText("Аналіз зображення скасовано.")
+        self._sync_history_controls()
+        self._start_pending_answer()
+
+    @Slot()
+    def _account_changed(self):
+        self.on_clear_all()
+        self._answer_history.clear()
+        self.ui.set_history_items([])
+        self.ui.txt_question.clear()
+        self.ui.txt_answer.clear()
+        self._sync_history_controls()
 
     def _accept_answer_signal(self):
         sender = self.sender()
@@ -1357,8 +1399,10 @@ class MainController(QObject):
             answer = brand_answer(answer)
             self._answer_hint_timer.stop()
             self._current_answer_text = answer
-            generation = getattr(self.sender(), "memory_generation", None)
-            self.conversation.remember(self._current_question, memory_answer, generation)
+            worker = self.sender()
+            generation = getattr(worker, "memory_generation", None)
+            self.conversation.remember(self._current_question, memory_answer, generation,
+                                       getattr(worker, "memory_evidence", ""))
             self._remember_answer(answer)
             self.ui.live_cards.ready(self._answer_request_id, self._current_question, answer)
             self.ui.txt_answer.show_response(answer)
@@ -1480,6 +1524,7 @@ class MainController(QObject):
         elif worker is not None and worker is self.api:
             worker.deleteLater()
             self.api = None
+            self._cancel_vision_shortcut.setEnabled(False)
             self._answer_hint_timer.stop()
             self._sync_history_controls()
             self._start_pending_answer()

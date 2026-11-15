@@ -1,12 +1,13 @@
 import re
 import logging
 from contextlib import ExitStack
+from contextvars import ContextVar
 from time import perf_counter
 
 import httpx
 from google import genai
 from google.genai import errors, types
-from examai.ai.conversation import CONVERSATION_HEADER
+from examai.ai.conversation import CONVERSATION_HEADER, ELABORATION
 from examai.branding import ANSWER_PREFIX
 from examai.ai.image_intent import AUTO_IMAGE, EXPLAIN_CODE
 
@@ -15,6 +16,8 @@ timing = logging.getLogger('phantom.timing')
 ANSWER_TIMEOUT = 'Час відповіді вичерпано.'
 NETWORK_IDLE_SECONDS = 12
 CONNECT_SECONDS = 5
+VISION_SECONDS = 38
+_vision_cancel = ContextVar("vision_cancel", default=None)
 
 
 class GenerationError(Exception):
@@ -100,6 +103,11 @@ class LLMEngine:
         instruction = "Почни з відповіді українською. Дай 1–2 речення, до 40 слів. "
         if history.strip():
             prompt += f"\n\n{CONVERSATION_HEADER}{history}"
+            if ELABORATION.search(question):
+                instruction = ("Почни з відповіді українською. Розкрий тему останньої репліки "
+                               "у 2–4 конкретних реченнях, до 75 слів. Якщо відомі файл і рядок, "
+                               "поясни роль операторів або змінних на основі уривку. "
+                               "Коли предмет уточнення вже є в контексті, поясни його одразу. ")
             questions = [line.removeprefix("Питання: ") for line in history.splitlines()
                          if line.startswith("Питання: ")]
             if len(questions) >= 2 and re.search(r"різниц|відрізня|разниц|отлича|differ", question, re.I):
@@ -143,7 +151,7 @@ class LLMEngine:
 
     def generate_image_answer(self, image_bytes, mime_type, *, on_text=None,
                               deadline=None, mode="fast", request_id="-",
-                              user_instruction="", context="", intent=AUTO_IMAGE):
+                              user_instruction="", context="", intent=AUTO_IMAGE, cancelled=None):
         if mime_type not in {"image/png", "image/jpeg"} or not image_bytes or len(image_bytes) > 12 * 1024 * 1024:
             raise GenerationError("Зображення не вдалося підготувати для Gemini.")
         instruction = "Відповідай українською: спочатку результат, далі лише необхідні кроки. "
@@ -176,9 +184,15 @@ class LLMEngine:
             prompt,
             types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
         ]
-        return self._generate(instruction, contents,
-                              420 if intent == EXPLAIN_CODE else 260,
-                              on_text=on_text, deadline=deadline, request_id=request_id)
+        token = _vision_cancel.set(cancelled or (lambda: False))
+        try:
+            return self._generate(instruction, contents,
+                                  420 if intent == EXPLAIN_CODE else 260,
+                                  on_text=on_text, deadline=(perf_counter() + VISION_SECONDS
+                                                            if deadline is None else deadline),
+                                  request_id=request_id)
+        finally:
+            _vision_cancel.reset(token)
 
     def _generate(self, instruction, prompt, budget, *, on_text=None, deadline=None, request_id="-"):
         self.used_model = None
@@ -271,7 +285,9 @@ class LLMEngine:
             if isinstance(exc, httpx.ConnectTimeout):
                 message = "Не вдалося вчасно підключитися до Gemini."
             elif isinstance(exc, httpx.ReadTimeout):
-                message = "Gemini не надіслав початок відповіді в межах мережевого таймауту."
+                message = ("Gemini не розпочав аналіз зображення вчасно. Виділіть область і спробуйте ще раз."
+                           if _vision_cancel.get() is not None else
+                           "Gemini не надіслав початок відповіді в межах мережевого таймауту.")
             else:
                 message = "Мережевий таймаут під час запиту до Gemini."
             raise GenerationError(message) from None
@@ -290,10 +306,13 @@ class LLMEngine:
         try:
             return self._request_gemini(model, instruction, prompt, budget, on_text,
                                         deadline=deadline, basic=basic, request_id=request_id)
-        except httpx.ConnectError:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # TCP/TLS connection failed before the HTTP request could be sent.
             # Read/write errors may follow an accepted request, so don't replay them.
-            if perf_counter() - started > 2.5:
+            cancelled = _vision_cancel.get()
+            if (cancelled and cancelled()) or (isinstance(exc, httpx.ConnectTimeout) and not cancelled):
+                raise
+            if perf_counter() - started > (CONNECT_SECONDS + .5 if cancelled else 2.5):
                 raise
             timing.info("request_id=%s llm_reconnect_before_send=1", request_id)
             return self._request_gemini(model, instruction, prompt, budget, on_text,
@@ -301,6 +320,9 @@ class LLMEngine:
 
     def _request_gemini(self, model, instruction, prompt, budget, on_text, *,
                         deadline, basic, request_id):
+        cancelled = _vision_cancel.get()
+        if cancelled and cancelled():
+            raise GenerationError("Запит скасовано.")
         remaining = None if deadline is None else deadline - perf_counter()
         if remaining is not None and remaining <= 0:
             raise GenerationError(ANSWER_TIMEOUT)
@@ -309,7 +331,7 @@ class LLMEngine:
         if not basic and model == "gemini-3.5-flash":
             # SDK 2.33 sends ThinkingConfig.thinking_level as snake_case.
             # Provide the documented REST field directly for this model.
-            level = "medium" if budget > 140 else "minimal"
+            level = "minimal" if cancelled or budget <= 140 else "medium"
             extra_body = {"generationConfig": {"thinkingConfig": {"thinkingLevel": level}}}
         # Flash-Lite already defaults to minimal. Other models use their own defaults.
         if basic:
@@ -317,7 +339,8 @@ class LLMEngine:
                 prompt = [f"{instruction}\n\n{prompt[0]}", *prompt[1:]]
             else:
                 prompt = f"{instruction}\n\n{prompt}"
-            config = None
+            config = (types.GenerateContentConfig(http_options=types.HttpOptions(timeout=timeout_ms))
+                      if cancelled and timeout_ms is not None else None)
         else:
             config = types.GenerateContentConfig(
                 system_instruction=instruction,
@@ -341,6 +364,8 @@ class LLMEngine:
             def deltas():
                 nonlocal finished, first_text
                 for chunk in stream:
+                    if cancelled and cancelled():
+                        raise GenerationError("Запит скасовано.")
                     if deadline is not None and perf_counter() >= deadline:
                         raise GenerationError(ANSWER_TIMEOUT)
                     finished |= any(candidate.finish_reason for candidate in chunk.candidates or ())
@@ -349,6 +374,7 @@ class LLMEngine:
                         first_text = False
                         timing.info("request_id=%s llm_ttft_ms=%.1f", request_id,
                                     (perf_counter() - sent_at) * 1000)
+                    # Some responses contain all text in the terminal event.
                     yield text
 
             answer = collect_text(deltas(), on_text, ANSWER_PREFIX, request_id=request_id)
