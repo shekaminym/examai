@@ -29,6 +29,7 @@ FOLLOW_UP = re.compile(
     re.IGNORECASE,
 )
 COMPARISON = re.compile(r"різниц|відрізня|порівняй|разниц|отлича|сравни|differ|compare", re.I)
+COMPARISON_REFERENCE = re.compile(r"\b(?:вони|ними|їх|їхня|они|ними|их|them|they|former|latter)\b", re.I)
 CONTEXT_LIMIT = 1900
 
 
@@ -92,6 +93,23 @@ class Conversation:
         return tuple(self._summaries[i] if i < len(self.turns) - 3 else
                      (self._summaries[i][0], " ".join(self.turns[i][1].split())[:660])
                      for i in selected)
+
+    @staticmethod
+    def resolve_comparison(question, turns):
+        """Name the referents in the question itself before it reaches either transport."""
+        if not (COMPARISON.search(question) and COMPARISON_REFERENCE.search(question)):
+            return question
+        topics = []
+        for previous, _ in turns:
+            if FOLLOW_UP.search(previous) or ELABORATION.search(previous):
+                continue
+            label = re.sub(r"^(?:що таке|что такое|what is|what are)\s+", "", previous, flags=re.I)
+            label = label.strip(" ?.!")
+            if label and label.casefold() not in {topic.casefold() for topic in topics}:
+                topics.append(label)
+        if len(topics) < 2:
+            return question
+        return f"Порівняй ці поняття: {'; '.join(topics)}. Поясни їхню відмінність і зв’язок."
 
     def reference_context(self, question):
         if (not self.turns or not (FOLLOW_UP.search(question.strip()) or ELABORATION.search(question))

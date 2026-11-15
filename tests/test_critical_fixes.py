@@ -275,6 +275,8 @@ class ImageAndHistoryTests(unittest.TestCase):
         controller.audio.isInterruptionRequested.return_value = False
         controller.submit_question = MagicMock()
         controller._submit_auto_question("Що таке рекурсія?", 1.0, "part-1")
+        controller.api = MagicMock()
+        controller._cancel_active_answer = MagicMock()
         controller.handle_question("і рекурсивний спуск?", 2.0, "part-2")
         self.assertEqual(controller._question_aggregator.text,
                          "Що таке рекурсія і рекурсивний спуск?")
@@ -282,6 +284,7 @@ class ImageAndHistoryTests(unittest.TestCase):
         self.assertEqual(controller.submit_question.call_count, 2)
         self.assertEqual(controller.submit_question.call_args.args[0],
                          "Що таке рекурсія і рекурсивний спуск?")
+        controller.api = None
 
     def test_completed_answers_remain_navigable_after_clear(self):
         controller = self._controller()

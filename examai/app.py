@@ -1088,7 +1088,7 @@ class MainController(QObject):
                 cards.preview(question, new=cards.request_id is not None, status="")
             return
         recent = self._recent_voice_item
-        if (recent and not self._question_aggregator.pending
+        if (recent and self.api is not None and not self._question_aggregator.pending
                 and perf_counter() - recent[3] <= 4.0
                 and is_continuation_fragment(question)):
             self._question_aggregator.add_final(recent[0], recent[1], recent[2])
@@ -1196,6 +1196,7 @@ class MainController(QObject):
         exact_lines = requested_lines(question) if not has_image else None
         prior = self.conversation.relevant_turns(question) if not has_image and exact_lines is None else ()
         memory = self.conversation.format_context(prior)
+        provider_question = self.conversation.resolve_comparison(question, prior)
         remembered_reference = self.conversation.reference_context(question) if prior else ""
         conversation_id = self.conversation.session_id
         token = self.ui.account_panel.client.token
@@ -1258,7 +1259,7 @@ class MainController(QObject):
                         "cloud" if isinstance(llm, CloudEngine) else "byok")
             try:
                 if not has_image:
-                    answer = llm.generate_answer(question, context, on_text=on_text,
+                    answer = llm.generate_answer(provider_question, context, on_text=on_text,
                                                  mode=mode, request_id=request_id)
                 else:
                     encode_started = perf_counter()
@@ -1307,6 +1308,7 @@ class MainController(QObject):
         worker = TaskWorker(task, "Помилка обробки запиту AI.", request_id=request_id)
         worker.cancel_answer = cancelled
         worker.memory_generation = memory_generation
+        worker.memory_question = question
         worker.memory_evidence = ""
         worker.progress.connect(self.on_answer_progress)
         worker.answer_ready.connect(self._answer_ready)
@@ -1401,7 +1403,8 @@ class MainController(QObject):
             self._current_answer_text = answer
             worker = self.sender()
             generation = getattr(worker, "memory_generation", None)
-            self.conversation.remember(self._current_question, memory_answer, generation,
+            self.conversation.remember(getattr(worker, "memory_question", self._current_question),
+                                       memory_answer, generation,
                                        getattr(worker, "memory_evidence", ""))
             self._remember_answer(answer)
             self.ui.live_cards.ready(self._answer_request_id, self._current_question, answer)

@@ -81,9 +81,10 @@ def test_followups_reach_existing_fast_engine_and_clear(tmp_path):
 
         def generate_answer(self, question, context, **_kwargs):
             requests.append((question, context))
-            if question.startswith("Чим"):
+            if question.startswith(("Чим", "Порівняй")):
                 if context:
                     assert "диз'юнкція" in context and "кон'юнкція" in context
+                    assert "диз'юнкція" in question and "кон'юнкція" in question
                     return "Диз'юнкція істинна, якщо істинний хоча б один операнд. Кон'юнкція — лише якщо істинні обидва."
                 return "Missing context"
             return "Логічна операція."

@@ -7,7 +7,7 @@ from time import perf_counter
 import httpx
 from google import genai
 from google.genai import errors, types
-from examai.ai.conversation import CONVERSATION_HEADER, ELABORATION
+from examai.ai.conversation import COMPARISON, CONVERSATION_HEADER, ELABORATION
 from examai.branding import ANSWER_PREFIX
 from examai.ai.image_intent import AUTO_IMAGE, EXPLAIN_CODE
 
@@ -110,12 +110,10 @@ class LLMEngine:
                                "Коли предмет уточнення вже є в контексті, поясни його одразу. ")
             questions = [line.removeprefix("Питання: ") for line in history.splitlines()
                          if line.startswith("Питання: ")]
-            if len(questions) >= 2 and re.search(r"різниц|відрізня|разниц|отлича|differ", question, re.I):
-                references = [re.sub(r"^(?:що таке|что такое|what is)\s+", "", q, flags=re.I).rstrip("?.!")
-                              for q in questions]
-                prompt += "\n\nОб'єкти порівняння з попередніх запитань: " + " | ".join(references)
+            if len(questions) >= 2 and COMPARISON.search(question):
                 instruction = ("Почни з відповіді українською. Дай по одному короткому пункту "
-                               "на кожен об'єкт порівняння та узагальни відмінність. ")
+                               "на кожне поняття, назване у поточному запитанні, та узагальни відмінність. "
+                               "Якщо поняття прямо названі, одразу порівняй їх. ")
         timing.info("request_id=%s prompt_ms=%.1f context_chars=%d",
                     request_id, (perf_counter() - build_started) * 1000, len(context))
         return self._generate(

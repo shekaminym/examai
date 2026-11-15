@@ -110,6 +110,13 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
         return posted[-1]["contents"][0]["parts"][0]["text"]
 
     try:
+        for question in ("Інтеграл", "Що таке Диференціювання?"):
+            send(question, voice=cloud)
+        payload = send("В чому різниця між ними?", voice=cloud)
+        current_question, memory = payload.split(CONVERSATION_HEADER, 1)
+        assert "Інтеграл" in current_question and "Диференціювання" in current_question
+        assert "Інтеграл" in memory and "Диференціювання" in memory
+        ctl.on_clear_all()
         for question in ("Що таке диз'юнкція?", "Що таке кон'юнкція?"):
             send(question)
         payload = send("Чим вони відрізняються?")

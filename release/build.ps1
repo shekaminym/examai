@@ -1,4 +1,4 @@
-param([string]$Version = "3.2.1-beta.1",
+param([string]$Version = "3.2.2-beta.1",
       [string]$BuildRoot = "release-build",
       [string]$CloudUrl = $env:EXAMAI_RELEASE_CLOUD_URL,
       [switch]$SkipInstaller)
