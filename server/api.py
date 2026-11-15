@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import secrets
+from functools import partial
 from urllib.parse import urlencode, urlsplit
 from threading import Event, Lock, Thread
 from uuid import UUID
@@ -12,6 +13,7 @@ from uuid import UUID
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.id_token import verify_oauth2_token
 from pydantic import BaseModel, Field
@@ -124,9 +126,13 @@ def create_app(path=None):
                 code=code, client_id=client_id, client_secret=client_secret, redirect_uri=redirect,
                 grant_type="authorization_code", code_verifier=row["verifier"]))
             response.raise_for_status()
-            claims = verify_oauth2_token(response.json()["id_token"], Request(), client_id)
+            claims = verify_oauth2_token(response.json()["id_token"],
+                                         partial(Request(), timeout=12), client_id)
             if claims.get("nonce") != row["nonce"] or not claims.get("sub"):
                 raise ValueError("Invalid OIDC response")
+        except (TransportError, httpx.RequestError) as exc:
+            log.warning("Google Sign-In network failure: %s", type(exc).__name__)
+            raise HTTPException(503, "Google Sign-In is temporarily unavailable") from None
         except (httpx.HTTPError, ValueError, KeyError):
             raise HTTPException(400, "Google authentication failed") from None
         with db.transaction() as tx:

@@ -14,6 +14,8 @@ Create `$HOME/.config/examai/backend.env` with permissions 0600. Use the HTTPS s
 
 Register the ASGI command `/bin/sh /home/<username>/exam-ai/server/deploy/pythonanywhere.sh` for the subdomain. Use the matching absolute path for the extracted directory. The host supplies `DOMAIN_SOCKET`. The launcher disables Uvicorn access logging. Restrict access to the host's proxy logs and keep secrets and databases outside web-served paths. Track startup errors and Cloud failures in the host's error log. Back up the database consistently with SQLite's backup API.
 
+If the free ASGI worker does not inherit the outbound proxy, set `HTTPS_PROXY=http://proxy.server:3128` and `https_proxy=http://proxy.server:3128` in its private environment file. Verify access to both the Google token and signing-certificate endpoints with a real sign-in before opening invitations. [PythonAnywhere outbound proxy](https://help.pythonanywhere.com/pages/403ForbiddenError/)
+
 ## Budget and abuse limits
 
 For public Cloud Gemini, the server requires the following settings:
