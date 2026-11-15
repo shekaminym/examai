@@ -11,9 +11,11 @@ python -m pip install -r requirements.txt -r requirements-rag.txt pyinstaller==6
 .\release\build.ps1
 ```
 
-Use `release-build/EXAM-AI-Setup.exe`. The build defaults to `3.2.1-beta.1`. Pass `-SkipInstaller` to build only the standalone folder and keep the entire `EXAM AI` folder together when redistributing it. The frozen app writes its configuration and notes database under `%LOCALAPPDATA%\EXAM AI`. Source mode continues to use the working directory. To migrate legacy notes, close both versions, back up the old SQLite database (including any WAL sidecars), then import materials or copy the checkpointed database to the new data directory. Setup preserves application data on update and uninstall.
+Use `release-build/EXAM-AI-Setup.exe`. The build defaults to `3.2.2-beta.1`. Pass `-SkipInstaller` to build only the standalone folder and keep the entire `EXAM AI` folder together when redistributing it. The frozen app writes its configuration and notes database under `%LOCALAPPDATA%\EXAM AI`. Source mode continues to use the working directory. To migrate legacy notes, close both versions, back up the old SQLite database (including any WAL sidecars), then import materials or copy the checkpointed database to the new data directory. Setup preserves application data on update and uninstall.
 
 ## Backend
+
+[Google Sign-In and HTTPS deployment](GOOGLE_SIGN_IN_DEPLOYMENT.md).
 
 ```powershell
 python -m pip install -r server/requirements.txt
