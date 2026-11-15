@@ -205,7 +205,7 @@ def create_app(path=None):
         oauth = bool(client_id and client_secret and urlsplit(base).scheme == "https")
         cloud = bool(os.getenv("EXAMAI_CLOUD_GEMINI_KEY") and budget)
         response.status_code = 200 if oauth and cloud else 503
-        return {"ready": oauth and cloud, "oauth_configured": oauth, "cloud_configured": cloud}
+        return {"ready": oauth and cloud}
 
     @app.get("/plans")
     def plans():
