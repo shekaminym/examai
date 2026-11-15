@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QEvent, QObject, QRectF
-from PySide6.QtGui import QColor, QPainterPath, QPalette, QRegion
+from PySide6.QtCore import QEvent, QObject
+from PySide6.QtGui import QColor, QPalette, QRegion
 
 
 class RoundedWindow(QObject):
@@ -34,9 +34,21 @@ class RoundedWindow(QObject):
         self.update_shape()
 
     def update_shape(self):
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(self.window.rect()), self.radius, self.radius)
-        self.window.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        width, height = self.window.width(), self.window.height()
+        radius = min(max(0, int(self.radius)), width // 2, height // 2)
+        if not radius:
+            self.window.setMask(QRegion(0, 0, width, height))
+            return
+        # A polygonal path approximates a quarter-circle with a few long
+        # edges. Rasterize the true circle row by row, including at high DPI.
+        region = QRegion(0, radius, width, max(0, height - 2 * radius))
+        for y in range(radius):
+            distance = radius - y - 0.5
+            inset = max(0, math.ceil(radius - math.sqrt(radius * radius - distance * distance) - 0.5))
+            strip = QRegion(inset, y, width - 2 * inset, 1)
+            region = region.united(strip)
+            region = region.united(QRegion(inset, height - y - 1, width - 2 * inset, 1))
+        self.window.setMask(region)
 
     def eventFilter(self, watched, event):
         if watched is getattr(self, "window", None) and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
