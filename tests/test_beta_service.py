@@ -1,5 +1,6 @@
 import base64
 import json
+from uuid import uuid4
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -9,7 +10,7 @@ import pytest
 from examai.updates import verify_manifest
 from server.api import create_app
 from server.payments import signature
-from server.store import Store, digest
+from server.store import Denied, Store, digest
 
 
 def bearer(token):
@@ -34,9 +35,15 @@ def test_server_invite_admin_and_reports(tmp_path, monkeypatch):
         "sub": "beta-sub", "action": "report", "report_id": issue["id"], "status": "Fixed"})
     assert result.is_success
     assert client.get("/reports", headers=user).json()[0]["status"] == "Fixed"
-    assert client.post("/admin/action", headers=admin, json={
-        "sub": "beta-sub", "action": "minutes", "amount": 10}).is_success
+    grant = {"sub": "beta-sub", "action": "minutes", "amount": 10, "operation_id": str(uuid4())}
+    assert client.post("/admin/action", headers=admin, json=grant).is_success
+    assert client.post("/admin/action", headers=admin, json=grant).is_success
+    assert client.post("/admin/action", headers=admin, json={**grant, "amount": 30}).status_code == 409
     assert client.get("/account", headers=user).json()["seconds"] == 2400
+    for action, state in (("suspend", "SUSPENDED"), ("restore", "BETA")):
+        assert client.post("/admin/action", headers=admin,
+                           json={"sub": "beta-sub", "action": action}).is_success
+        assert client.get("/account", headers=user).json()["state"] == state
     assert client.post("/logout", headers=user).is_success
     assert client.get("/account", headers=user).status_code == 401
 
@@ -58,6 +65,36 @@ def test_active_time_server_clock_exclusive_and_bounded(tmp_path):
         assert store.access(db, "beta", token=b, lease_action="start")["granted"]
         now[0] += 300
         assert store.access(db, "beta")["seconds"] == 1781
+
+
+def test_expired_invite_cannot_be_redeemed(tmp_path):
+    store = Store(tmp_path / "server.sqlite", now=lambda: 100)
+    with store.transaction() as db:
+        store.issue(db, "beta", "desktop")
+        code = digest("expired-code")
+        db.execute("INSERT INTO invite(code) VALUES(?)", (code,))
+        db.execute("INSERT INTO invite_expiry VALUES(?,?)", (code, 100))
+        with pytest.raises(Denied):
+            store.redeem(db, "beta", "expired-code")
+        assert store.access(db, "beta")["state"] == "EXPIRED"
+
+
+def test_report_attachment_is_private(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAMAI_ADMIN_SUBJECTS", "admin-sub")
+    path = tmp_path / "server.sqlite"
+    client = TestClient(create_app(path))
+    store = Store(path)
+    with store.transaction() as db:
+        admin = bearer(store.issue(db, "admin-sub", "admin-device"))
+        user = bearer(store.issue(db, "user-sub", "user-device"))
+    report = {"kind": "Bug", "description": "Cannot open notes", "diagnostics": "OS: Windows"}
+    assert client.post("/reports", headers=user, json={**report, "screenshot": "broken"}).status_code == 422
+    report_id = client.post("/reports", headers=user, json=report).json()["id"]
+    route = f"/admin/reports/{report_id}/diagnostics"
+    assert client.get(route, headers=user).status_code == 403
+    response = client.get(route, headers=admin)
+    assert response.content == b"OS: Windows"
+    assert response.headers["content-disposition"] == 'attachment; filename="diagnostics.txt"'
 
 
 def test_sandbox_requires_signature_and_records_callback_once(tmp_path, monkeypatch):
