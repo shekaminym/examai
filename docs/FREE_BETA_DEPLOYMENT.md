@@ -12,7 +12,7 @@ install -d -m 700 "$HOME/.config/examai" "$HOME/examai-state"
 
 Create `$HOME/.config/examai/backend.env` with permissions 0600. Use the HTTPS subdomain for `EXAMAI_PUBLIC_URL` and the persistent absolute path for `EXAMAI_SERVER_DB`. The Google callback is `https://<username>.pythonanywhere.com/oauth/callback`. Configure `EXAMAI_GOOGLE_CLIENT_ID`, `EXAMAI_GOOGLE_CLIENT_SECRET`, and the free-tier `EXAMAI_CLOUD_GEMINI_KEY` in that file. Set `EXAMAI_ADMIN_SUBJECTS` only after confirming the two owners' OIDC subject IDs. The profile table stores their verified emails alongside those IDs after their first Google sign-in.
 
-Register the ASGI command `sh /home/<username>/exam-ai/server/deploy/pythonanywhere.sh` for the subdomain. Use the matching absolute path for the extracted directory. The host supplies `DOMAIN_SOCKET`. Keep request logging off for OAuth callbacks and keep secrets and databases outside web-served paths. Track startup errors and Cloud failures in the host's error log. Back up the database consistently with SQLite's backup API.
+Register the ASGI command `/bin/sh /home/<username>/exam-ai/server/deploy/pythonanywhere.sh` for the subdomain. Use the matching absolute path for the extracted directory. The host supplies `DOMAIN_SOCKET`. The launcher disables Uvicorn access logging. Restrict access to the host's proxy logs and keep secrets and databases outside web-served paths. Track startup errors and Cloud failures in the host's error log. Back up the database consistently with SQLite's backup API.
 
 ## Budget and abuse limits
 
