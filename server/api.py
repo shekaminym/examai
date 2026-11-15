@@ -15,7 +15,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.id_token import verify_oauth2_token
 from pydantic import BaseModel, Field
 
-from examai.ai.llm_engine import LLMEngine
+from examai.ai.llm_engine import GenerationError, LLMEngine
 from server.payments import mount as mount_payments
 from server.store import Denied, Store, digest
 
@@ -350,28 +350,32 @@ def create_app(path=None):
         queue = Queue()
         cancelled = Event()
         def generate():
-            engine = LLMEngine(api_key)
             try:
-                def progress(text):
-                    if cancelled.is_set():
-                        from examai.ai.llm_engine import GenerationError
-                        raise GenerationError("Cloud request cancelled")
-                    queue.put({"text": text})
-                if picture:
-                    final = engine.generate_image_answer(picture, body.mime, on_text=progress,
-                                                         user_instruction=body.question, context=body.context)
-                else:
-                    final = engine.generate_answer(body.question, body.context, on_text=progress)
-                queue.put({"final": final})
-            except Exception:
-                queue.put({"error": "Cloud request failed"})
-            finally:
+                engine = LLMEngine(api_key)
                 try:
-                    engine.close()
+                    def progress(text):
+                        if cancelled.is_set():
+                            raise GenerationError("Cloud request cancelled")
+                        queue.put({"text": text})
+
+                    if picture:
+                        final = engine.generate_image_answer(
+                            picture, body.mime, on_text=progress, user_instruction=body.question,
+                            context=body.context, cancelled=cancelled.is_set)
+                    else:
+                        final = engine.generate_answer(body.question, body.context, on_text=progress)
                 finally:
-                    with inflight_lock:
-                        inflight.discard(sub)
-                    queue.put(None)
+                    engine.close()
+                terminal = {"final": final}
+            except GenerationError as exc:
+                terminal = {"error": str(exc)}
+            except Exception:
+                terminal = {"error": "Cloud request failed"}
+            finally:
+                with inflight_lock:
+                    inflight.discard(sub)
+            queue.put(terminal)
+            queue.put(None)
 
         def stream():
             Thread(target=generate, daemon=True).start()

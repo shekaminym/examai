@@ -5,10 +5,20 @@ import threading
 import logging
 from time import perf_counter
 from urllib.parse import urlsplit
+from pathlib import Path
+import json
 
 import httpx
 
 from examai.ai.llm_engine import GenerationError
+
+
+def distribution_url():
+    path = Path(__file__).with_name("cloud_config.json")
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))["server_url"]
+    except (OSError, ValueError, KeyError):
+        return ""
 
 
 class BetaClient:
@@ -68,15 +78,18 @@ class CloudEngine:
     def generate_answer(self, question, context, *, on_text=None, request_id="-", **_kwargs):
         return self._stream({"question": question[:4000], "context": context[:3500]}, on_text, request_id)
 
-    def generate_image_answer(self, image, mime, *, on_text=None, user_instruction="", context="", **_kwargs):
+    def generate_image_answer(self, image, mime, *, on_text=None, user_instruction="", context="",
+                              request_id="-", cancelled=None, **_kwargs):
+        if not image or len(image) > 2_625_000 or mime not in {"image/png", "image/jpeg"}:
+            raise GenerationError("Зображення завелике або пошкоджене. Виділіть меншу область.")
         return self._stream({"question": user_instruction[:4000] or "Проаналізуй зображення",
                              "context": context[:3500], "mime": mime,
-                             "image": base64.b64encode(image).decode()}, on_text)
+                             "image": base64.b64encode(image).decode()}, on_text, request_id, cancelled)
 
     def generate_summary(self, context):
         return self.generate_answer("Склади короткий конспект за наданим текстом.", context)
 
-    def _stream(self, body, on_text, request_id="-"):
+    def _stream(self, body, on_text, request_id="-", cancelled=None):
         started = perf_counter()
         self.client.acquire()
         timing = logging.getLogger("phantom.timing")
@@ -94,11 +107,16 @@ class CloudEngine:
         worker = threading.Thread(target=heartbeat, daemon=True)
         worker.start()
         try:
+            if cancelled and cancelled():
+                raise GenerationError("Запит скасовано.")
             with httpx.stream("POST", self.client.url + "/answer", json=body,
-                              headers=self.client.headers(), timeout=25) as response:
+                              headers=self.client.headers(),
+                              timeout=httpx.Timeout(48, connect=5) if "image" in body else 25) as response:
                 response.raise_for_status()
                 import json
                 for line in response.iter_lines():
+                    if cancelled and cancelled():
+                        raise GenerationError("Запит скасовано.")
                     event = json.loads(line)
                     if "text" in event and on_text:
                         if first:
@@ -109,6 +127,16 @@ class CloudEngine:
                         return event["final"]
                     if "error" in event:
                         raise GenerationError(event["error"])
+        except httpx.ReadTimeout:
+            raise GenerationError("EXAM AI Cloud затримав відповідь. Спробуйте ще раз.") from None
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in (401, 403, 429):
+                message = {401: "Увійдіть в EXAM AI Cloud ще раз.",
+                           403: "Доступ до EXAM AI Cloud або ліміт використання вичерпано.",
+                           429: "Досягнуто квоти EXAM AI Cloud."}[status]
+                raise GenerationError(message) from None
+            raise GenerationError("EXAM AI Cloud тимчасово недоступний.") from None
         except (httpx.HTTPError, ValueError):
             raise GenerationError("EXAM AI Cloud request failed or the usage limit was reached.") from None
         finally:
