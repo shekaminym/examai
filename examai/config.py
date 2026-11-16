@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
     "update_channel": "beta",
     "account_session": "",
     "account_device": "",
+    "account_name": "",
     "protected_gemini_key": "",
     "gemini_model": "gemini-3.5-flash-lite",
     "whisper_model_size": "base",

@@ -11,11 +11,12 @@ const labels = {
   Owner: "Власник", Admin: "Адміністратор", User: "Користувач",
   Pending: "Очікує", Expired: "Строк дії минув", Activated: "Активовано", Revoked: "Відкликано",
   BETA: "Бета-доступ", TRIAL: "Тестовий доступ", ACTIVE: "Активний", SUSPENDED: "Призупинений",
-  EXPIRED: "Немає доступу", Unlimited: "Без обмежень", Calendar: "Строкова", Minutes: "За хвилинами",
+  EXPIRED: "Немає доступу", Unlimited: "Назавжди", Calendar: "До дати", Minutes: "Похвилинно",
   None: "Немає", Received: "Отримано", Reviewing: "На розгляді", Confirmed: "Підтверджено",
   Fixed: "Виправлено", Closed: "Закрито", Bug: "Помилка", Suggestion: "Пропозиція",
 };
 const errors = {
+  "Google account changed. Refresh user list": "Обліковий запис Google змінився. Оновіть список користувачів.",
   "Administrator required": "Потрібні права адміністратора.",
   "Owner required": "Ця дія доступна власнику.",
   "Sign in to EXAM AI": "Увійдіть до EXAM AI.",
@@ -79,14 +80,16 @@ function errorText(error) {
 }
 
 function auditLabel(action) {
+  if (action.startsWith("Purged example.test QA data:")) return "Видалено тестові записи @example.test";
+  if (action.startsWith("Cleared audit ")) return "Очищено журнал дій";
   if (Object.hasOwn(auditLabels, action)) return auditLabels[action];
   const role = /^Role (Owner|Admin) → (Owner|Admin)$/.exec(action);
   if (role) return "Змінено роль: " + display(role[1]) + " → " + display(role[2]);
-  const license = /^(?:License )?(minutes|remove|days|suspend|restore|revoke|invite) (\d+)(?: \d+\s*)?$/.exec(action);
+  const license = /^(?:License )?(minutes|remove|days|unlimited|suspend|restore|revoke|invite) (\d+)(?: \d+\s*)?$/.exec(action);
   if (license) {
     const [, kind, count] = license;
     const names = {minutes: "Додано", remove: "Списано", days: "Продовжено доступ на",
-      suspend: "Доступ призупинено", restore: "Доступ відновлено", revoke: "Ліцензію відкликано",
+      unlimited: "Надано доступ назавжди", suspend: "Доступ призупинено", restore: "Доступ відновлено", revoke: "Ліцензію відкликано",
       invite: "Створено запрошення"};
     return Number(count) && ["minutes", "remove", "days"].includes(kind)
       ? names[kind] + " " + quantity(Number(count), kind) : names[kind];
@@ -166,7 +169,7 @@ function signInScreen(message = "") {
   $("app").hidden = true;
   $("login").hidden = false;
   $("login-status").textContent = message;
-  for (const id of ["summary", "users", "invitations", "licenses", "reports", "staff", "activity"]) {
+  for (const id of ["summary", "users", "invitations", "reports", "staff", "activity"]) {
     $(id).replaceChildren();
   }
 }
@@ -234,23 +237,41 @@ function view(name) {
   notice("");
 }
 
+let userPage = 1;
+
 async function refresh() {
   const sequence = ++refreshSequence;
   const filter = $("reports-form").elements;
+  const userFilter = $("search-form").elements;
+  const order = userFilter.ordering.value;
   const filters = {
-    search: $("search-form").elements.search.value.trim(),
+    search: userFilter.search.value.trim(),
+    sort: order.replace(/^-/, ""),
+    descending: order.startsWith("-"),
+    page: userPage,
     status: filter.status.value,
     report_email: filter.email.value.trim().toLowerCase(),
   };
-  const result = await json("/admin/v2/overview", "POST", filters);
-  if (sequence !== refreshSequence) return;
-  data = result;
-  render();
+  $("users").setAttribute("aria-busy", "true");
+  if (currentView === "users") notice("Завантаження користувачів…");
+  try {
+    const result = await json("/admin/v2/overview", "POST", filters);
+    if (sequence !== refreshSequence) return;
+    data = result;
+    render();
+    if (currentView === "users") notice("");
+  } catch (error) {
+    if (sequence === refreshSequence) throw error;
+  } finally {
+    if (sequence === refreshSequence) $("users").removeAttribute("aria-busy");
+  }
 }
 
 function render() {
   $("actor").textContent = display(data.role);
   $("staff-form").hidden = data.role !== "Owner";
+  $("qa-purge").hidden = data.role !== "Owner";
+  $("audit-form").hidden = data.role !== "Owner";
   $("summary").replaceChildren(...[
     ["Зареєстровані користувачі", "users"], ["Очікують активації", "pending"],
     ["Запити за сьогодні", "requests"], ["Відкриті звіти", "reports"],
@@ -260,29 +281,22 @@ function render() {
     return card;
   }));
 
-  table("users", ["Електронна пошта", "Роль", "Статус", "Хвилини", "Ліцензія", "Запити за сьогодні", "Остання активність", "Дії"],
-    data.users.map((user) => {
-      const actions = node("div", null, "actions");
-      if (user.email) {
-        if (user.role !== "Owner" || data.role === "Owner") {
-          actions.append(button("Ліцензія", () => {
-            $("license-form").elements.email.value = user.email;
-            view("licenses");
-          }));
-        }
-        actions.append(button("Переглянути звіти", async () => {
-          $("reports-form").elements.email.value = user.email;
-          $("reports-form").elements.status.value = "";
-          view("reports");
-          await refresh();
-        }));
-      }
-      return [user.email || "Пошту не підтверджено", display(user.role), node("span", display(user.state), "tag"),
-        minutes(user.seconds), display(user.license), user.requests, time(user.last_active), actions];
-    }), "За цією адресою користувачів не знайдено.");
-
-  table("licenses", ["Електронна пошта", "Ліцензія", "Залишок", "Діє до", "Статус"], data.users.map(user =>
-    [user.email || "Пошту не підтверджено", display(user.license), minutes(user.seconds), time(user.until), display(user.state)]));
+  const pagination = data.user_pagination;
+  userPage = pagination.page;
+  $("user-pagination").hidden = !pagination.total;
+  $("user-page").textContent = `${pagination.page} / ${pagination.pages} · Усього: ${pagination.total}`;
+  $("previous-users").disabled = userPage <= 1;
+  $("next-users").disabled = userPage >= pagination.pages;
+  table("users", ["Ім’я", "E-mail", "Підписка", "Запити за сьогодні", "Дії", "Хвилини"],
+    data.users.map(user => {
+      const actions = user.email ? userActions(user) : "—";
+      const subscription = node("span", "betatest", "tag");
+      subscription.title = `${display(user.state)} · ${display(user.license)}`;
+      const remaining = node("span", "betatest");
+      remaining.title = minutes(user.seconds);
+      return [user.name || "—", user.email || "Пошту не підтверджено", subscription,
+        user.requests, actions, remaining];
+    }), "За цим пошуком користувачів не знайдено.");
 
   table("invitations", ["Електронна пошта Google", "Доступ", "Статус", "Код діє до", "Дії"],
     data.invitations.map(invite => {
@@ -309,10 +323,9 @@ function render() {
           : json("/admin/v2/staff", "DELETE", {subject: member.sub}),
         "Список адміністраторів оновлено.")));
     }
-    const canDemote = member.role === "Owner" && data.staff.filter(row => row.role === "Owner").length > 1;
-    if (data.role === "Owner" && member.email && (member.role === "Admin" || canDemote)) {
-      const role = member.role === "Admin" ? "Owner" : "Admin";
-      const title = role === "Owner" ? "Призначити власником" : "Призначити адміністратором";
+    if (data.role === "Owner" && member.email && member.role === "Admin") {
+      const role = "Owner";
+      const title = "Призначити власником";
       actions.append(button(title, () => confirm(title,
         member.email + " · Google ID " + member.sub + ". Усі чинні сеанси цього облікового запису буде завершено.",
         () => json("/admin/v2/staff", "PATCH", {email: member.email, subject: member.sub, role, confirmed: true}),
@@ -457,7 +470,14 @@ $("dialog").addEventListener("close", () => {
   $("dialog-content").replaceChildren();
 });
 form("dialog-form", () => confirmAction?.());
-form("search-form", refresh);
+function searchUsers() {
+  userPage = 1;
+  return refresh();
+}
+form("search-form", searchUsers);
+$("search-form").elements.ordering.addEventListener("change", () => recover(searchUsers));
+$("previous-users").addEventListener("click", () => { userPage = Math.max(1, userPage - 1); recover(refresh); });
+$("next-users").addEventListener("click", () => { userPage = Math.min(data.user_pagination.pages, userPage + 1); recover(refresh); });
 form("reports-form", refresh);
 for (const status of statuses) $("reports-form").elements.status.add(new Option(display(status), status));
 
@@ -481,25 +501,77 @@ form("invite-form", async ({email, kind, validity, minutes: custom}) => {
   await showCode(invite.code, true);
 });
 
-const licenseForm = $("license-form").elements;
-licenseForm.action.addEventListener("change", () => {
-  const enabled = ["days", "minutes", "remove"].includes(licenseForm.action.value);
-  licenseForm.amount.disabled = !enabled;
-  $("license-amount").hidden = !enabled;
-  $("amount-label").textContent = licenseForm.action.value === "days" ? "Дні" : "Хвилини";
-  licenseForm.amount.max = licenseForm.action.value === "days" ? "365" : "10080";
-});
-form("license-form", ({email, action, amount}) => {
-  const title = licenseForm.action.selectedOptions[0].text;
+function userActions(user) {
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Дії для " + user.email);
+  select.add(new Option("Дії…", ""));
+  if (user.role !== "Owner" || data.role === "Owner") {
+    for (const [action, label] of [
+      ["minutes", "Додати хвилини"], ["remove", "Списати хвилини"], ["days", "Продовжити доступ"],
+      ["suspend", "Призупинити доступ"], ["unlimited", "Надати доступ назавжди"],
+      ["restore", "Відновити доступ"], ["revoke", "Відкликати ліцензію"],
+    ]) {
+      if (action !== "unlimited" || data.role === "Owner") select.add(new Option(label, action));
+    }
+  }
+  select.add(new Option("Переглянути звіти", "reports"));
+  select.addEventListener("change", () => {
+    const action = select.value;
+    const title = select.selectedOptions[0].text;
+    select.selectedIndex = 0;
+    if (action === "reports") {
+      $("reports-form").elements.email.value = user.email;
+      $("reports-form").elements.status.value = "";
+      view("reports");
+      recover(refresh);
+    } else {
+      editLicense(user, action, title);
+    }
+  });
+  return select;
+}
+
+function editLicense(user, action, title) {
   const operation_id = crypto.randomUUID();
-  const detail = amount ? " · " + quantity(Number(amount), action) : "";
-  confirm(title, email + detail, () => json("/admin/v2/licenses", "POST",
-    {email, action, amount: Number(amount || 0), operation_id}), "Ліцензію оновлено.");
-});
+  const info = node("p", user.email);
+  const amount = document.createElement("input");
+  if (["minutes", "remove", "days"].includes(action)) {
+    amount.type = "number";
+    amount.min = "1";
+    amount.max = action === "days" ? "365" : "10080";
+    amount.value = action === "days" ? "7" : "30";
+    amount.required = true;
+    info.append(field(action === "days" ? "Дні" : "Хвилини", amount));
+  }
+  dialog(title, [info], async () => {
+    await json("/admin/v2/licenses", "POST",
+      {email: user.email, subject: user.subject, action, amount: amount.type === "number" ? amount.valueAsNumber : 0, operation_id});
+    $("dialog").close();
+    await refresh();
+    notice("Ліцензію оновлено.");
+  });
+}
+
 form("staff-form", ({email}) => confirm("Додати адміністратора",
   "Надати права адміністратора для " + email + " після підтвердження облікового запису Google?",
   () => json("/admin/v2/staff", "POST", {email}),
   result => result.role === "Pending" ? "Очікується перший підтверджений вхід через Google." : "Список адміністраторів оновлено."));
+
+$("qa-purge").addEventListener("click", () => recover(async () => {
+  const preview = await json("/admin/v2/qa/preview");
+  confirm("Безповоротно видалити тестові записи?",
+    `Буде видалено ${preview.accounts} облікових записів @example.test і ${preview.invitations} запрошень, а також пов'язані дані. Цю дію неможливо скасувати.`,
+    () => json("/admin/v2/qa/purge", "POST", {confirmed: true}),
+    result => `Видалено ${result.accounts} тестових облікових записів і ${result.invitations} запрошень.`);
+}));
+
+form("audit-form", async ({period}) => {
+  const label = $("audit-form").elements.period.selectedOptions[0].textContent;
+  const preview = await json(`/admin/v2/audit/preview?period=${encodeURIComponent(period)}`);
+  confirm("Очистити журнал дій?", `За останні ${label.toLowerCase()} буде видалено ${preview.count} записів. Цю дію неможливо скасувати.`,
+    () => json("/admin/v2/audit/clear", "POST", {period, confirmed: true}),
+    result => `Видалено ${result.deleted} записів журналу.`);
+});
 
 $("sign-in").addEventListener("click", async () => {
   const popup = window.open("about:blank", "_blank", "popup");

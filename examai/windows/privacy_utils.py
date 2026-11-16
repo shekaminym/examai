@@ -117,6 +117,13 @@ def _default_api() -> WindowsCaptureAPI:
     return _api
 
 
+def flush_desktop_composition() -> None:
+    """Wait for Windows to present pending window visibility changes."""
+    dwm = _default_api().dwmapi
+    if dwm is not None:
+        dwm.DwmFlush()
+
+
 def set_capture_exclusion(hwnd: int, enabled: bool) -> AffinityResult:
     return _default_api().apply(int(hwnd), bool(enabled))
 

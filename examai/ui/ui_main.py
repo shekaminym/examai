@@ -596,6 +596,13 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_live, "AI")
 
         self.account_panel = AccountPanel(self.config_mgr)
+        self.account_window = SettingsWindow(self)
+        self.account_window.setObjectName("SettingsWindow")
+        self.account_window.setWindowTitle("EXAM AI · Обліковий запис")
+        self.account_window.setWindowIcon(QApplication.windowIcon())
+        self.account_window.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        QVBoxLayout(self.account_window).addWidget(self.account_panel)
+        self.account_window.resize(440, 360)
         self.init_settings_window()
         self._startup_pump()
         self.nav_buttons["settings"].clicked.connect(self.open_settings)
@@ -620,7 +627,7 @@ class MainWindow(QMainWindow):
         self.tab_about = QWidget()
         self.init_about_tab()
         self.tabs.addTab(self.tab_about, "Про нас")
-        self.tab_subscriptions = SubscriptionsPage(self.account_panel)
+        self.tab_subscriptions = SubscriptionsPage(self.account_panel, self.open_account)
         self.tabs.addTab(self.tab_subscriptions, "Підписки")
         for name, page in (("live", self.tab_live), ("docs", self.tab_docs),
                            ("history", self.tab_history),
@@ -925,6 +932,19 @@ class MainWindow(QMainWindow):
         self.settings_window.raise_()
         self.settings_window.activateWindow()
 
+    def open_account(self):
+        _, color, _, _, text, *_ = THEMES.get(
+            self.config_mgr.get("theme"), THEMES["midnight"])
+        self.account_window.set_caption_colors(color, text, True)
+        self.account_window.show()
+        self.account_window.raise_()
+        self.account_window.activateWindow()
+        if self.account_panel.client.token:
+            self.account_panel.refresh()
+
+    def show_account_on_startup(self):
+        self.account_panel.restore_session(self)
+
     def position_settings(self):
         if not self.config_mgr.get("settings_docked"):
             return
@@ -982,6 +1002,7 @@ class MainWindow(QMainWindow):
         pages = QStackedWidget()
         body.addWidget(pages, 1)
         groups = {}
+        self.settings_scrolls = {}
         for key, label in (
             ("general", "Загальні"), ("models", "ШІ та моделі"),
             ("audio", "Аудіо та розпізнавання"), ("appearance", "Інтерфейс і теми"),
@@ -999,6 +1020,7 @@ class MainWindow(QMainWindow):
             layout.setContentsMargins(7, 8, 7, 8)
             layout.setSpacing(10)
             groups[key] = layout
+            self.settings_scrolls[key] = scroll
             pages.addWidget(scroll)
         self.settings_categories = [self.settings_navigation.item(i).text()
                                     for i in range(self.settings_navigation.count())]
@@ -1022,7 +1044,7 @@ class MainWindow(QMainWindow):
         groups["models"].addWidget(remember_key)
         groups["diagnostics"].addWidget(self.account_panel.reports_panel())
         groups["diagnostics"].addWidget(self.account_panel.updates_panel())
-        groups["general"].addWidget(self.account_panel)
+        groups["general"].addWidget(self.account_panel.invitation)
         groups["general"].addWidget(self.save_history)
         auto_send = self.settings_auto_send = QCheckBox("Автоматично надсилати голосові питання")
         auto_send.setChecked(self.auto_send.isChecked())
@@ -1033,11 +1055,11 @@ class MainWindow(QMainWindow):
         groups["general"].addWidget(self.hide_taskbar)
         help_label = QLabel("Також прибирає вікно з Alt+Tab. Повернення: Ctrl+Shift+F12.")
         help_label.setWordWrap(True)
-        groups["general"].addWidget(help_label)
+        groups["keys"].addWidget(help_label)
         share_minimize = QPushButton("Згорнути для демонстрації")
         share_minimize.setToolTip("Прибирає вікно з робочого столу. Повернення: Ctrl+Shift+F12 або панель завдань.")
         share_minimize.clicked.connect(self.minimize_for_sharing)
-        groups["general"].addWidget(share_minimize)
+        groups["keys"].addWidget(share_minimize)
 
         self.lbl_set_model = QLabel("МОДЕЛЬ AI:")
         layout.addWidget(self.lbl_set_model)
@@ -1548,6 +1570,7 @@ class MainWindow(QMainWindow):
 
     def hideEvent(self, event):
         self.settings_window.hide()
+        self.account_window.hide()
         super().hideEvent(event)
 
     def showEvent(self, event):

@@ -35,6 +35,7 @@ from examai.audio.stt_engine import STTEngine
 from examai.audio.speech_correction import SPEECH_GLOSSARY, SpeechCorrector, has_non_ukrainian_cyrillic
 from examai.ui.ui_main import MainWindow
 from examai.ui.screen_selection import ScreenSelection, encode_image
+from examai.windows.privacy_utils import flush_desktop_composition
 
 
 timing = logging.getLogger("phantom.timing")
@@ -779,7 +780,7 @@ class MainController(QObject):
         self.ui.preview_transparency(self.config.get("window_transparency", 0))
         self.ui.btn_ghost.setToolTip(error or (
             "Windows підтвердив параметр Ghost Mode. Якщо на трансляції видно чорну область, "
-            "натисніть «Згорнути для демонстрації» в загальних налаштуваннях."
+            "натисніть «Згорнути для демонстрації» у розділі «Гарячі клавіші» налаштувань."
             if enabled else "Ghost v2.1 вимкнено. Правий клік: діагностика."
         ))
         if error:
@@ -1002,7 +1003,7 @@ class MainController(QObject):
         if self.closing or self._selecting_screen:
             return
         if not self.config.get("gemini_api_key") and not self.ui.account_panel.client.token:
-            self.ui.lbl_status.setText("Додайте ключ Gemini у налаштуваннях.")
+            self.ui.lbl_status.setText("Увійдіть через Google, щоб користуватися EXAM AI Cloud.")
             return
         self._pending_screen_instruction = select_screen_instruction(
             self.ui.txt_question.toPlainText(), self._last_manual_instruction,
@@ -1023,6 +1024,7 @@ class MainController(QObject):
             return
         try:
             started = perf_counter()
+            flush_desktop_composition()
             shots = [(screen, screen.grabWindow(0)) for screen in self.app.screens()]
             if not shots or any(pixmap.isNull() for _, pixmap in shots):
                 raise RuntimeError("screen capture unavailable")
@@ -1039,14 +1041,19 @@ class MainController(QObject):
             self.ui.lbl_status.setText("Не вдалося захопити екран. Спробуйте ще раз.")
 
     def _finish_screen_selection(self):
-        for overlay in self._screen_overlays:
+        overlays, self._screen_overlays = self._screen_overlays, []
+        self._selecting_screen = False
+        for overlay in overlays:
+            overlay.hide()
+            self.capture_privacy.unregister(overlay)
             overlay.close()
             overlay.deleteLater()
-        self._screen_overlays = []
-        self._selecting_screen = False
+        if overlays:
+            flush_desktop_composition()
         self.ui.btn_select_screen.setEnabled(True)
         if not self.closing:
             self.ui.show()
+            self.ui.repaint()
             self.ui.raise_()
             self.ui.activateWindow()
 
@@ -1729,6 +1736,7 @@ def main():
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ExamAI.Desktop")
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     from pathlib import Path
     from PySide6.QtGui import QIcon
     app.setWindowIcon(QIcon(str(Path(__file__).with_name("assets") / "examai.ico")))
@@ -1756,7 +1764,11 @@ def main():
                                         startup_pump=lambda: pump_startup_splash(app, splash))
             if config.get("privacy_mode"):
                 controller.apply_privacy(True, persist=False)
-            controller.ui.show()
+            if smoke_test:
+                controller.ui.show()
+            else:
+                QTimer.singleShot(0, lambda: controller.ui.account_panel.restore_session(
+                    controller.ui, controller.ui.show))
             controller._startup_audio_scan = BackgroundCall(AudioCapturer.get_available_devices)
             controller._startup_audio_scan.ready.connect(controller.ui.refresh_audio_devices)
             controller._startup_audio_scan.failed.connect(
