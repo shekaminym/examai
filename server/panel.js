@@ -62,6 +62,11 @@ const auditLabels = {
   "Created minutes invitation": "Створено запрошення з доступом у хвилинах",
   "Created days invitation": "Створено запрошення з доступом на кілька днів",
   "Created unlimited invitation": "Створено запрошення з безстроковим доступом",
+  "Migrated legacy browser session": "Веб-сеанс переведено на захищений cookie",
+  "Replaced inactive desktop session": "Завершено старий сеанс Windows",
+  "Account maintenance: delete": "Обліковий запис видалено",
+  "Account maintenance: disable": "Обліковий запис деактивовано",
+  "Account maintenance: enable": "Обліковий запис відновлено",
   "Revoked one stale owner session for sign-in recovery": "Завершено старий сеанс власника для відновлення входу",
 };
 
@@ -172,7 +177,8 @@ function signInScreen(message = "") {
   }
 }
 
-function notice(message, error = false) {
+function notice(message, error = false, source = "") {
+  $("notice").dataset.source = source;
   $("notice").textContent = message;
   $("notice").dataset.error = error;
   $("notice").hidden = !message;
@@ -532,10 +538,17 @@ async function pollBalances() {
   try {
     const current = await json("/admin/v2/users/balances", "POST", {subjects: data.users.map(user => user.subject)});
     if (snapshot !== data || currentView !== "users") return;
+    if ($("notice").dataset.source === "balance") notice("");
     for (const cell of $("users").querySelectorAll("[data-balance]")) {
       const user = data.users.find(row => row.subject === cell.dataset.balance);
       const balance = current[cell.dataset.balance];
       if (user && balance) cell.textContent = balanceText({...user, ...balance});
+    }
+  } catch (error) {
+    if (error.status === 401 || error.status === 403) throw error;
+    if (snapshot === data && currentView === "users" &&
+        ($("notice").hidden || $("notice").dataset.source === "balance")) {
+      notice("Не вдалося оновити залишки. Перевіримо їх знову.", true, "balance");
     }
   } finally {
     balanceRequest = false;
