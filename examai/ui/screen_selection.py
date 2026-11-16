@@ -82,6 +82,7 @@ class ScreenSelection(QWidget):
         self._origin: QPoint | None = None
         self._selection = QRect()
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setGeometry(screen.geometry())
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)

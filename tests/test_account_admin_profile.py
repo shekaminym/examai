@@ -53,12 +53,47 @@ def test_startup_opens_google_login_with_name_field(tmp_path):
     window.account_panel.client.url = "http://127.0.0.1:8000"
     window.show()
     window.show_account_on_startup()
-    assert window.settings_window.isVisible()
-    assert window.account_panel.google_button.isVisible()
-    assert window.account_panel.name_input.isVisible()
+    panel = window.account_panel
+    assert not window.settings_window.isVisible()
+    assert panel.welcome.isVisible()
+    assert not panel.welcome.google.isEnabled()
+    panel.welcome.name.setText("   ")
+    assert not panel.welcome.google.isEnabled()
+    panel.welcome.name.setText("Олена")
+    assert panel.welcome.google.isEnabled()
+    panel.welcome.close()
+    window.open_settings()
+    settings = window.settings_scrolls["general"].widget()
+    from PySide6.QtWidgets import QCheckBox
+    assert len(settings.findChildren(QCheckBox)) == 3
+    assert settings.isAncestorOf(panel.invite)
+    assert not settings.isAncestorOf(panel.name_input)
     window.settings_window.hide()
     window.hide()
     app.processEvents()
+
+
+def test_users_search_by_unicode_name_and_returns_real_sorted_usage(tmp_path, monkeypatch):
+    client, store, headers = prepared(tmp_path, monkeypatch)
+    assert client.put("/account/name", headers=headers["qa"], json={"name": "Ївга"}).status_code == 200
+    assert client.put("/account/name", headers=headers["qa"], json={"name": "Ім’я\u202e"}).status_code == 422
+    with store.transaction() as tx:
+        day = int(store.now() // 86400)
+        tx.execute("INSERT INTO usage(sub,day,requests) VALUES(?,?,?)", ("qa", day, 17))
+        for index in range(27):
+            sub = f"person-{index}"
+            store.issue(tx, sub, "pagination")
+            tx.execute("INSERT INTO profile VALUES(?,?)", (sub, sub + "@example.test"))
+    route = "/admin/v2/overview"
+    assert client.post(route, headers=headers["real"], json={}).status_code == 403
+    first = client.post(route, headers=headers["owner"],
+                        json={"sort": "requests", "descending": True}).json()
+    assert first["user_pagination"] == {"page": 1, "pages": 2, "total": 30}
+    assert first["users"][0]["requests"] == 17
+    second = client.post(route, headers=headers["owner"], json={"page": 2}).json()
+    assert len(second["users"]) == 5
+    match = client.post(route, headers=headers["owner"], json={"search": "їВГА"}).json()
+    assert [user["name"] for user in match["users"]] == ["Ївга"]
 
 
 def test_owner_can_grant_real_unlimited_access(tmp_path, monkeypatch):

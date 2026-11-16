@@ -174,9 +174,10 @@ class PlanTile(QWidget):
 class SubscriptionsPage(QScrollArea):
     """Four visual price cards, reflowed to two columns on narrow windows."""
 
-    def __init__(self, account=None):
+    def __init__(self, account=None, open_account=None):
         super().__init__()
         self.account = account
+        self.open_account = open_account
         if account is not None:
             account.catalog_changed.connect(self.refresh_checkout)
         self.setObjectName("SubscriptionsPage")
@@ -217,6 +218,10 @@ class SubscriptionsPage(QScrollArea):
         self.status_label.setObjectName("SubscriptionStatusText")
         self.status_label.setWordWrap(True)
         status_row.addWidget(self.status_label, 1)
+        if self.open_account is not None:
+            self.account_button = QPushButton("Обліковий запис")
+            self.account_button.clicked.connect(self.open_account)
+            status_row.addWidget(self.account_button)
         root.addWidget(status)
         root.addSpacing(4)
         self.cards = [PlanTile(months, price, featured=index == 1)
@@ -314,6 +319,8 @@ class SubscriptionsPage(QScrollArea):
 
     def set_language(self, language):
         self.language = language if language in TRANSLATIONS else "UA"
+        if hasattr(self, "account_button"):
+            self.account_button.setText("Account" if self.language == "ENG" else "Обліковий запис")
         if not self._built:
             return
         words = TRANSLATIONS[self.language]
