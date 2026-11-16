@@ -25,12 +25,20 @@ FOLLOW_UP = re.compile(
     r"|^(?:а\s+)?(?:розкажи|поясни|расскажи|объясни)\s+(?:детальніше|докладніше|подробнее)\b"
     r"|\b(?:ця змінна|цю змінну|цей рядок|ту строку|эта переменная|эту переменную|"
     r"this variable|that variable|this line|that line|у нього|у него)\b"
+    r"|^(?:а\s+)?(?:для чого|навіщо|де|як|чому|що робить|зачем|для чего|где|как|why|where|what)\s+"
+    r"(?:це|він|вона|воно|її|його|їх|он|она|оно|это|её|его|it|this|that)\b"
+    r"|\b(?:якщо|если|if)\s+(?:її|його|їх|её|его|их|it|them)\b"
+    r"|^(?:а\s+)?(?:покажи|знайди|покажіть|найди|show|find)\b[^?!.]{0,45}"
+    r"\b(?:вона|він|його|її|це|она|он|его|её|это|it)\b"
     r"|^(?:а\s+)?(?:що це|як це|чому це|а що|что это|как это|почему это|what is that|how so)\b",
     re.IGNORECASE,
 )
 COMPARISON = re.compile(r"різниц|відрізня|порівняй|разниц|отлича|сравни|differ|compare", re.I)
 COMPARISON_REFERENCE = re.compile(r"\b(?:вони|ними|їх|їхня|они|ними|их|them|they|former|latter)\b", re.I)
 CONTEXT_LIMIT = 1900
+CODE_IDENTIFIER = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b")
+USAGE_LOCATION = re.compile(r"\b(?:де|где|where)\b", re.I)
+CONTEXT_SOURCE = re.compile(r"файл[у]? «([^»]+)»", re.I)
 
 
 class Conversation:
@@ -86,7 +94,17 @@ class Conversation:
         recent = [len(self.turns) - 1]
         while recent[-1] > 0 and len(recent) < 3 and FOLLOW_UP.search(self.turns[recent[-1]][0]):
             recent.append(recent[-1] - 1)
-        return sorted(set((related + recent)[:4]))
+        # Keep the original subject even after several rounds of pronouns.
+        anchor = recent[-1]
+        while anchor > 0 and FOLLOW_UP.search(self.turns[anchor][0]):
+            anchor -= 1
+        essential = [recent[0], anchor]
+        if anchor and any(COMPARISON.search(self.turns[i][0]) for i in range(anchor + 1, len(self.turns))):
+            previous = next((i for i in range(anchor - 1, -1, -1)
+                             if not FOLLOW_UP.search(self.turns[i][0])), None)
+            if previous is not None:
+                essential.append(previous)
+        return sorted(list(dict.fromkeys(essential + related + recent))[:4])
 
     def relevant_turns(self, question):
         selected = self._selected_indices(question)
@@ -115,7 +133,17 @@ class Conversation:
         if (not self.turns or not (FOLLOW_UP.search(question.strip()) or ELABORATION.search(question))
                 or COMPARISON.search(question)):
             return ""
-        return self._evidence[-1]
+        return next((self._evidence[i] for i in reversed(self._selected_indices(question)) if self._evidence[i]), "")
+
+    @staticmethod
+    def code_usage_reference(question, turns, evidence):
+        if not (FOLLOW_UP.search(question) and USAGE_LOCATION.search(question)):
+            return None
+        source = CONTEXT_SOURCE.search(evidence)
+        identifiers = set(CODE_IDENTIFIER.findall(" ".join(answer for _, answer in turns)))
+        if source and len(identifiers) == 1:
+            return identifiers.pop(), source[1]
+        return None
 
     @staticmethod
     def format_context(turns):

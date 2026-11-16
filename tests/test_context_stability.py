@@ -191,3 +191,35 @@ def test_recording_pulse_and_floating_geometry(tmp_path):
     restored.deleteLater()
     app.aboutToQuit.disconnect(ctl.shutdown)
     ui.deleteLater()
+
+
+def test_pronoun_code_followups_keep_anchor_after_card_limit():
+    from examai.ai.conversation import Conversation
+    memory = Conversation()
+    for i in range(25):
+        memory.remember(f"Самостійне питання {i}", f"Відповідь {i}", memory.generation)
+    evidence = "Точні рядки з файлу «code.txt» (цільовий рядок 5):\n6: #define MAX_DEGREE 10"
+    memory.remember("Поясни п’яту строчку, що таке max degree?", "MAX_DEGREE обмежує степінь.",
+                    memory.generation, evidence)
+    for question in ("Для чого вона використовується?", "А що буде, якщо її збільшити?",
+                     "Як вона впливає?", "Покажи, де вона використовується в коді"):
+        prior = memory.relevant_turns(question)
+        assert any("MAX_DEGREE" in answer for _, answer in prior)
+        assert "Самостійне питання" not in memory.format_context(prior)
+        assert memory.reference_context(question) == evidence
+        if question.startswith("Покажи"):
+            assert memory.code_usage_reference(question, prior, evidence) == ("MAX_DEGREE", "code.txt")
+        memory.remember(question, "Попередня відповідь.", memory.generation)
+    memory.clear()
+    assert not memory.relevant_turns("Для чого вона використовується?")
+
+
+def test_application_followup_retains_two_comparison_concepts():
+    from examai.ai.conversation import Conversation
+    memory = Conversation()
+    for q, a in (("Що таке інтегрування?", "Інтеграл"), ("Що таке диференціювання?", "Похідна"),
+                 ("Чим вони відрізняються?", "Порівняння")):
+        memory.remember(q, a, memory.generation)
+    assert [answer for _, answer in memory.relevant_turns("А де це застосовується?")] == [
+        "Інтеграл", "Похідна", "Порівняння"
+    ]

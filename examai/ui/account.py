@@ -71,9 +71,11 @@ class AccountPanel(QWidget):
         self.refresh_button = self.button(layout, "Refresh account and plans", self.refresh)
         self.signout_button = self.button(layout, "Sign out", self.sign_out)
         self.invite = QLineEdit()
-        self.invite.setPlaceholderText("Closed beta invite")
+        self.invite.setPlaceholderText("Код запрошення")
         layout.addWidget(self.invite)
-        self.redeem_button = self.button(layout, "Redeem invite", self.redeem)
+        self.redeem_button = self.button(layout, "Активувати запрошення", self.redeem)
+        self.redeem_button.setEnabled(False)
+        self.invite.textChanged.connect(lambda text: self.redeem_button.setEnabled(16 <= len(text.strip()) <= 128))
         self.timer = QTimer(self, interval=1600)
         self.timer.timeout.connect(self.poll)
         self.plans = QComboBox()
@@ -228,6 +230,9 @@ class AccountPanel(QWidget):
 
     def redeem(self):
         code = self.invite.text().strip()
+        if not 16 <= len(code) <= 128:
+            self.status.setText("Вставте повний код запрошення (від 16 до 128 символів).")
+            return
         self.launch(lambda: self.client.request("POST", "/invite", {"code": code}),
                     lambda result: (self.invite.clear(), self.refresh()))
 

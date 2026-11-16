@@ -649,6 +649,7 @@ class MainController(QObject):
         self.recover_hotkey_handle = None
         self._taskbar_hidden = False
         self.privacy_enabled = False
+        self._sharing_minimized = False
         self.capture_privacy = CapturePrivacy(app, self)
         self.capture_privacy.register(self.ui)
         self.capture_privacy.register(self.ui.settings_window, require_hidden=False)
@@ -664,6 +665,7 @@ class MainController(QObject):
         self.ui.list_docs.currentItemChanged.connect(self.on_active_document_changed)
         self.ui.file_deleted_signal.connect(self.handle_file_deletion)
         self.ui.ghost_toggled_signal.connect(self.apply_privacy)
+        self.ui.minimize_for_sharing.connect(self.minimize_for_sharing)
         self.ui.taskbar_preference_changed.connect(self.apply_taskbar_preference)
         self.ui.search_keyword_signal.connect(self.handle_search_keyword)
         self.ui.auto_summary_signal.connect(self.handle_auto_summary)
@@ -709,7 +711,24 @@ class MainController(QObject):
     def recover_window(self):
         if not self.closing:
             self._restore_fully_transparent_window()
-            self.ui.window_mode.recover()
+            if self._sharing_minimized:
+                self._sharing_minimized = False
+                self.ui.showNormal()
+                self.ui.window_mode.apply()
+                self.ui.raise_()
+                self.ui.activateWindow()
+            else:
+                self.ui.window_mode.recover()
+
+    @Slot()
+    def minimize_for_sharing(self):
+        self._sharing_minimized = True
+        self.ui.window_mode.animation.stop()
+        self.ui.window_mode.card_animation.stop()
+        self.ui.settings_window.hide()
+        if self.timing_window:
+            self.timing_window.hide()
+        self.ui.showMinimized()
 
     def update_meter(self):
         self.ui.update_audio_indicator(self.audio.capturer.current_rms if self.audio else 0.0)
@@ -759,13 +778,14 @@ class MainController(QObject):
         self.ui.set_privacy_button(enabled, self.capture_privacy.requested, error)
         self.ui.preview_transparency(self.config.get("window_transparency", 0))
         self.ui.btn_ghost.setToolTip(error or (
-            "Ghost v2.1. Windows підтвердив прапор виключення. Правий клік: діагностика."
+            "Windows підтвердив параметр Ghost Mode. Якщо на трансляції видно чорну область, "
+            "натисніть «Згорнути для демонстрації» в загальних налаштуваннях."
             if enabled else "Ghost v2.1 вимкнено. Правий клік: діагностика."
         ))
         if error:
             self.ui.lbl_status.setText(f"Ghost Mode: {error}")
         elif enabled:
-            self.ui.lbl_status.setText("Ghost Mode: Windows підтвердив виключення із захоплення.")
+            self.ui.lbl_status.setText("Ghost Mode увімкнено. Результат залежить від способу захоплення.")
         else:
             self.ui.lbl_status.setText("Ghost Mode вимкнено.")
 
@@ -1198,6 +1218,7 @@ class MainController(QObject):
         memory = self.conversation.format_context(prior)
         provider_question = self.conversation.resolve_comparison(question, prior)
         remembered_reference = self.conversation.reference_context(question) if prior else ""
+        usage_reference = self.conversation.code_usage_reference(question, prior, remembered_reference)
         conversation_id = self.conversation.session_id
         token = self.ui.account_panel.client.token
         account_scope = sha256(token.encode()).hexdigest() if token else ""
@@ -1228,6 +1249,13 @@ class MainController(QObject):
                     context = ""
                 if remembered_reference and not FILE_REFERENCE.search(question.casefold()):
                     context = remembered_reference
+                    if usage_reference:
+                        try:
+                            usage = self.rag.retrieve_code_usage(*usage_reference, request_id)
+                            if usage:
+                                context = usage + "\n\n" + remembered_reference
+                        except sqlite3.Error:
+                            pass
                 worker.memory_evidence = context[:1400]
                 if memory:
                     context = "\n\n".join(filter(None, (context[:3500-len(memory)-2], memory)))

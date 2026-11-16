@@ -337,6 +337,7 @@ class MainWindow(QMainWindow):
     file_uploaded_signal = Signal(str)
     file_deleted_signal = Signal(str)
     ghost_toggled_signal = Signal(bool)
+    minimize_for_sharing = Signal()
     search_keyword_signal = Signal(str)
     auto_summary_signal = Signal(str)
     history_step_signal = Signal(int)
@@ -1033,6 +1034,10 @@ class MainWindow(QMainWindow):
         help_label = QLabel("Також прибирає вікно з Alt+Tab. Повернення: Ctrl+Shift+F12.")
         help_label.setWordWrap(True)
         groups["general"].addWidget(help_label)
+        share_minimize = QPushButton("Згорнути для демонстрації")
+        share_minimize.setToolTip("Прибирає вікно з робочого столу. Повернення: Ctrl+Shift+F12 або панель завдань.")
+        share_minimize.clicked.connect(self.minimize_for_sharing)
+        groups["general"].addWidget(share_minimize)
 
         self.lbl_set_model = QLabel("МОДЕЛЬ AI:")
         layout.addWidget(self.lbl_set_model)

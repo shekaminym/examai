@@ -157,3 +157,51 @@ def test_owner_can_promote_an_existing_verified_account(beta):
     assert client.post("/admin/v2/overview", headers=gmail, json={}).status_code == 401
     assert client.post("/admin/v2/overview", headers=sign_in(beta, "gmail", "existing@gmail.com"),
                        json={}).json()["role"] == "Admin"
+
+
+def test_shared_owner_requires_confirmed_exact_identity_and_preserves_last_owner(beta):
+    client, _, owner, outsider, _ = beta
+    email = "second-owner@gmail.com"
+    member = sign_in(beta, "second", email)
+    assert client.post("/admin/v2/staff", headers=owner, json={"email": email}).is_success
+    member = sign_in(beta, "second", email)
+    body = {"subject": "second", "email": email, "role": "Owner", "confirmed": True}
+    endpoint = "/admin/v2/staff"
+    assert client.patch(endpoint, headers=outsider, json=body).status_code == 403
+    assert client.patch(endpoint, headers=member, json=body).status_code == 403
+    assert client.patch(endpoint, headers=owner, json={**body, "confirmed": False}).status_code == 422
+    assert client.patch(endpoint, headers=owner, json={**body, "subject": "other"}).status_code == 409
+    assert client.patch(endpoint, headers=owner, json=body).json() == {"role": "Owner"}
+    assert client.post("/admin/v2/overview", headers=member, json={}).status_code == 401
+    member = sign_in(beta, "second", email)
+    assert client.post("/admin/v2/overview", headers=member, json={}).json()["role"] == "Owner"
+    for actor in (owner, member):
+        invite = new_invite(client, actor, "beta-guest@gmail.com", "unlimited", 0)
+        assert client.get(f"/admin/v2/invitations/{invite['id']}/code", headers=actor).is_success
+    assert client.patch(endpoint, headers=member, json={**body, "role": "Admin"}).is_success
+    last = {**body, "email": "owner@gmail.com", "subject": "owner", "role": "Admin"}
+    assert client.patch(endpoint, headers=owner, json=last).status_code == 409
+
+
+@pytest.mark.parametrize("kind,amount", [("minutes", 30), ("minutes", 60), ("days", 7), ("days", 30), ("unlimited", None)])
+def test_invite_duration_and_safe_validation(beta, kind, amount):
+    client, store, owner, _, _ = beta
+    email = "invite-check@gmail.com"
+    user = sign_in(beta, "recipient", email)
+    payload = dict(email=email, kind=kind, validity=1, operation_id=str(uuid4()))
+    if amount is not None:
+        payload["amount"] = amount
+    invite = client.post("/admin/v2/invitations", headers=owner, json=payload)
+    assert invite.is_success, invite.text
+    response = client.post("/invite", headers=user, json={"code": "short"})
+    assert response.status_code == 422
+    assert "short" not in response.text and isinstance(response.json()["detail"], str)
+    response = client.post("/invite", headers=user, json={"code": invite.json()["code"]})
+    assert response.is_success
+    grant = response.json()
+    if kind == "days":
+        assert amount * 86400 - 1 <= grant["until"] - store.now() <= amount * 86400
+    elif kind == "minutes":
+        assert grant["seconds"] == amount * 60
+    else:
+        assert grant["state"] == "ACTIVE" and grant["until"] is None

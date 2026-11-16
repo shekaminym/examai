@@ -278,14 +278,14 @@ class RAGEngine:
         target = f"цільовий рядок {number}" if number == last else f"цільові рядки {number}–{last}"
         return f"Точні рядки з файлу «{source}» ({target}):\n{shown}"
 
-    def _code_context(self, query, source_hint, request_id):
+    def _code_context(self, query, source_hint, request_id, *, source_only=False):
         terms = code_terms(query)
         if not terms:
             return ""
         expression = " OR ".join('"' + term + '"' for term in terms)
         started = perf_counter()
         rows = self.db_mgr.search_code_lines(expression, source=source_hint)
-        if not rows and source_hint is not None:
+        if not rows and source_hint is not None and not source_only:
             rows = self.db_mgr.search_code_lines(expression)
         if not rows:
             return ""
@@ -297,6 +297,9 @@ class RAGEngine:
             excerpts.append(f"Файл «{source}», рядок {line}:\n" +
                             "\n".join(f"{number}: {content}" for number, content in window))
         return "\n\n".join(excerpts)[:1800]
+
+    def retrieve_code_usage(self, identifier, source, request_id):
+        return self._code_context(identifier, source, request_id, source_only=True)
 
     def get_source_preview(self, source, *, max_chars=2200):
         """Small, optional code reference for a selected file in an image request."""
