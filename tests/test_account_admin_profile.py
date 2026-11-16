@@ -83,6 +83,9 @@ def test_owner_purge_removes_only_test_accounts_and_related_data(tmp_path, monke
                    "VALUES('qa-invite','hash','qa2@example.test','real','minutes',30,?,?)", (time.time(), time.time()+1000))
         store.audit(tx, "owner", "qa", "QA action")
         store.audit(tx, "owner", "real", "Real action")
+    assert client.get("/admin/v2/qa/preview", headers=headers["qa"]).status_code == 403
+    assert client.get("/admin/v2/qa/preview", headers=headers["owner"]).json() == {
+        "accounts": 1, "invitations": 1}
     assert client.post("/admin/v2/qa/purge", headers=headers["qa"], json={"confirmed": True}).status_code == 403
     assert client.post("/admin/v2/qa/purge", headers=headers["owner"], json={"confirmed": False}).status_code == 422
     result = client.post("/admin/v2/qa/purge", headers=headers["owner"], json={"confirmed": True})
@@ -115,6 +118,9 @@ def test_audit_clear_uses_selected_window_and_preserves_cleanup_history(tmp_path
         tx.execute("INSERT INTO audit(actor,subject,action,created) VALUES('owner','owner',"
                    "'Purged example.test QA data: 0 accounts',?)", (now-10,))
     body = {"period": "5m", "confirmed": True}
+    assert client.get("/admin/v2/audit/preview?period=5m", headers=headers["real"]).status_code == 403
+    assert client.get("/admin/v2/audit/preview?period=5m", headers=headers["owner"]).json() == {
+        "count": 1}
     assert client.post("/admin/v2/audit/clear", headers=headers["real"], json=body).status_code == 403
     assert client.post("/admin/v2/audit/clear", headers=headers["owner"],
                        json={"period": "5m", "confirmed": False}).status_code == 422

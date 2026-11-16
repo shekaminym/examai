@@ -189,6 +189,19 @@ def mount_admin(app, store, bearer, admin_subject):
             raise HTTPException(403, "Owner required")
         return actor
 
+    @app.get("/admin/v2/qa/preview")
+    def preview_qa(token=Depends(bearer)):
+        with store.transaction() as tx:
+            owner(tx, token)
+            accounts = tx.execute(
+                "SELECT count(*) FROM (SELECT sub FROM profile WHERE lower(email) LIKE '%@example.test' "
+                "UNION SELECT sub FROM google_identity WHERE lower(email) LIKE '%@example.test')"
+            ).fetchone()[0]
+            invitations = tx.execute(
+                "SELECT count(*) FROM beta_invitation WHERE lower(email) LIKE '%@example.test'"
+            ).fetchone()[0]
+            return {"accounts": accounts, "invitations": invitations}
+
     @app.post("/admin/v2/qa/purge")
     def purge_qa(body: ConfirmedAction, token=Depends(bearer)):
         with store.transaction() as tx:
@@ -232,6 +245,20 @@ def mount_admin(app, store, bearer, admin_subject):
             ).rowcount
             store.audit(tx, actor, actor, f"Cleared audit {body.period}: {count} entries")
             return {"deleted": count}
+
+    @app.get("/admin/v2/audit/preview")
+    def preview_audit(period: Literal["5m", "10m", "30m", "1h", "2h", "3h", "5h", "10h",
+                                      "1d", "1w", "2w", "1mo", "1y"], token=Depends(bearer)):
+        with store.transaction() as tx:
+            owner(tx, token)
+            now = store.now()
+            count = tx.execute(
+                "SELECT count(*) FROM audit WHERE created>=? AND created<=? "
+                "AND action NOT LIKE 'Cleared audit %' "
+                "AND action NOT LIKE 'Purged example.test QA data%'",
+                (audit_cutoff(now, period), now),
+            ).fetchone()[0]
+            return {"count": count}
 
     @app.post("/admin/v2/overview")
     def overview(filters: Filters, token=Depends(bearer)):

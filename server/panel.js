@@ -510,15 +510,18 @@ form("staff-form", ({email}) => confirm("Додати адміністратор
   () => json("/admin/v2/staff", "POST", {email}),
   result => result.role === "Pending" ? "Очікується перший підтверджений вхід через Google." : "Список адміністраторів оновлено."));
 
-$("qa-purge").addEventListener("click", () => confirm(
-  "Безповоротно видалити тестові записи?",
-  "Буде видалено облікові записи @example.test, їхні сеанси, запрошення, звіти та пов'язану історію. Цю дію неможливо скасувати.",
-  () => json("/admin/v2/qa/purge", "POST", {confirmed: true}),
-  result => `Видалено ${result.accounts} тестових облікових записів і ${result.invitations} запрошень.`));
+$("qa-purge").addEventListener("click", () => recover(async () => {
+  const preview = await json("/admin/v2/qa/preview");
+  confirm("Безповоротно видалити тестові записи?",
+    `Буде видалено ${preview.accounts} облікових записів @example.test і ${preview.invitations} запрошень, а також пов'язані дані. Цю дію неможливо скасувати.`,
+    () => json("/admin/v2/qa/purge", "POST", {confirmed: true}),
+    result => `Видалено ${result.accounts} тестових облікових записів і ${result.invitations} запрошень.`);
+}));
 
-form("audit-form", ({period}) => {
+form("audit-form", async ({period}) => {
   const label = $("audit-form").elements.period.selectedOptions[0].textContent;
-  confirm("Очистити журнал дій?", `Безповоротно видалити записи за останні ${label.toLowerCase()}?`,
+  const preview = await json(`/admin/v2/audit/preview?period=${encodeURIComponent(period)}`);
+  confirm("Очистити журнал дій?", `За останні ${label.toLowerCase()} буде видалено ${preview.count} записів. Цю дію неможливо скасувати.`,
     () => json("/admin/v2/audit/clear", "POST", {period, confirmed: true}),
     result => `Видалено ${result.deleted} записів журналу.`);
 });
