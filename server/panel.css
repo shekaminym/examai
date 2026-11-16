@@ -61,3 +61,7 @@ nav button{min-height:36px}
 aside #sign-out{margin:0;position:absolute;right:1rem;top:.48rem;min-height:36px}
 .login{margin:10vh 1rem 0}
 }
+
+#user-pagination { align-items: center; margin: 12px 0 24px; }
+#users select { width: 9rem; max-width: 100%; }
+[data-page="users"] > h2 { margin-top: 28px; }

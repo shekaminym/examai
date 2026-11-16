@@ -20,7 +20,6 @@
       <div class="brand"><span aria-hidden="true">ϟ</span> EXAM AI</div>
       <nav aria-label="Адміністрування">
         <button data-view="dashboard">Огляд</button><button data-view="users">Користувачі</button>
-        <button data-view="invitations">Запрошення</button><button data-view="licenses">Дії</button>
         <button data-view="reports">Звіти про помилки</button><button data-view="staff">Адміністратори</button>
         <button data-view="activity">Журнал дій</button>
       </nav>
@@ -34,13 +33,22 @@
       </section>
       <section data-page="users" hidden>
         <form id="search-form" class="toolbar">
-          <label>Пошук за електронною поштою<input type="search" name="search" placeholder="Електронна пошта Google" maxlength="254"></label>
+          <label>Пошук<input type="search" name="search" placeholder="Ім’я або e-mail" maxlength="254"></label>
+          <label>Сортування<select name="ordering">
+            <option value="email">E-mail (А–Я)</option><option value="-email">E-mail (Я–А)</option>
+            <option value="name">Ім’я (А–Я)</option><option value="-name">Ім’я (Я–А)</option>
+            <option value="-requests">Найбільше запитів</option><option value="requests">Найменше запитів</option>
+          </select></label>
           <button>Знайти</button>
         </form>
         <button id="qa-purge" class="danger" hidden>Видалити тестові записи @example.test</button>
         <div id="users"></div>
-      </section>
-      <section data-page="invitations" hidden>
+        <div id="user-pagination" class="actions" aria-label="Сторінки користувачів" hidden>
+          <button type="button" id="previous-users">Назад</button>
+          <span id="user-page" aria-live="polite"></span>
+          <button type="button" id="next-users">Далі</button>
+        </div>
+        <h2>Запрошення</h2>
         <form id="invite-form" class="toolbar">
           <label>Електронна пошта Google<input type="email" name="email" maxlength="254" required></label>
           <label>Доступ<select name="kind">
@@ -53,22 +61,6 @@
           <button class="primary">Створити запрошення</button>
         </form>
         <div id="invitations"></div>
-      </section>
-      <section data-page="licenses" hidden>
-        <form id="license-form" class="toolbar">
-          <label>Електронна пошта Google<input type="email" name="email" maxlength="254" required></label>
-          <label>Дія<select name="action">
-            <option value="minutes">Додати хвилини</option><option value="remove">Списати хвилини</option>
-            <option value="days">Продовжити доступ</option><option value="suspend">Призупинити доступ</option>
-            <option value="unlimited">Надати доступ назавжди</option>
-            <option value="restore">Відновити доступ</option><option value="revoke">Відкликати ліцензію</option>
-          </select></label>
-          <label id="license-amount"><span id="amount-label">Хвилини</span>
-            <input type="number" name="amount" min="1" max="10080" value="30" required>
-          </label>
-          <button class="primary">Перевірити зміну</button>
-        </form>
-        <div id="licenses"></div>
       </section>
       <section data-page="reports" hidden>
         <form id="reports-form" class="toolbar">

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import secrets
+from unicodedata import category
 from functools import partial
 from io import BytesIO
 from pathlib import Path
@@ -141,7 +142,15 @@ def create_app(path=None):
         return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + query, "claim": claim}
 
     @app.get("/oauth/callback", response_class=HTMLResponse)
-    def oauth_callback(state: str, code: str):
+    def oauth_callback(state: str, code: str = "", error: str = ""):
+        if error and not code:
+            with db.transaction() as tx:
+                tx.execute("DELETE FROM oauth WHERE state=? AND verifier<>''", (state,))
+            return HTMLResponse("EXAM AI: sign-in cancelled. Return to the application.", headers={
+                "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+            })
+        if not code:
+            raise HTTPException(400, "Missing authorization code")
         with db.transaction() as tx:
             row = tx.execute("SELECT * FROM oauth WHERE state=? AND until>? AND verifier<>''",
                              (state, db.now())).fetchone()
@@ -213,7 +222,7 @@ def create_app(path=None):
     @app.put("/account/name")
     def account_name(body: AccountName, token=Depends(bearer)):
         name = " ".join(body.name.split())
-        if not name or len(name) > 60 or any(ord(char) < 32 for char in body.name):
+        if not name or len(name) > 60 or any(category(char) in {"Cc", "Cf", "Cs"} for char in body.name):
             raise HTTPException(422, "Enter a name of up to 60 characters")
         with db.transaction() as tx:
             sub = subject(tx, token)

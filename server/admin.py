@@ -41,6 +41,9 @@ class Filters(BaseModel):
     search: str = Field(default="", max_length=254)
     status: str = Field(default="", max_length=20)
     report_email: str = Field(default="", max_length=254)
+    page: int = Field(default=1, ge=1, le=1_000_000)
+    sort: Literal["name", "email", "requests"] = "email"
+    descending: bool = False
 
 
 class StaffAccount(BaseModel):
@@ -71,6 +74,7 @@ class Invitation(Email):
 
 
 class License(Email):
+    subject: str = Field(default="", max_length=255)
     action: str = Field(pattern="^(minutes|remove|days|unlimited|suspend|restore|revoke)$")
     amount: int = Field(default=0, ge=0, le=10080)
     operation_id: UUID
@@ -266,13 +270,27 @@ def mount_admin(app, store, bearer, admin_subject):
             actor = admin_subject(tx, token)
             now = store.now()
             day = int(now // 86400)
+            tx.create_function("casefold", 1, str.casefold, deterministic=True)
+            search = filters.search.strip().casefold()
+            joins = """FROM account a
+                       LEFT JOIN profile p USING(sub)
+                       LEFT JOIN display_name n USING(sub)"""
+            matches = """WHERE instr(casefold(coalesce(p.email,'')),?)>0
+                            OR instr(casefold(coalesce(n.name,'')),?)>0"""
+            count = tx.execute(f"SELECT count(*) {joins} {matches}", (search, search)).fetchone()[0]
+            page_size = 25
+            pages = max(1, (count + page_size - 1) // page_size)
+            page = min(pages, filters.page)
+            sort = {"name": "casefold(coalesce(n.name,''))", "email": "casefold(coalesce(p.email,''))",
+                    "requests": "requests"}[filters.sort]
+            direction = "DESC" if filters.descending else "ASC"
             users = []
             for row in tx.execute(
-                """SELECT a.sub,p.email,s.role,x.seen,coalesce(u.requests,0) AS requests
-                   FROM account a LEFT JOIN profile p USING(sub) LEFT JOIN staff s USING(sub)
-                   LEFT JOIN account_activity x USING(sub) LEFT JOIN usage u ON u.sub=a.sub AND u.day=?
-                   WHERE instr(lower(coalesce(p.email,'')),?)>0
-                   ORDER BY p.email LIMIT 100""", (day, filters.search.strip().lower()),
+                f"""SELECT a.sub,p.email,n.name,s.role,x.seen,coalesce(u.requests,0) AS requests
+                    {joins} LEFT JOIN staff s USING(sub)
+                    LEFT JOIN account_activity x USING(sub) LEFT JOIN usage u ON u.sub=a.sub AND u.day=?
+                    {matches} ORDER BY {sort} {direction}, a.sub LIMIT ? OFFSET ?""",
+                (day, search, search, page_size, (page - 1) * page_size),
             ).fetchall():
                 account = store.access(tx, row["sub"])
                 license_state = tx.execute("SELECT state FROM suspended_access WHERE sub=?", (row["sub"],)).fetchone()
@@ -280,7 +298,7 @@ def mount_admin(app, store, bearer, admin_subject):
                 license_type = ("Unlimited" if account["until"] is None else "Calendar")
                 if state != "ACTIVE":
                     license_type = "Minutes" if account["seconds"] else "None"
-                users.append(dict(email=row["email"], role=row["role"] or "User", last_active=row["seen"],
+                users.append(dict(subject=row["sub"], email=row["email"], name=row["name"], role=row["role"] or "User", last_active=row["seen"],
                                   requests=row["requests"], license=license_type, **account))
             invites = [dict(row, status=invitation_status(row, now)) for row in tx.execute(
                 "SELECT id,email,kind,amount,created,expires,activated,revoked FROM beta_invitation "
@@ -311,7 +329,8 @@ def mount_admin(app, store, bearer, admin_subject):
                           (SELECT count(*) FROM report WHERE status NOT IN ('Fixed','Closed')) AS reports""",
                 (now, day)).fetchone())
             return dict(role=store.role(tx, actor), summary=summary, users=users, invitations=invites,
-                        staff=staff, reports=reports, audit=audit)
+                        staff=staff, reports=reports, audit=audit,
+                        user_pagination=dict(page=page, pages=pages, total=count))
 
     @app.post("/admin/v2/staff")
     def add_admin(body: Email, token=Depends(bearer)):
@@ -417,12 +436,14 @@ def mount_admin(app, store, bearer, admin_subject):
         with store.transaction() as tx:
             actor = admin_subject(tx, token)
             sub = lookup(store, tx, normalize_email(body.email), required=True)
+            if body.subject and body.subject != sub:
+                raise HTTPException(409, "Google account changed. Refresh user list")
             guard_target(store, tx, actor, sub)
             if body.action == "unlimited" and store.role(tx, actor) != "Owner":
                 raise HTTPException(403, "Owner required")
             if (body.action == "days" and body.amount > 365):
                 raise HTTPException(422, "Maximum extension is 365 days")
-            if record_operation(tx, actor, body.operation_id, "license:" + body.model_dump_json()):
+            if record_operation(tx, actor, body.operation_id, "license:" + body.model_dump_json(exclude={"subject"} if not body.subject else None)):
                 change_license(store, tx, sub, body.action, body.amount)
                 store.audit(tx, actor, sub, f"License {body.action} {body.amount}")
             return {"ok": True}
