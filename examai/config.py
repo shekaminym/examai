@@ -8,6 +8,7 @@ from examai.paths import data_root
 
 CONFIG_FILE = "config.json"
 KEY_ENV = {"gemini_api_key": "GEMINI_API_KEY"}
+PROFILE_FIELDS = {"active_document_source", "gemini_api_key", "protected_gemini_key"}
 
 DEFAULT_CONFIG = {
     "server_url": "",
@@ -15,6 +16,7 @@ DEFAULT_CONFIG = {
     "account_session": "",
     "account_device": "",
     "account_name": "",
+    "profile_settings": {},
     "protected_gemini_key": "",
     "gemini_model": "gemini-3.5-flash-lite",
     "whisper_model_size": "base",
@@ -67,6 +69,8 @@ class ConfigManager:
     def __init__(self, filepath=None):
         self.filepath = Path(filepath) if filepath is not None else data_root() / CONFIG_FILE
         self.config = self.load_config()
+        self.profile_scope = ""
+        self.profile_key = ""
 
     def load_config(self):
         config = DEFAULT_CONFIG.copy()
@@ -105,7 +109,19 @@ class ConfigManager:
         return config
 
     def save_config(self, new_config=None):
-        updated = self.config | (new_config or {})
+        changes = dict(new_config or {})
+        key = self.profile_key
+        if self.profile_scope:
+            scopes = self.config["profile_settings"].copy()
+            settings = dict(scopes.get(self.profile_scope, {}))
+            for field in PROFILE_FIELDS.intersection(changes):
+                if field == "gemini_api_key":
+                    key = changes.pop(field)
+                else:
+                    settings[field] = changes.pop(field)
+            scopes[self.profile_scope] = settings
+            changes["profile_settings"] = scopes
+        updated = self.config | changes
         updated["answer_mode"] = "fast"
         updated["system_blur"] = False
         # Preserve keys already on disk while keeping newly entered keys session-only.
@@ -127,8 +143,25 @@ class ConfigManager:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         self.config = updated
+        self.profile_key = key
+
+    def set_profile_scope(self, scope):
+        if scope != self.profile_scope:
+            self.profile_scope = scope
+            self.profile_key = ""
 
     def get(self, key, default=None):
+        if self.profile_scope and key in PROFILE_FIELDS:
+            settings = self.config["profile_settings"].get(self.profile_scope, {})
+            if key != "gemini_api_key":
+                return settings.get(key, DEFAULT_CONFIG[key])
+            if self.profile_key:
+                return self.profile_key
+            from examai.windows.credentials import reveal
+            try:
+                return reveal(settings.get("protected_gemini_key", ""))
+            except (ValueError, OSError):
+                return ""
         if key in KEY_ENV:
             value = self.config.get(key, "") or os.environ.get(KEY_ENV[key], "").strip()
             if key == "gemini_api_key" and not value and self.config.get("protected_gemini_key"):

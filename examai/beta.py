@@ -91,8 +91,9 @@ class CloudEngine:
                              "context": context[:3500], "mime": mime,
                              "image": base64.b64encode(image).decode()}, on_text, request_id, cancelled)
 
-    def generate_summary(self, context):
-        return self.generate_answer("Склади короткий конспект за наданим текстом.", context)
+    def generate_summary(self, context, *, cancelled=None):
+        return self._stream({"question": "Склади короткий конспект за наданим текстом.",
+                             "context": context[:3500]}, None, "-", cancelled)
 
     def _stream(self, body, on_text, request_id="-", cancelled=None):
         started = perf_counter()

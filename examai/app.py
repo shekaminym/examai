@@ -3,7 +3,7 @@ import os
 import sqlite3
 import sys
 import threading
-from hashlib import sha256
+from pathlib import Path
 from math import ceil
 from time import perf_counter
 from uuid import uuid4
@@ -590,6 +590,7 @@ class MainController(QObject):
         self.app = app
         self.config = config if config is not None else ConfigManager()
         self.db = database if database is not None else DatabaseManager()
+        self.local_db = self.db
         self.rag = RAGEngine(self.db)
         self.stt = self.stt_settings = None
         self.ui = MainWindow(self.config, self.db, startup_devices=startup_devices,
@@ -633,6 +634,8 @@ class MainController(QObject):
         self._last_imported_at = None
         self._recent_imports = {}
         self._pending_import_selection = None
+        self._data_generation = 0
+        self._profile_ready = True
         self._voice_wait_at = None
         for timer in (self._answer_hint_timer, self._voice_timer, self._question_timer):
             timer.setSingleShot(True)
@@ -804,7 +807,7 @@ class MainController(QObject):
 
     @Slot()
     def start_listening(self):
-        if self.closing or self.audio is not None or self._lease_worker is not None:
+        if self.closing or not self._profile_ready or self.audio is not None or self._lease_worker is not None:
             return
         client = self.ui.account_panel.client
         if client.token and not self.config.get("gemini_api_key"):
@@ -829,6 +832,10 @@ class MainController(QObject):
                 return
             if action == "acquire":
                 self.ui.btn_toggle_listen.setEnabled(True)
+            if action != "release" and client is not self.ui.account_panel.client:
+                if action == "acquire" and not error:
+                    self._cloud_listening = client
+                return
             if error:
                 self.ui.lbl_status.setText(error)
                 if action == "renew" and self.audio:
@@ -1000,7 +1007,7 @@ class MainController(QObject):
 
     @Slot()
     def start_screen_selection(self):
-        if self.closing or self._selecting_screen:
+        if self.closing or not self._profile_ready or self._selecting_screen:
             return
         if not self.config.get("gemini_api_key") and not self.ui.account_panel.client.token:
             self.ui.lbl_status.setText("Увійдіть через Google, щоб користуватися EXAM AI Cloud.")
@@ -1169,7 +1176,7 @@ class MainController(QObject):
                         mode=None, enqueued_at=None, image=None, image_bytes=None, image_mime=None,
                         image_instruction=""):
         question = question.strip()
-        if self.closing or not question:
+        if self.closing or not self._profile_ready or not question:
             return
         submitted = perf_counter()
         request_id = request_id or uuid4().hex[:12]
@@ -1227,8 +1234,8 @@ class MainController(QObject):
         remembered_reference = self.conversation.reference_context(question) if prior else ""
         usage_reference = self.conversation.code_usage_reference(question, prior, remembered_reference)
         conversation_id = self.conversation.session_id
-        token = self.ui.account_panel.client.token
-        account_scope = sha256(token.encode()).hexdigest() if token else ""
+        database, rag = self.db, self.rag
+        account_scope = self.ui.account_panel.profile_id
         timing.info("request_id=%s session=%s prior_turns=%d context_prep_ms=%.2f",
                     request_id, conversation_id, len(prior), (perf_counter() - memory_started) * 1000)
         memory_generation = self.conversation.generation
@@ -1240,7 +1247,7 @@ class MainController(QObject):
             context = ""
             if not has_image:
                 try:
-                    context = self.rag.retrieve_relevant_context(
+                    context = rag.retrieve_relevant_context(
                         question, limit=2,
                         source_hint=retrieval_hint, request_id=request_id,
                     )
@@ -1258,7 +1265,7 @@ class MainController(QObject):
                     context = remembered_reference
                     if usage_reference:
                         try:
-                            usage = self.rag.retrieve_code_usage(*usage_reference, request_id)
+                            usage = rag.retrieve_code_usage(*usage_reference, request_id)
                             if usage:
                                 context = usage + "\n\n" + remembered_reference
                         except sqlite3.Error:
@@ -1313,7 +1320,7 @@ class MainController(QObject):
                     image_context = ""
                     if intent == EXPLAIN_CODE and source_hint:
                         try:
-                            image_context = self.rag.get_source_preview(source_hint)
+                            image_context = rag.get_source_preview(source_hint)
                         except sqlite3.Error:
                             pass
                     timing.info("request_id=%s screen_image_sent=1 intent=%s context_chars=%d",
@@ -1333,7 +1340,7 @@ class MainController(QObject):
             status = "Готово"
             if save_history and not has_image:
                 try:
-                    self.db.save_qa(question, answer, llm.used_model, session=conversation_id,
+                    database.save_qa(question, answer, llm.used_model, session=conversation_id,
                                     account=account_scope, reference=worker.memory_evidence)
                 except Exception:
                     status = "Відповідь отримано. Історію не збережено."
@@ -1357,9 +1364,11 @@ class MainController(QObject):
     def _cancel_active_answer(self):
         worker = self.api
         cancelled = getattr(worker, "cancel_answer", None)
-        if cancelled is None or len(self._retired_answers) >= MAX_RETIRED_ANSWERS:
+        if cancelled is None:
             return
         cancelled.set()
+        if len(self._retired_answers) >= MAX_RETIRED_ANSWERS:
+            return
         self._retired_answers[worker] = self.llm
         self.llm = self.llm_settings = None
         self.api = None
@@ -1377,10 +1386,51 @@ class MainController(QObject):
     @Slot()
     def _account_changed(self):
         self.on_clear_all()
+        self._data_generation += 1
+        if self.audio is not None:
+            self.audio.requestInterruption()
+        self._lease_timer.stop()
+        if self.audio is None:
+            self._release_listening()
+        if self._selecting_screen:
+            self._finish_screen_selection()
+
+        scope = self.ui.account_panel.profile_id
+        self.config.set_profile_scope(scope)
+        self.ui.settings_window.hide()
+        self.ui.input_gemini_key.setText(self.config.get("gemini_api_key", ""))
+        self.ui.remember_gemini_key.setChecked(bool(self.config.get("protected_gemini_key")))
+        self._last_imported_source = self._last_imported_at = self._pending_import_selection = None
+        self._recent_imports.clear()
         self._answer_history.clear()
         self.ui.set_history_items([])
         self.ui.txt_question.clear()
         self.ui.txt_answer.clear()
+        self.ui.input_manual_question.clear()
+        self.ui.input_search.clear()
+        self.ui.txt_docs_result.clear()
+        self.ui.list_docs.clear()
+        self._profile_ready = False
+        try:
+            database = self.local_db
+            if scope:
+                folder = Path(self.local_db.db_path).parent / "profiles" / scope
+                folder.mkdir(parents=True, exist_ok=True)
+                database = DatabaseManager(folder / "exam_assistant.db")
+            history = database.get_history(limit=100, account=scope) if scope else []
+            self.db = database
+            self.rag = RAGEngine(database)
+            self.ui.db_mgr = database
+        except (OSError, sqlite3.Error):
+            # Keep other profiles unavailable even if this profile's disk cannot be opened.
+            self.ui.centralWidget().setEnabled(False)
+            self.ui.lbl_status.setText("Не вдалося відкрити локальні дані акаунта.")
+            return
+        self._profile_ready = True
+        self.ui.centralWidget().setEnabled(True)
+        self._answer_history = [(uuid4().hex, row["question"], row["answer"]) for row in reversed(history)]
+        self.ui.set_history_items(self._answer_history)
+        self.ui.refresh_documents_list()
         self._sync_history_controls()
 
     def _accept_answer_signal(self):
@@ -1519,7 +1569,7 @@ class MainController(QObject):
 
     @Slot(str)
     def handle_auto_summary(self, filename):
-        if self.closing:
+        if self.closing or not self._profile_ready:
             return
         if not filename:
             self.ui.txt_docs_result.setPlainText("Виберіть документ.")
@@ -1530,16 +1580,28 @@ class MainController(QObject):
         llm = self.get_llm()
         self.ui.txt_docs_result.setPlainText("Створення автоконспекту…")
 
+        rag = self.rag
+        cancelled = threading.Event()
+
         def task():
-            context = self.rag.get_summary_context(filename)
+            context = rag.get_summary_context(filename)
             if not context:
                 raise GenerationError("У вибраному документі немає тексту.")
+            if cancelled.is_set():
+                raise GenerationError("Запит скасовано.")
+            if isinstance(llm, CloudEngine):
+                return llm.generate_summary(context, cancelled=cancelled.is_set)
             return llm.generate_summary(context)
 
-        self.start_api(TaskWorker(task, "Помилка обробки запиту AI."), self.on_summary_result)
+        worker = TaskWorker(task, "Помилка обробки запиту AI.")
+        worker.cancel_answer = cancelled
+        worker.data_generation = self._data_generation
+        self.start_api(worker, self.on_summary_result)
 
     @Slot(object, str)
     def on_summary_result(self, value, error):
+        if getattr(self.sender(), "data_generation", self._data_generation) != self._data_generation:
+            return
         if error:
             self.ui.txt_docs_result.setPlainText(error)
         else:
@@ -1575,7 +1637,7 @@ class MainController(QObject):
             self.submit_question(*pending, **options)
 
     def docs_available(self):
-        if self.closing:
+        if self.closing or not self._profile_ready:
             return False
         if self.docs is not None:
             self.ui.txt_docs_result.setPlainText("Зачекайте завершення операції з документом.")
@@ -1586,13 +1648,16 @@ class MainController(QObject):
     def handle_search_keyword(self, keyword):
         keyword = keyword.strip()
         if keyword and self.docs_available():
-            self.start_docs_task(lambda: self.rag.search_keyword(keyword))
+            rag = self.rag
+            self.start_docs_task(lambda: rag.search_keyword(keyword))
 
     @Slot(str)
     def handle_file_deletion(self, filename):
         if self.docs_available():
+            database = self.db
+
             def task():
-                self.db.delete_document_source(filename)
+                database.delete_document_source(filename)
                 return f"Конспект «{filename}» видалено."
 
             self.start_docs_task(task)
@@ -1604,6 +1669,8 @@ class MainController(QObject):
 
     @Slot(object, str)
     def on_doc_result(self, value, error):
+        if getattr(self.sender(), "data_generation", self._data_generation) != self._data_generation:
+            return
         self.ui.txt_docs_result.setPlainText(error or value)
 
     @Slot(object, object)
@@ -1624,6 +1691,8 @@ class MainController(QObject):
 
     @Slot(str, int, str)
     def on_index_result(self, filename, count, error):
+        if getattr(self.sender(), "data_generation", self._data_generation) != self._data_generation:
+            return
         message = error or f"«{filename}» збережено ({count} блоків)."
         self.ui.txt_docs_result.setPlainText(message)
         if not error:
@@ -1641,14 +1710,16 @@ class MainController(QObject):
 
     def start_docs(self, worker):
         self.docs = worker
+        worker.data_generation = self._data_generation
         self.docs.finished.connect(self.docs_done)
         self.docs.start()
 
     @Slot()
     def docs_done(self):
-        self.docs.deleteLater()
+        worker = self.docs
+        worker.deleteLater()
         self.docs = None
-        if not self.closing:
+        if not self.closing and worker.data_generation == self._data_generation:
             self.ui.refresh_documents_list()
             if self._pending_import_selection is not None:
                 items = self.ui.list_docs.findItems(self._pending_import_selection,

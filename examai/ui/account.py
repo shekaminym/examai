@@ -2,10 +2,12 @@
 import base64
 import os
 from pathlib import Path
+from hashlib import sha256
 import platform
 import secrets
 from unicodedata import category
 from time import monotonic
+from datetime import datetime
 
 from PySide6.QtCore import QThread, QTimer, QUrl, Signal, Qt
 from PySide6.QtGui import QDesktopServices, QPixmap
@@ -16,6 +18,24 @@ from examai.beta import BetaClient, distribution_url
 from examai.branding import VERSION
 from examai.windows.credentials import protect, reveal
 from examai.ui.settings_window import SettingsWindow
+
+
+def access_text(account):
+    if not account:
+        return ""
+    state, until, seconds = account["state"], account["until"], account["seconds"]
+    if state == "SUSPENDED":
+        return "Доступ призупинено"
+    if state == "ACTIVE":
+        if until is None:
+            return "Доступ без обмежень"
+        return "Доступ до " + datetime.fromtimestamp(until).strftime("%d.%m.%Y")
+    if state in {"BETA", "TRIAL"} and seconds > 0:
+        minutes, seconds = divmod(seconds, 60)
+        if minutes >= 60:
+            return f"Залишилось: {minutes // 60} год {minutes % 60} хв"
+        return f"Залишилось: {minutes} хв {seconds} с"
+    return "Доступ закінчився" if account.get("invited") or until is not None else "Доступ не активовано"
 
 
 class NetworkJob(QThread):
@@ -75,6 +95,7 @@ class WelcomeDialog(SettingsWindow):
         self.google = account.button(layout, "Увійти через Google", account.sign_in)
         self.google.setObjectName("WelcomeGoogle")
         self.cancel = account.button(layout, "Скасувати вхід", self.reject)
+        self.replace_device = account.button(layout, "Завершити старий сеанс", account.replace_device)
         self.feedback = QLabel()
         self.feedback.setTextFormat(Qt.TextFormat.PlainText)
         self.feedback.setWordWrap(True)
@@ -96,6 +117,7 @@ class WelcomeDialog(SettingsWindow):
         self.google.setEnabled(valid and not busy)
         self.name.setReadOnly(busy)
         self.cancel.setVisible(busy)
+        self.replace_device.setVisible(bool(self.account.device_limit and not busy))
 
     def reject(self):
         if self.account.job is not None or self.account.timer.isActive():
@@ -105,13 +127,17 @@ class WelcomeDialog(SettingsWindow):
         super().reject()
 
     def use_byok(self):
-        self.account.cancel_login()
+        if self.account.client.token and not self.account.profile_id:
+            self.account.clear_session()
+        else:
+            self.account.cancel_login()
         self.accept()
 
 
 class AccountPanel(QWidget):
     session_changed = Signal()
     catalog_changed = Signal()
+    balance_changed = Signal(str)
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -120,6 +146,9 @@ class AccountPanel(QWidget):
         self.job = None
         self.closing = False
         self.claim = ""
+        self.device_limit = False
+        self.profile_id = ""
+        self.balance_job = None
         self.login_attempt = 0
         self.welcome = None
         self.startup_ready = None
@@ -158,7 +187,10 @@ class AccountPanel(QWidget):
         key_info.setWordWrap(True)
         layout.addWidget(key_info)
         self.refresh_button = self.button(layout, "Оновити обліковий запис", self.refresh)
-        self.signout_button = self.button(layout, "Вийти", self.sign_out)
+        self.switch_button = self.button(layout, "Змінити акаунт", lambda: self.sign_out(switch=True))
+        self.signout_button = self.button(layout, "Вийти", lambda: self.sign_out())
+        self.balance_timer = QTimer(self, interval=8000)
+        self.balance_timer.timeout.connect(self.poll_balance)
         self.url.editingFinished.connect(self.configure_developer_url)
         self.timer = QTimer(self, interval=1600)
         self.timer.timeout.connect(self.poll)
@@ -194,12 +226,12 @@ class AccountPanel(QWidget):
         signed_in = configured and bool(self.client.token)
         self.google_button.setVisible((configured or self.developer) and not signed_in)
         self.save_name_button.setVisible(signed_in)
-        for widget in (self.refresh_button, self.signout_button):
+        for widget in (self.refresh_button, self.switch_button, self.signout_button):
             widget.setVisible(signed_in)
         if not configured:
             self.status.setText("EXAM AI Cloud is unavailable. You can use your Gemini key in AI & Models.")
         elif not signed_in:
-            self.status.setText("Sign in to EXAM AI Cloud")
+            self.status.setText("Увійдіть до EXAM AI Cloud")
 
     def report_available(self, label):
         if not self.client.url:
@@ -293,31 +325,36 @@ class AccountPanel(QWidget):
             return
 
         def failed(error):
-            if error == "Session expired":
-                self.client.token = ""
-                try:
-                    self.config.set("account_session", "")
-                except OSError:
-                    pass
-                self.url.setReadOnly(False)
-                self.update_controls()
-                self.session_changed.emit()
+            if error in {"Session expired", "Account disabled"}:
+                self.clear_session(remember_name=True)
                 self.show_welcome(parent)
             else:
-                self.status.setText(error)
-                self.welcome_finished(QDialog.DialogCode.Accepted)
+                # Do not open local Notes under an account whose identity could not be verified.
+                self.show_welcome(parent)
+                self.welcome.feedback.setText("Не вдалося перевірити сеанс. Спробуйте ще раз або продовжіть локально.")
 
         def restored(account):
-            self.remember_name(account.get("name", ""))
+            self.activate_profile(account)
             self.welcome_finished(QDialog.DialogCode.Accepted)
             self.refresh()
 
         self.launch(lambda: self.client.request("GET", "/account"), restored, on_error=failed)
 
+    def activate_profile(self, account):
+        identity = account.get("profile_id") or self.client.token
+        profile = sha256((self.client.url + "\n" + identity).encode()).hexdigest()
+        if profile != self.profile_id:
+            self.profile_id = profile
+            self.session_changed.emit()
+        self.remember_name(account.get("name", ""))
+        self.apply_account(account)
+        self.balance_timer.start()
+
     def cancel_login(self):
         self.login_attempt += 1
         self.timer.stop()
         self.claim = ""
+        self.device_limit = False
         if self.welcome:
             self.welcome.update_controls()
 
@@ -330,6 +367,8 @@ class AccountPanel(QWidget):
             self.show_welcome(self.window().parentWidget() or self.window())
             return
         welcome.feedback.clear()
+        if self.device_limit:
+            self.cancel_login()
         if self.client.token:
             self.complete_profile(name)
             return
@@ -353,10 +392,16 @@ class AccountPanel(QWidget):
     def login_failed(self, attempt, error):
         if attempt != self.login_attempt:
             return
+        if error in {"Device limit reached", "All devices busy"}:
+            self.timer.stop()
+            self.device_limit = error == "Device limit reached"
+            self.welcome.feedback.setText("Досягнуто ліміту пристроїв. Вийдіть на іншому пристрої або завершіть старий неактивний сеанс тут.")
+            return
         self.cancel_login()
         self.welcome.feedback.setText({
             "Login expired": "Вхід скасовано або час очікування минув. Спробуйте ще раз.",
             "Session expired": "Сеанс завершився. Увійдіть повторно.",
+            "Account disabled": "Обліковий запис деактивовано. Зверніться до адміністратора.",
         }.get(error, error))
 
     def open_browser(self, result):
@@ -373,7 +418,15 @@ class AccountPanel(QWidget):
         else:
             self.login_failed(self.login_attempt, "Не вдалося відкрити браузер.")
 
-    def poll(self):
+    def replace_device(self):
+        if not self.device_limit or self.job is not None:
+            return
+        if QMessageBox.question(self.welcome, "Завершити старий сеанс?",
+                                "Найстаріший неактивний пристрій буде від’єднано. На ньому знадобиться повторний вхід."
+                                ) == QMessageBox.StandardButton.Yes:
+            self.poll(replace=True)
+
+    def poll(self, *, replace=False):
         attempt = self.login_attempt
         if monotonic() >= self.timeout:
             self.login_failed(attempt, "Login expired")
@@ -389,35 +442,43 @@ class AccountPanel(QWidget):
                 return
             self.timer.stop()
             self.claim = ""
+            self.device_limit = False
             self.client.token = result["token"]
             self.complete_profile(self.welcome.name.text().strip())
 
-        self.launch(lambda: self.client.request("POST", "/oauth/claim", {"claim": claim}),
+        self.launch(lambda: self.client.request("POST", "/oauth/claim", {"claim": claim, "replace": replace}),
                     completed, on_error=lambda error: self.login_failed(attempt, error))
 
     def complete_profile(self, name):
         attempt = self.login_attempt
-        def saved(result):
+        client = self.client
+
+        def saved(account):
             if attempt != self.login_attempt:
                 return
-            self.name_input.setText(result["name"])
-            self.remember_name(result["name"])
             self.update_controls()
             self.url.setReadOnly(True)
             try:
-                self.config.set("account_session", protect(self.client.token))
+                self.config.set("account_session", protect(client.token))
             except (OSError, ValueError):
-                self.welcome.feedback.setText("Windows не вдалося зберегти сеанс для наступного запуску.")
-            self.session_changed.emit()
+                self.status.setText("Windows не вдалося зберегти сеанс для наступного запуску.")
+            self.activate_profile(account)
             self.welcome.accept()
             self.refresh()
 
         def failed(error):
-            if attempt == self.login_attempt and error == "Session expired":
-                self.client.token = ""
-            self.login_failed(attempt, error)
+            if attempt == self.login_attempt and error in {"Session expired", "Account disabled"}:
+                self.clear_session(remember_name=True)
+                attempt_now = self.login_attempt
+            else:
+                attempt_now = attempt
+            self.login_failed(attempt_now, error)
 
-        self.launch(lambda: self.client.request("PUT", "/account/name", {"name": name}), saved, on_error=failed)
+        def complete():
+            client.request("PUT", "/account/name", {"name": name})
+            return client.request("GET", "/account")
+
+        self.launch(complete, saved, on_error=failed)
 
     def save_name(self):
         name = self.name_input.text().strip()
@@ -439,24 +500,45 @@ class AccountPanel(QWidget):
         self.launch(fetch, self.show_account)
 
     def show_account(self, data):
-        from datetime import datetime, timezone
         account, catalog = data
-        status = "Signed out"
-        if account:
-            status = f"{account['state']} · {account['seconds'] // 60}:{account['seconds'] % 60:02d} beta time"
-            if account["until"]:
-                status += " · " + datetime.fromtimestamp(account["until"], timezone.utc).date().isoformat()
-        if account:
-            status = "\n".join(filter(None, (account.get("email"), status, account.get("plan"))))
-            if not self.name_input.hasFocus():
-                self.name_input.setText(account.get("name", ""))
+        self.apply_account(account)
         self.plans.clear()
         for plan in catalog["plans"]:
             self.plans.addItem(f"{plan['months']} mo / {plan['price_uah']} UAH", plan["id"])
         self.checkout.setEnabled(bool(self.developer and account and catalog["checkout_available"]))
         self.available_plans = {plan["id"]: plan for plan in catalog["plans"]}
         self.catalog_changed.emit()
-        self.status.setText(status)
+
+    def apply_account(self, account):
+        label = access_text(account)
+        self.balance_changed.emit(label)
+        if account:
+            self.status.setText("\n".join(filter(None, (account.get("email"), account.get("role"), label))))
+            if not self.name_input.hasFocus():
+                self.name_input.setText(account.get("name", ""))
+        else:
+            self.status.setText("Ви вийшли з акаунта.")
+
+    def poll_balance(self):
+        if self.balance_job is not None or self.job is not None or not self.client.token or self.closing:
+            return
+        client = self.client
+        worker = self.balance_job = NetworkJob(lambda: client.request("GET", "/account"), self)
+
+        def finished(account, error):
+            self.balance_job = None
+            if self.closing or self.client is not client or self.job is not None:
+                return
+            if error in {"Session expired", "Account disabled"}:
+                self.clear_session(remember_name=True)
+                self.show_welcome(self.window().parentWidget() or self.window())
+            elif not error:
+                self.apply_account(account)
+            else:
+                self.balance_changed.emit("Перевіряємо залишок…")
+        worker.result.connect(finished, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def open_checkout(self, plan=None):
         plan = plan or self.plans.currentData()
@@ -494,37 +576,53 @@ class AccountPanel(QWidget):
         self.launch(lambda: self.client.request("POST", "/invite", {"code": code}),
                     activated, error_label=self.invite_feedback)
 
-    def sign_out(self):
-        self.timer.stop()
+    def clear_session(self, *, remember_name=False):
+        self.balance_timer.stop()
+        self.cancel_login()
+        self.client = BetaClient(self.client.url)
+        self.profile_id = ""
+        self.name_input.clear()
+        self.invite.clear()
+        self.invite_feedback.hide()
+        self.balance_changed.emit("")
+        if self.welcome and not remember_name:
+            self.welcome.name.clear()
+        self.url.setReadOnly(False)
+        self.checkout.setEnabled(False)
+        self.update_controls()
+        self.session_changed.emit()
+        try:
+            fields = {"account_session": ""}
+            if not remember_name:
+                fields["account_name"] = ""
+            self.config.save_config(fields)
+        except OSError:
+            self.status.setText("Сеанс завершено. Не вдалося оновити локальний файл налаштувань.")
+
+    def sign_out(self, *, switch=False):
+        client = self.client
         def done(_):
-            self.client.token = ""
-            self.name_input.clear()
-            self.invite_feedback.hide()
-            if self.welcome:
-                self.welcome.name.clear()
-            self.session_changed.emit()
-            self.url.setReadOnly(False)
-            self.checkout.setEnabled(False)
-            self.update_controls()
-            try:
-                self.config.save_config({"account_session": "", "account_name": ""})
-            except OSError:
-                self.status.setText("Signed out on the server. Could not clear the local file.")
-            else:
-                self.status.setText("Signed out")
+            self.clear_session()
+            if switch:
+                parent = self.window().parentWidget() or self.window()
+                self.window().hide()
+                self.show_welcome(parent)
+
         def end_session():
             from examai.ai.llm_engine import GenerationError
             try:
-                return self.client.request("POST", "/logout")
+                return client.request("POST", "/logout")
             except GenerationError as exc:
-                if str(exc) == "Session expired":
+                if str(exc) in {"Session expired", "Account disabled"}:
                     return None
                 raise
-        self.launch(end_session, done)
+        self.launch(end_session, done, on_error=lambda _error: self.status.setText(
+            "Не вдалося завершити серверний сеанс. Перевірте з’єднання й повторіть спробу."))
 
     def stop_jobs(self):
         self.closing = True
         self.timer.stop()
+        self.balance_timer.stop()
         for job in self.findChildren(NetworkJob):
             job.wait()
 
