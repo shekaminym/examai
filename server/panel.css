@@ -8,6 +8,9 @@ button:hover:not(:disabled){border-color:var(--accent);background:var(--active)}
 button:disabled{opacity:.6;cursor:wait}
 button.primary{color:#19142b;background:#b5a0ff;border-color:#b5a0ff}
 button.primary:hover:not(:disabled){color:#19142b;background:#c6b6ff}
+button.danger{color:#f4c5cf;border-color:#844557;background:#39242e}
+button.danger:hover:not(:disabled){background:#54303e;border-color:#bd647b}
+#qa-purge{margin-bottom:1rem}
 :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 a{color:var(--accent)}
 h1,h2,p{margin:0}

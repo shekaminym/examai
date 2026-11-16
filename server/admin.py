@@ -3,6 +3,8 @@ import hashlib
 import hmac
 import re
 import secrets
+from calendar import monthrange
+from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID
 
@@ -13,6 +15,22 @@ from server.store import ADMIN_INVITATION_SECONDS, Denied, digest
 
 
 STATUSES = ("Received", "Reviewing", "Confirmed", "Fixed", "Closed")
+AUDIT_PERIODS = {"5m": 300, "10m": 600, "30m": 1800, "1h": 3600,
+                 "2h": 7200, "3h": 10800, "5h": 18000, "10h": 36000,
+                 "1d": 86400, "1w": 604800, "2w": 1209600}
+
+
+def audit_cutoff(now, period):
+    if period in AUDIT_PERIODS:
+        return now - AUDIT_PERIODS[period]
+    current = datetime.fromtimestamp(now, timezone.utc)
+    if period == "1mo":
+        year = current.year - (current.month == 1)
+        month = 12 if current.month == 1 else current.month - 1
+    else:
+        year, month = current.year - 1, current.month
+    return current.replace(year=year, month=month,
+                           day=min(current.day, monthrange(year, month)[1])).timestamp()
 
 
 class Email(BaseModel):
@@ -53,9 +71,18 @@ class Invitation(Email):
 
 
 class License(Email):
-    action: str = Field(pattern="^(minutes|remove|days|suspend|restore|revoke)$")
+    action: str = Field(pattern="^(minutes|remove|days|unlimited|suspend|restore|revoke)$")
     amount: int = Field(default=0, ge=0, le=10080)
     operation_id: UUID
+
+
+class ConfirmedAction(BaseModel):
+    confirmed: Literal[True]
+
+
+class AuditClear(ConfirmedAction):
+    period: Literal["5m", "10m", "30m", "1h", "2h", "3h", "5h", "10h",
+                    "1d", "1w", "2w", "1mo", "1y"]
 
 
 class ReportUpdate(BaseModel):
@@ -118,6 +145,8 @@ def change_license(store, tx, sub, action, amount):
         if not (account["state"] == "ACTIVE" and account["until"] is None):
             until = max(now, account["until"] or 0) + amount * 86400
             tx.execute("UPDATE account SET state='ACTIVE',until=? WHERE sub=?", (until, sub))
+    elif action == "unlimited" and account["state"] != "SUSPENDED":
+        tx.execute("UPDATE account SET state='ACTIVE',until=NULL WHERE sub=?", (sub,))
     elif action == "suspend" and account["state"] != "SUSPENDED":
         tx.execute("INSERT INTO suspended_access VALUES(?,?)", (sub, account["state"]))
         tx.execute("UPDATE account SET state='SUSPENDED' WHERE sub=?", (sub,))
@@ -159,6 +188,50 @@ def mount_admin(app, store, bearer, admin_subject):
         if store.role(tx, actor) != "Owner":
             raise HTTPException(403, "Owner required")
         return actor
+
+    @app.post("/admin/v2/qa/purge")
+    def purge_qa(body: ConfirmedAction, token=Depends(bearer)):
+        with store.transaction() as tx:
+            actor = owner(tx, token)
+            subs = {row["sub"] for row in tx.execute(
+                "SELECT sub FROM profile WHERE lower(email) LIKE '%@example.test' "
+                "UNION SELECT sub FROM google_identity WHERE lower(email) LIKE '%@example.test'"
+            )}
+            if any(store.role(tx, sub) == "Owner" for sub in subs):
+                raise HTTPException(409, "A test account has owner access")
+            invitations = 0
+            for sub in subs:
+                tx.execute("DELETE FROM report_attachment WHERE report_id IN "
+                           "(SELECT id FROM report WHERE sub=?)", (sub,))
+                tx.execute("DELETE FROM report_assignment WHERE report_id IN "
+                           "(SELECT id FROM report WHERE sub=?) OR sub=?", (sub, sub))
+                tx.execute("DELETE FROM audit WHERE actor=? OR subject=?", (sub, sub))
+                invitations += tx.execute("DELETE FROM beta_invitation WHERE sub=?", (sub,)).rowcount
+                for table in ("report", "usage", "session", "lease", "oauth", "invite",
+                              "suspended_access", "staff", "google_identity", "account_activity",
+                              "display_name", "profile", "account"):
+                    tx.execute(f"DELETE FROM {table} WHERE sub=?", (sub,))
+                tx.execute("DELETE FROM admin_operation WHERE actor=?", (sub,))
+            tx.execute("DELETE FROM audit WHERE lower(subject) LIKE '%@example.test'")
+            tx.execute("DELETE FROM admin_operation WHERE lower(payload) LIKE '%@example.test%'")
+            invitations += tx.execute("DELETE FROM beta_invitation WHERE lower(email) LIKE '%@example.test'").rowcount
+            tx.execute("DELETE FROM pending_admin WHERE lower(email) LIKE '%@example.test'")
+            store.audit(tx, actor, actor, f"Purged example.test QA data: {len(subs)} accounts")
+            return {"accounts": len(subs), "invitations": invitations}
+
+    @app.post("/admin/v2/audit/clear")
+    def clear_audit(body: AuditClear, token=Depends(bearer)):
+        with store.transaction() as tx:
+            actor = owner(tx, token)
+            now = store.now()
+            count = tx.execute(
+                "DELETE FROM audit WHERE created>=? AND created<=? "
+                "AND action NOT LIKE 'Cleared audit %' "
+                "AND action NOT LIKE 'Purged example.test QA data%'",
+                (audit_cutoff(now, body.period), now),
+            ).rowcount
+            store.audit(tx, actor, actor, f"Cleared audit {body.period}: {count} entries")
+            return {"deleted": count}
 
     @app.post("/admin/v2/overview")
     def overview(filters: Filters, token=Depends(bearer)):
@@ -318,6 +391,8 @@ def mount_admin(app, store, bearer, admin_subject):
             actor = admin_subject(tx, token)
             sub = lookup(store, tx, normalize_email(body.email), required=True)
             guard_target(store, tx, actor, sub)
+            if body.action == "unlimited" and store.role(tx, actor) != "Owner":
+                raise HTTPException(403, "Owner required")
             if (body.action == "days" and body.amount > 365):
                 raise HTTPException(422, "Maximum extension is 365 days")
             if record_operation(tx, actor, body.operation_id, "license:" + body.model_dump_json()):

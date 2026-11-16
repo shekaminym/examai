@@ -67,9 +67,18 @@ class AccountPanel(QWidget):
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status)
-        self.google_button = self.button(layout, "Continue with Google", self.sign_in)
-        self.refresh_button = self.button(layout, "Refresh account and plans", self.refresh)
-        self.signout_button = self.button(layout, "Sign out", self.sign_out)
+        layout.addWidget(QLabel("Ваше ім'я"))
+        self.name_input = QLineEdit()
+        self.name_input.setMaxLength(60)
+        self.name_input.setPlaceholderText("Як до вас звертатися")
+        layout.addWidget(self.name_input)
+        self.save_name_button = self.button(layout, "Зберегти ім'я", self.save_name)
+        self.google_button = self.button(layout, "Увійти через Google", self.sign_in)
+        key_info = QLabel("Після входу EXAM AI використовує ваш особистий сеанс і ліміти. Окремий Gemini API Key не потрібен.")
+        key_info.setWordWrap(True)
+        layout.addWidget(key_info)
+        self.refresh_button = self.button(layout, "Оновити обліковий запис", self.refresh)
+        self.signout_button = self.button(layout, "Вийти", self.sign_out)
         self.invite = QLineEdit()
         self.invite.setPlaceholderText("Код запрошення")
         layout.addWidget(self.invite)
@@ -94,6 +103,7 @@ class AccountPanel(QWidget):
         configured = bool(self.client.url)
         signed_in = configured and bool(self.client.token)
         self.google_button.setVisible((configured or self.developer) and not signed_in)
+        self.save_name_button.setVisible(signed_in)
         for widget in (self.refresh_button, self.signout_button, self.invite, self.redeem_button):
             widget.setVisible(signed_in)
         if not configured:
@@ -183,8 +193,18 @@ class AccountPanel(QWidget):
             self.config.set("account_session", protect(self.client.token))
         except (OSError, ValueError):
             self.status.setText("Signed in for this session. Windows storage is unavailable.")
+        if self.name_input.text().strip():
+            self.save_name()
+        else:
+            self.refresh()
+
+    def save_name(self):
+        name = self.name_input.text().strip()
+        if not self.client.token or not name:
+            self.status.setText("Введіть ім'я та увійдіть через Google.")
             return
-        self.refresh()
+        self.launch(lambda: self.client.request("PUT", "/account/name", {"name": name}),
+                    lambda result: (self.name_input.setText(result["name"]), self.refresh()))
 
     def refresh(self):
         def fetch():
@@ -203,6 +223,8 @@ class AccountPanel(QWidget):
                 status += " · " + datetime.fromtimestamp(account["until"], timezone.utc).date().isoformat()
         if account:
             status = "\n".join(filter(None, (account.get("email"), status, account.get("plan"))))
+            if not self.name_input.hasFocus():
+                self.name_input.setText(account.get("name", ""))
         self.plans.clear()
         for plan in catalog["plans"]:
             self.plans.addItem(f"{plan['months']} mo / {plan['price_uah']} UAH", plan["id"])
@@ -240,6 +262,7 @@ class AccountPanel(QWidget):
         self.timer.stop()
         def done(_):
             self.client.token = ""
+            self.name_input.clear()
             self.session_changed.emit()
             self.url.setReadOnly(False)
             self.checkout.setEnabled(False)

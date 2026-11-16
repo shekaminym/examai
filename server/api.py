@@ -43,6 +43,10 @@ class Claim(BaseModel):
     claim: str = Field(min_length=32, max_length=128)
 
 
+class AccountName(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
 class Invite(BaseModel):
     code: str = Field(min_length=16, max_length=128)
 
@@ -198,11 +202,24 @@ def create_app(path=None):
             sub = subject(tx, token)
             account = db.access(tx, sub, token=digest(token))
             profile = tx.execute("SELECT email FROM profile WHERE sub=?", (sub,)).fetchone()
+            name = tx.execute("SELECT name FROM display_name WHERE sub=?", (sub,)).fetchone()
             account["email"] = profile["email"] if profile else None
+            account["name"] = name["name"] if name else ""
             account["plan"] = {"BETA": "Closed Beta", "TRIAL": "Trial",
                                "ACTIVE": "Granted access"}.get(account["state"])
             account["auto_renew"] = False
             return account
+
+    @app.put("/account/name")
+    def account_name(body: AccountName, token=Depends(bearer)):
+        name = " ".join(body.name.split())
+        if not name or len(name) > 60 or any(ord(char) < 32 for char in body.name):
+            raise HTTPException(422, "Enter a name of up to 60 characters")
+        with db.transaction() as tx:
+            sub = subject(tx, token)
+            tx.execute("INSERT INTO display_name(sub,name) VALUES(?,?) "
+                       "ON CONFLICT(sub) DO UPDATE SET name=excluded.name", (sub, name))
+        return {"name": name}
 
     @app.post("/invite")
     def invite(body: Invite, token=Depends(bearer)):

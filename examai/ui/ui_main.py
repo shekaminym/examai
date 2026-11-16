@@ -925,6 +925,16 @@ class MainWindow(QMainWindow):
         self.settings_window.raise_()
         self.settings_window.activateWindow()
 
+    def show_account_on_startup(self):
+        panel = self.account_panel
+        panel.update_controls()
+        if panel.client.token:
+            panel.refresh()
+        elif panel.client.url:
+            self.settings_navigation.setCurrentRow(0)
+            self.open_settings()
+            self.settings_scrolls["general"].ensureWidgetVisible(panel)
+
     def position_settings(self):
         if not self.config_mgr.get("settings_docked"):
             return
@@ -982,6 +992,7 @@ class MainWindow(QMainWindow):
         pages = QStackedWidget()
         body.addWidget(pages, 1)
         groups = {}
+        self.settings_scrolls = {}
         for key, label in (
             ("general", "Загальні"), ("models", "ШІ та моделі"),
             ("audio", "Аудіо та розпізнавання"), ("appearance", "Інтерфейс і теми"),
@@ -999,6 +1010,7 @@ class MainWindow(QMainWindow):
             layout.setContentsMargins(7, 8, 7, 8)
             layout.setSpacing(10)
             groups[key] = layout
+            self.settings_scrolls[key] = scroll
             pages.addWidget(scroll)
         self.settings_categories = [self.settings_navigation.item(i).text()
                                     for i in range(self.settings_navigation.count())]

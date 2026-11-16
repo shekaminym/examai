@@ -1002,7 +1002,7 @@ class MainController(QObject):
         if self.closing or self._selecting_screen:
             return
         if not self.config.get("gemini_api_key") and not self.ui.account_panel.client.token:
-            self.ui.lbl_status.setText("Додайте ключ Gemini у налаштуваннях.")
+            self.ui.lbl_status.setText("Увійдіть через Google, щоб користуватися EXAM AI Cloud.")
             return
         self._pending_screen_instruction = select_screen_instruction(
             self.ui.txt_question.toPlainText(), self._last_manual_instruction,
@@ -1757,6 +1757,8 @@ def main():
             if config.get("privacy_mode"):
                 controller.apply_privacy(True, persist=False)
             controller.ui.show()
+            if not smoke_test:
+                QTimer.singleShot(0, controller.ui.show_account_on_startup)
             controller._startup_audio_scan = BackgroundCall(AudioCapturer.get_available_devices)
             controller._startup_audio_scan.ready.connect(controller.ui.refresh_audio_devices)
             controller._startup_audio_scan.failed.connect(
