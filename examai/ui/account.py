@@ -36,10 +36,12 @@ class NetworkJob(QThread):
 
 
 class WelcomeDialog(SettingsWindow):
-    def __init__(self, account, parent):
-        super().__init__(parent)
+    def __init__(self, account, screen):
+        # A native dialog owned by a hidden HWND has no taskbar entry.
+        super().__init__()
         self.account = account
-        self.setWindowTitle("EXAM AI")
+        self.setWindowTitle("EXAM AI · Вхід")
+        self.setWindowFlag(Qt.WindowType.Window, True)
         self.setModal(True)
         self.set_caption_colors("#191824", "#eeeaf7", True)
         self.setFixedWidth(440)
@@ -81,6 +83,9 @@ class WelcomeDialog(SettingsWindow):
         self.name.textChanged.connect(self.update_controls)
         self.name.returnPressed.connect(self.google.click)
         self.update_controls()
+        self.adjustSize()
+        if screen:
+            self.move(screen.availableGeometry().center() - self.rect().center())
 
     def update_controls(self):
         busy = self.account.job is not None or self.account.timer.isActive()
@@ -118,6 +123,7 @@ class AccountPanel(QWidget):
         self.login_attempt = 0
         self.welcome = None
         self.startup_ready = None
+        self.startup_exit = None
         self.available_plans = {}
         self.device = config.get("account_device") or secrets.token_hex(16)
         try:
@@ -249,7 +255,7 @@ class AccountPanel(QWidget):
         if not self.client.url:
             return
         if self.welcome is None:
-            self.welcome = WelcomeDialog(self, parent)
+            self.welcome = WelcomeDialog(self, parent.screen())
             self.welcome.finished.connect(self.welcome_finished)
             try:
                 self.welcome.name.setText(reveal(self.config.get("account_name")))
@@ -261,11 +267,12 @@ class AccountPanel(QWidget):
 
     def welcome_finished(self, result):
         ready, self.startup_ready = self.startup_ready, None
+        close, self.startup_exit = self.startup_exit, None
         if ready is not None:
             if result == QDialog.DialogCode.Accepted:
                 ready()
             else:
-                self.welcome.parentWidget().close()
+                close()
 
     def remember_name(self, name):
         if name:
@@ -280,6 +287,7 @@ class AccountPanel(QWidget):
                 ready()
             return
         self.startup_ready = ready
+        self.startup_exit = parent.close if ready else None
         if not self.client.token:
             self.show_welcome(parent)
             return

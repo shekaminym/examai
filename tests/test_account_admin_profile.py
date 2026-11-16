@@ -51,9 +51,9 @@ def test_startup_opens_google_login_with_name_field(tmp_path):
     window = MainWindow(ConfigManager(tmp_path / "config.json"),
                         DatabaseManager(tmp_path / "notes.db"), startup_devices=[])
     window.account_panel.client.url = "http://127.0.0.1:8000"
-    window.show()
     window.show_account_on_startup()
     panel = window.account_panel
+    assert not window.isVisible()
     assert not window.settings_window.isVisible()
     assert panel.welcome.isVisible()
     assert not panel.welcome.google.isEnabled()
@@ -62,6 +62,7 @@ def test_startup_opens_google_login_with_name_field(tmp_path):
     panel.welcome.name.setText("Олена")
     assert panel.welcome.google.isEnabled()
     panel.welcome.close()
+    window.show()
     window.open_settings()
     settings = window.settings_scrolls["general"].widget()
     from PySide6.QtWidgets import QCheckBox
