@@ -41,7 +41,12 @@
           </select></label>
           <button>Знайти</button>
         </form>
-        <button id="qa-purge" class="danger" hidden>Видалити тестові записи @example.test</button>
+        <div id="user-selection" class="actions" hidden>
+          <button id="delete-users" class="danger" disabled>Видалити вибрані</button>
+          <button id="disable-users" disabled>Деактивувати вибрані</button>
+          <button id="enable-users" disabled>Відновити вибрані</button>
+          <span id="selection-count" aria-live="polite"></span>
+        </div>
         <div id="users"></div>
         <div id="user-pagination" class="actions" aria-label="Сторінки користувачів" hidden>
           <button type="button" id="previous-users">Назад</button>
@@ -79,7 +84,7 @@
       </section>
       <section data-page="activity" hidden>
         <form id="audit-form" class="toolbar" hidden>
-          <label>Очистити останні записи за
+          <label>Приховати останні записи за
             <select name="period">
               <option value="5m">5 хвилин</option><option value="10m">10 хвилин</option>
               <option value="30m">30 хвилин</option><option value="1h">1 годину</option>

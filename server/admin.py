@@ -3,6 +3,11 @@ import hashlib
 import hmac
 import re
 import secrets
+import os
+import sqlite3
+import tempfile
+from contextlib import closing
+from pathlib import Path
 from calendar import monthrange
 from datetime import datetime, timezone
 from typing import Literal
@@ -11,7 +16,7 @@ from uuid import UUID
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-from server.store import ADMIN_INVITATION_SECONDS, Denied, digest
+from server.store import ADMIN_INVITATION_SECONDS, SESSION_SECONDS, Denied, digest
 
 
 STATUSES = ("Received", "Reviewing", "Confirmed", "Fixed", "Closed")
@@ -96,6 +101,64 @@ class ReportUpdate(BaseModel):
     operation_id: UUID
 
 
+class Selection(BaseModel):
+    subjects: list[str] = Field(min_length=1, max_length=50)
+
+
+class AccountMaintenance(Selection, ConfirmedAction):
+    action: Literal["delete", "disable", "enable"]
+
+
+class DeviceMaintenance(ConfirmedAction):
+    action: Literal["unbind", "stale", "reset"]
+    session: str = Field(default="", max_length=64)
+
+
+VISIBLE_AUDIT = """NOT EXISTS (SELECT 1 FROM audit_hidden h WHERE h.id=l.id)
+    AND l.action NOT LIKE 'Cleared audit %'
+    AND l.action NOT LIKE 'Purged example.test QA data%'"""
+
+
+def identity_status(row):
+    if row["verified_email"]:
+        return "confirmed"
+    if row["email"]:
+        return "legacy_email"
+    return "missing_email" if row["sub"].isascii() and row["sub"].isdigit() else "legacy_record"
+
+
+def erase_account(store, tx, sub):
+    tx.execute("DELETE FROM report_attachment WHERE report_id IN (SELECT id FROM report WHERE sub=?)", (sub,))
+    tx.execute("DELETE FROM report_assignment WHERE report_id IN (SELECT id FROM report WHERE sub=?) OR sub=?",
+               (sub, sub))
+    tx.execute("DELETE FROM invite_expiry WHERE code IN (SELECT code FROM invite WHERE sub=?)", (sub,))
+    tx.execute("DELETE FROM invite WHERE sub=?", (sub,))
+    email = tx.execute("SELECT email FROM google_identity WHERE sub=?", (sub,)).fetchone()
+    if email:
+        tx.execute("DELETE FROM pending_admin WHERE email=?", (email["email"],))
+        tx.execute("DELETE FROM beta_invitation WHERE email=? AND sub IS NULL", (email["email"],))
+    for table in ("beta_invitation", "report", "usage", "suspended_access", "staff",
+                  "google_identity", "account_activity", "display_name", "profile", "account"):
+        tx.execute(f"DELETE FROM {table} WHERE sub=?", (sub,))
+    store.revoke_sessions(tx, sub)
+
+
+def backup_for_deletion(store):
+    path = Path(store.path)
+    directory = path.resolve().parent / "deletion-backups"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="before-deletion-", suffix=".sqlite", dir=directory)
+    os.close(fd)
+    try:
+        with closing(sqlite3.connect(path)) as original, closing(sqlite3.connect(name)) as backup:
+            original.backup(backup)
+            if backup.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError("Deletion backup integrity check failed")
+    except (sqlite3.Error, OSError):
+        Path(name).unlink(missing_ok=True)
+        raise
+
+
 def normalize_email(value):
     email = value.strip().lower()
     if not re.fullmatch(r"[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+", email):
@@ -161,7 +224,7 @@ def change_license(store, tx, sub, action, amount):
         tx.execute("DELETE FROM suspended_access WHERE sub=?", (sub,))
     elif action == "revoke":
         tx.execute("UPDATE account SET state=CASE WHEN state='SUSPENDED' THEN state ELSE 'EXPIRED' END,"
-                   "remaining=0,until=NULL WHERE sub=?", (sub,))
+                   "remaining=0,until=? WHERE sub=?", (now, sub))
         tx.execute("UPDATE suspended_access SET state='EXPIRED' WHERE sub=?", (sub,))
         tx.execute("DELETE FROM lease WHERE sub=?", (sub,))
     else:
@@ -217,19 +280,20 @@ def mount_admin(app, store, bearer, admin_subject):
             if any(store.role(tx, sub) == "Owner" for sub in subs):
                 raise HTTPException(409, "A test account has owner access")
             invitations = 0
+            if subs or tx.execute("SELECT 1 FROM beta_invitation WHERE lower(email) LIKE '%@example.test'").fetchone():
+                backup_for_deletion(store)
             for sub in subs:
+                store.revoke_sessions(tx, sub)
                 tx.execute("DELETE FROM report_attachment WHERE report_id IN "
                            "(SELECT id FROM report WHERE sub=?)", (sub,))
                 tx.execute("DELETE FROM report_assignment WHERE report_id IN "
                            "(SELECT id FROM report WHERE sub=?) OR sub=?", (sub, sub))
-                tx.execute("DELETE FROM audit WHERE actor=? OR subject=?", (sub, sub))
                 invitations += tx.execute("DELETE FROM beta_invitation WHERE sub=?", (sub,)).rowcount
                 for table in ("report", "usage", "session", "lease", "oauth", "invite",
                               "suspended_access", "staff", "google_identity", "account_activity",
                               "display_name", "profile", "account"):
                     tx.execute(f"DELETE FROM {table} WHERE sub=?", (sub,))
                 tx.execute("DELETE FROM admin_operation WHERE actor=?", (sub,))
-            tx.execute("DELETE FROM audit WHERE lower(subject) LIKE '%@example.test'")
             tx.execute("DELETE FROM admin_operation WHERE lower(payload) LIKE '%@example.test%'")
             invitations += tx.execute("DELETE FROM beta_invitation WHERE lower(email) LIKE '%@example.test'").rowcount
             tx.execute("DELETE FROM pending_admin WHERE lower(email) LIKE '%@example.test'")
@@ -242,9 +306,8 @@ def mount_admin(app, store, bearer, admin_subject):
             actor = owner(tx, token)
             now = store.now()
             count = tx.execute(
-                "DELETE FROM audit WHERE created>=? AND created<=? "
-                "AND action NOT LIKE 'Cleared audit %' "
-                "AND action NOT LIKE 'Purged example.test QA data%'",
+                f"""INSERT INTO audit_hidden(id) SELECT l.id FROM audit l
+                    WHERE l.created BETWEEN ? AND ? AND {VISIBLE_AUDIT}""",
                 (audit_cutoff(now, body.period), now),
             ).rowcount
             store.audit(tx, actor, actor, f"Cleared audit {body.period}: {count} entries")
@@ -257,9 +320,7 @@ def mount_admin(app, store, bearer, admin_subject):
             owner(tx, token)
             now = store.now()
             count = tx.execute(
-                "SELECT count(*) FROM audit WHERE created>=? AND created<=? "
-                "AND action NOT LIKE 'Cleared audit %' "
-                "AND action NOT LIKE 'Purged example.test QA data%'",
+                f"SELECT count(*) FROM audit l WHERE l.created BETWEEN ? AND ? AND {VISIBLE_AUDIT}",
                 (audit_cutoff(now, period), now),
             ).fetchone()[0]
             return {"count": count}
@@ -274,7 +335,9 @@ def mount_admin(app, store, bearer, admin_subject):
             search = filters.search.strip().casefold()
             joins = """FROM account a
                        LEFT JOIN profile p USING(sub)
-                       LEFT JOIN display_name n USING(sub)"""
+                       LEFT JOIN display_name n USING(sub)
+                       LEFT JOIN google_identity g USING(sub)
+                       LEFT JOIN disabled_account d USING(sub)"""
             matches = """WHERE instr(casefold(coalesce(p.email,'')),?)>0
                             OR instr(casefold(coalesce(n.name,'')),?)>0"""
             count = tx.execute(f"SELECT count(*) {joins} {matches}", (search, search)).fetchone()[0]
@@ -286,7 +349,7 @@ def mount_admin(app, store, bearer, admin_subject):
             direction = "DESC" if filters.descending else "ASC"
             users = []
             for row in tx.execute(
-                f"""SELECT a.sub,p.email,n.name,s.role,x.seen,coalesce(u.requests,0) AS requests
+                f"""SELECT a.sub,p.email,n.name,g.email AS verified_email,d.sub IS NOT NULL AS disabled,s.role,x.seen,coalesce(u.requests,0) AS requests
                     {joins} LEFT JOIN staff s USING(sub)
                     LEFT JOIN account_activity x USING(sub) LEFT JOIN usage u ON u.sub=a.sub AND u.day=?
                     {matches} ORDER BY {sort} {direction}, a.sub LIMIT ? OFFSET ?""",
@@ -299,7 +362,8 @@ def mount_admin(app, store, bearer, admin_subject):
                 if state != "ACTIVE":
                     license_type = "Minutes" if account["seconds"] else "None"
                 users.append(dict(subject=row["sub"], email=row["email"], name=row["name"], role=row["role"] or "User", last_active=row["seen"],
-                                  requests=row["requests"], license=license_type, **account))
+                                  requests=row["requests"], license=license_type, identity=identity_status(row),
+                                  disabled=bool(row["disabled"]), **account))
             invites = [dict(row, status=invitation_status(row, now)) for row in tx.execute(
                 "SELECT id,email,kind,amount,created,expires,activated,revoked FROM beta_invitation "
                 "ORDER BY created DESC LIMIT 100")]
@@ -317,10 +381,10 @@ def mount_admin(app, store, bearer, admin_subject):
                    ORDER BY r.created DESC LIMIT 100""",
                 (filters.status, filters.status, filters.report_email, filters.report_email))]
             audit = [dict(row) for row in tx.execute(
-                """SELECT l.action,l.created,p.email AS actor,t.email AS target,
+                f"""SELECT l.action,l.created,p.email AS actor,t.email AS target,
                           CASE WHEN instr(l.subject,'@')>0 THEN l.subject END AS pending_email
                    FROM audit l LEFT JOIN profile p ON p.sub=l.actor
-                   LEFT JOIN profile t ON t.sub=l.subject ORDER BY l.id DESC LIMIT 100""")]
+                   LEFT JOIN profile t ON t.sub=l.subject WHERE {VISIBLE_AUDIT} ORDER BY l.id DESC LIMIT 100""")]
             summary = dict(tx.execute(
                 """SELECT (SELECT count(*) FROM account) AS users,
                           (SELECT count(*) FROM beta_invitation WHERE activated IS NULL AND revoked IS NULL
@@ -331,6 +395,103 @@ def mount_admin(app, store, bearer, admin_subject):
             return dict(role=store.role(tx, actor), summary=summary, users=users, invitations=invites,
                         staff=staff, reports=reports, audit=audit,
                         user_pagination=dict(page=page, pages=pages, total=count))
+
+    def selection(tx, subjects):
+        rows = []
+        for sub in dict.fromkeys(subjects):
+            row = tx.execute(
+                """SELECT a.sub,p.email,n.name,s.role
+                     FROM account a LEFT JOIN profile p USING(sub)
+                     LEFT JOIN display_name n USING(sub) LEFT JOIN staff s USING(sub)
+                     WHERE a.sub=?""", (sub,)).fetchone()
+            if not row:
+                raise HTTPException(404, "Account not found")
+            if row["role"] == "Owner":
+                raise HTTPException(403, "Owner accounts are protected")
+            counts = dict(tx.execute(
+                """SELECT (SELECT count(*) FROM report WHERE sub=?) AS reports,
+                          (SELECT count(*) FROM session WHERE sub=? AND until>?) AS sessions,
+                          ((SELECT count(*) FROM beta_invitation WHERE sub=? OR
+                            (email=(SELECT email FROM google_identity WHERE sub=?) AND sub IS NULL)) +
+                           (SELECT count(*) FROM invite WHERE sub=?)) AS invitations""",
+                (sub, sub, store.now(), sub, sub, sub)).fetchone())
+            rows.append(dict(row, **counts))
+        return rows
+
+    @app.post("/admin/v2/users/balances")
+    def balances(body: Selection, token=Depends(bearer)):
+        with store.transaction() as tx:
+            admin_subject(tx, token)
+            return {sub: store.access(tx, sub) for sub in dict.fromkeys(body.subjects)
+                    if tx.execute("SELECT 1 FROM account WHERE sub=?", (sub,)).fetchone()}
+
+    @app.post("/admin/v2/users/preview")
+    def preview_accounts(body: Selection, token=Depends(bearer)):
+        with store.transaction() as tx:
+            owner(tx, token)
+            return {"accounts": selection(tx, body.subjects)}
+
+    @app.post("/admin/v2/users/maintenance")
+    def maintain_accounts(body: AccountMaintenance, token=Depends(bearer)):
+        with store.transaction() as tx:
+            actor = owner(tx, token)
+            rows = selection(tx, body.subjects)
+            if body.action == "delete":
+                try:
+                    backup_for_deletion(store)
+                except (sqlite3.Error, OSError) as exc:
+                    raise HTTPException(503, "Could not back up accounts") from exc
+            for row in rows:
+                sub = row["sub"]
+                if body.action == "enable":
+                    tx.execute("DELETE FROM disabled_account WHERE sub=?", (sub,))
+                else:
+                    tx.execute("INSERT OR IGNORE INTO disabled_account VALUES(?)", (sub,))
+                    if body.action == "delete":
+                        erase_account(store, tx, sub)
+                    else:
+                        sessions = tx.execute("SELECT token FROM session WHERE sub=?", (sub,)).fetchall()
+                        for session in sessions:
+                            store.end_device(tx, sub, session["token"])
+                        store.revoke_sessions(tx, sub)
+                store.audit(tx, actor, sub, f"Account maintenance: {body.action}")
+            return {"count": len(rows)}
+
+    def devices(tx, sub):
+        if not tx.execute("SELECT 1 FROM account WHERE sub=?", (sub,)).fetchone():
+            raise HTTPException(404, "Account not found")
+        return tx.execute(
+            """SELECT s.token, coalesce(d.seen,s.until-?) AS seen,
+                      (l.token IS NOT NULL) AS active FROM session s
+                      LEFT JOIN desktop_seen d USING(token)
+                      LEFT JOIN lease l ON l.token=s.token AND l.until>?
+                      WHERE s.sub=? AND s.until>? ORDER BY seen DESC""",
+            (SESSION_SECONDS, store.now(), sub, store.now())).fetchall()
+
+    @app.get("/admin/v2/devices/{sub}")
+    def list_devices(sub: str, token=Depends(bearer)):
+        with store.transaction() as tx:
+            owner(tx, token)
+            return {"devices": [dict(id=digest(row["token"]), seen=row["seen"], active=bool(row["active"]))
+                                for row in devices(tx, sub)]}
+
+    @app.post("/admin/v2/devices/{sub}")
+    def maintain_devices(sub: str, body: DeviceMaintenance, token=Depends(bearer)):
+        with store.transaction() as tx:
+            actor = owner(tx, token)
+            rows = devices(tx, sub)
+            if body.action == "unbind":
+                selected = [row for row in rows if digest(row["token"]) == body.session]
+                if not selected:
+                    raise HTTPException(404, "Device no longer registered")
+            elif body.action == "stale":
+                selected = [row for row in rows if not row["active"] and row["seen"] < store.now() - 600]
+            else:
+                selected = rows
+            for row in selected:
+                store.end_device(tx, sub, row["token"])
+            store.audit(tx, actor, sub, f"Device maintenance: {body.action} ({len(selected)})")
+            return {"count": len(selected)}
 
     @app.post("/admin/v2/staff")
     def add_admin(body: Email, token=Depends(bearer)):

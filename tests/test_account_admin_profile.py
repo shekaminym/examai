@@ -131,7 +131,7 @@ def test_owner_purge_removes_only_test_accounts_and_related_data(tmp_path, monke
     with store.transaction() as tx:
         assert tx.execute("SELECT count(*) FROM report_attachment").fetchone()[0] == 0
         assert tx.execute("SELECT count(*) FROM beta_invitation").fetchone()[0] == 0
-        assert tx.execute("SELECT count(*) FROM audit WHERE subject='qa'").fetchone()[0] == 0
+        assert tx.execute("SELECT count(*) FROM audit WHERE subject='qa'").fetchone()[0] == 1
         assert tx.execute("SELECT count(*) FROM audit WHERE subject='real'").fetchone()[0] == 1
         assert tx.execute("SELECT count(*) FROM profile WHERE sub='qa'").fetchone()[0] == 0
 
@@ -165,7 +165,10 @@ def test_audit_clear_uses_selected_window_and_preserves_cleanup_history(tmp_path
     assert client.post("/admin/v2/audit/clear", headers=headers["owner"], json=body).json() == {"deleted": 1}
     with store.transaction() as tx:
         actions = [row[0] for row in tx.execute("SELECT action FROM audit ORDER BY id")]
-    assert "old" in actions and "recent" not in actions
+    assert "old" in actions and "recent" in actions
+    assert client.post("/admin/v2/audit/clear", headers=headers["owner"], json=body).json() == {"deleted": 0}
+    visible = client.post("/admin/v2/overview", headers=headers["owner"], json={}).json()["audit"]
+    assert [entry["action"] for entry in visible] == ["old"]
     assert any(action.startswith("Purged example.test") for action in actions)
     assert any(action.startswith("Cleared audit 5m") for action in actions)
 
@@ -175,3 +178,111 @@ def test_month_and_year_windows_follow_calendar_dates():
     leap = datetime(2024, 2, 29, 12, tzinfo=timezone.utc).timestamp()
     assert audit_cutoff(march, "1mo") == datetime(2026, 2, 28, 12, tzinfo=timezone.utc).timestamp()
     assert audit_cutoff(leap, "1y") == datetime(2023, 2, 28, 12, tzinfo=timezone.utc).timestamp()
+
+
+def test_admin_cookie_survives_reload_and_requires_origin_for_writes(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server.store import digest
+
+    origin = "https://examai.example"
+    monkeypatch.setenv("EXAMAI_PUBLIC_URL", origin)
+    client, store, headers = prepared(tmp_path, monkeypatch)
+    with store.transaction() as tx:
+        store.issue(tx, "owner", "second-desktop")
+        tx.execute("INSERT INTO oauth VALUES(?,?,?,?,?,?,?)",
+                   ("callback", "", "nonce", digest("q" * 32), "admin-cookie:", store.now() + 60, "owner"))
+    browser = TestClient(client.app, base_url=origin)
+    csrf = {"Origin": origin, "X-ExamAI-Request": "admin"}
+    assert browser.post("/oauth/claim", json={"claim": "q" * 32}).status_code == 410
+    cookie = browser.post("/admin/session/claim", headers=csrf, json={"claim": "q" * 32})
+    assert cookie.status_code == 200 and cookie.json() == {"ok": True}
+    assert all(flag in cookie.headers["set-cookie"].lower() for flag in
+               ("httponly", "secure", "samesite=strict", "max-age=", "path=/"))
+    assert browser.get("/admin#users").status_code == 200
+    assert browser.get("/admin/session").json()["role"] == "Owner"
+    assert browser.post("/admin/v2/overview", json={}).status_code == 403
+    assert browser.post("/admin/v2/overview", headers=csrf, json={}).status_code == 200
+    assert browser.post("/admin/v2/audit/clear", headers=csrf | {"Origin": "https://other.example"},
+                        json={"period": "1d", "confirmed": True}).status_code == 403
+    assert browser.get("/account").status_code == 401
+    with store.transaction() as tx:
+        assert tx.execute("SELECT count(*) FROM session WHERE sub='owner'").fetchone()[0] == 2
+    assert browser.post("/admin/session/logout", headers=csrf).status_code == 200
+    assert browser.get("/admin/session").status_code == 401
+    assert client.get("/account", headers=headers["owner"]).status_code == 200
+
+
+def test_desktop_recovery_keeps_active_other_device_and_reuses_existing_id(tmp_path):
+    import pytest
+    from server.store import Denied, digest
+
+    store = Store(tmp_path / "devices.sqlite")
+    with store.transaction() as tx:
+        first = store.issue(tx, "person", "first-device")
+        oldest_idle = store.issue(tx, "person", "second-device")
+        tx.execute("UPDATE account SET state='BETA',remaining=300 WHERE sub='person'")
+        assert store.access(tx, "person", token=digest(first), lease_action="start")["granted"]
+    with pytest.raises(Denied, match="Device limit"):
+        with store.transaction() as tx:
+            store.issue(tx, "person", "third-device")
+    with store.transaction() as tx:
+        replacement = store.issue(tx, "person", "third-device", replace=True)
+        assert store.authenticate(tx, first) == "person"
+        with pytest.raises(Denied):
+            store.authenticate(tx, oldest_idle)
+        assert not store.access(tx, "person", token=digest(replacement), lease_action="start")["granted"]
+        assert store.issue(tx, "person", "third-device") != replacement
+        assert tx.execute("SELECT count(*) FROM session WHERE sub='person'").fetchone()[0] == 2
+
+
+def test_selected_deletion_backs_up_and_blocks_recreating_account(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import closing
+
+    client, store, headers = prepared(tmp_path, monkeypatch)
+    path = "/admin/v2/users/maintenance"
+    body = {"subjects": ["qa"], "action": "delete", "confirmed": True}
+    assert client.post(path, headers=headers["real"], json=body).status_code == 403
+    assert client.post(path, headers=headers["owner"], json=body | {"subjects": ["owner"]}).status_code == 403
+    assert client.post(path, headers=headers["owner"], json=body | {"action": "disable"}).status_code == 200
+    assert client.get("/account", headers=headers["qa"]).status_code == 401
+    assert client.post(path, headers=headers["owner"], json=body).json() == {"count": 1}
+    backup = next((tmp_path / "deletion-backups").glob("*.sqlite"))
+    with closing(sqlite3.connect(backup)) as original:
+        assert original.execute("SELECT count(*) FROM account WHERE sub='qa'").fetchone()[0] == 1
+    with store.transaction() as tx:
+        assert tx.execute("SELECT count(*) FROM account WHERE sub='qa'").fetchone()[0] == 0
+        assert tx.execute("SELECT count(*) FROM disabled_account WHERE sub='qa'").fetchone()[0] == 1
+        assert tx.execute("SELECT count(*) FROM audit WHERE subject='qa'").fetchone()[0] == 2
+
+
+def test_windows_switch_scopes_notes_history_and_keys(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from examai.app import MainController
+    from examai.config import ConfigManager
+    from examai.database import DatabaseManager
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("examai.app.keyboard.add_hotkey", lambda *_: None)
+    config = ConfigManager(tmp_path / "config.json")
+    database = DatabaseManager(tmp_path / "legacy.sqlite")
+    controller = MainController(app, config=config, database=database, startup_devices=[])
+    panel = controller.ui.account_panel
+    config.set("gemini_api_key", "legacy key")
+    controller.ui.input_manual_question.setText("legacy draft")
+    panel.activate_profile({"state": "EXPIRED", "seconds": 0, "until": None, "profile_id": "first"})
+    first = controller.db.db_path
+    assert not controller.ui.input_manual_question.text()
+    assert not config.get("gemini_api_key")
+    config.set("gemini_api_key", "first key")
+    controller.db.save_qa("private question", "private answer", "test", session="test", account=panel.profile_id)
+    panel.activate_profile({"state": "EXPIRED", "seconds": 0, "until": None, "profile_id": "second"})
+    assert controller.db.db_path != first
+    assert not config.get("gemini_api_key")
+    assert not controller._answer_history
+    panel.activate_profile({"state": "EXPIRED", "seconds": 0, "until": None, "profile_id": "first"})
+    assert controller.db.db_path == first
+    assert controller._answer_history[0][1:] == ("private question", "private answer")
+    panel.balance_timer.stop()
+    app.aboutToQuit.disconnect(controller.shutdown)
+    controller.shutdown()

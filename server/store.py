@@ -9,6 +9,7 @@ BETA_SECONDS = 1800
 ADMIN_INVITATION_SECONDS = 7 * 86400
 LEASE_SECONDS = 15
 SESSION_SECONDS = 12 * 3600
+ADMIN_SESSION_SECONDS = 7 * 86400
 REQUESTS_PER_DAY = 30
 CLOUD_UNITS_PER_DAY = 60
 SCHEMA = """
@@ -48,6 +49,12 @@ CREATE TABLE IF NOT EXISTS google_identity (sub TEXT PRIMARY KEY, email TEXT NOT
 CREATE INDEX IF NOT EXISTS google_identity_email ON google_identity(email);
 CREATE TABLE IF NOT EXISTS account_activity (sub TEXT PRIMARY KEY, seen REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS report_assignment (report_id INTEGER PRIMARY KEY, sub TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admin_session (token TEXT PRIMARY KEY, sub TEXT NOT NULL, until REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS desktop_seen (token TEXT PRIMARY KEY, seen REAL NOT NULL);
+CREATE TRIGGER IF NOT EXISTS desktop_session_removed AFTER DELETE ON session
+BEGIN DELETE FROM desktop_seen WHERE token=OLD.token; END;
+CREATE TABLE IF NOT EXISTS audit_hidden (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS disabled_account (sub TEXT PRIMARY KEY);
 """
 
 
@@ -74,16 +81,59 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             yield db
 
-    def issue(self, db, sub, device):
+    def issue(self, db, sub, device, *, replace=False):
         now = self.now()
+        self.check_enabled(db, sub)
         db.execute("INSERT OR IGNORE INTO account(sub) VALUES(?)", (sub,))
-        db.execute("DELETE FROM session WHERE until <= ? OR (sub=? AND device=?)", (now, sub, device))
+        db.execute("DELETE FROM session WHERE until<=?", (now,))
+        current = db.execute("SELECT token FROM session WHERE sub=? AND device=?", (sub, device)).fetchone()
+        if current:
+            self.end_device(db, sub, current["token"])
         if db.execute("SELECT count(*) FROM session WHERE sub=?", (sub,)).fetchone()[0] >= 2:
-            raise Denied("Device limit reached")
+            if not replace:
+                raise Denied("Device limit reached")
+            oldest = db.execute(
+                """SELECT s.token FROM session s LEFT JOIN desktop_seen d USING(token)
+                   WHERE s.sub=? AND NOT EXISTS
+                   (SELECT 1 FROM lease WHERE token=s.token AND until>?)
+                   ORDER BY coalesce(d.seen,s.until-?), s.token LIMIT 1""",
+                (sub, now, SESSION_SECONDS)).fetchone()
+            if oldest is None:
+                raise Denied("All devices busy")
+            self.end_device(db, sub, oldest["token"])
+            self.audit(db, sub, sub, "Replaced inactive desktop session")
         token = secrets.token_urlsafe(32)
-        db.execute("INSERT INTO session VALUES(?,?,?,?)", (digest(token), sub, device, now + SESSION_SECONDS))
+        key = digest(token)
+        db.execute("INSERT INTO session VALUES(?,?,?,?)", (key, sub, device, now + SESSION_SECONDS))
+        db.execute("INSERT INTO desktop_seen VALUES(?,?)", (key, now))
         self.touch(db, sub)
         return token
+
+    @staticmethod
+    def check_enabled(db, sub):
+        if db.execute("SELECT 1 FROM disabled_account WHERE sub=?", (sub,)).fetchone():
+            raise Denied("Account disabled")
+
+    def end_device(self, db, sub, token):
+        self.access(db, sub, token=token, lease_action="stop")
+        db.execute("DELETE FROM session WHERE sub=? AND token=?", (sub, token))
+
+    def issue_admin(self, db, sub, previous=""):
+        self.check_enabled(db, sub)
+        db.execute("DELETE FROM admin_session WHERE until<=? OR (sub=? AND token=?)",
+                   (self.now(), sub, digest(previous)))
+        token = secrets.token_urlsafe(32)
+        db.execute("INSERT INTO admin_session VALUES(?,?,?)",
+                   (digest(token), sub, self.now() + ADMIN_SESSION_SECONDS))
+        return token
+
+    def authenticate_admin(self, db, token):
+        row = db.execute("SELECT sub FROM admin_session WHERE token=? AND until>?",
+                         (digest(token), self.now())).fetchone()
+        if row is None:
+            raise Denied("Session expired")
+        self.check_enabled(db, row["sub"])
+        return row["sub"]
 
     def bootstrap_roles(self, subjects):
         if not subjects:
@@ -119,6 +169,7 @@ class Store:
 
     @staticmethod
     def revoke_sessions(db, sub):
+        db.execute("DELETE FROM admin_session WHERE sub=?", (sub,))
         db.execute("DELETE FROM session WHERE sub=?", (sub,))
         db.execute("DELETE FROM lease WHERE sub=?", (sub,))
         db.execute("DELETE FROM oauth WHERE sub=?", (sub,))
@@ -150,6 +201,7 @@ class Store:
         if pending and self.role(db, pending["actor"]) == "Owner":
             if db.execute("INSERT OR IGNORE INTO staff VALUES(?,'Admin')", (sub,)).rowcount:
                 # Keep the verified OAuth claim currently completing. Old bearer sessions lose access.
+                db.execute("DELETE FROM admin_session WHERE sub=?", (sub,))
                 db.execute("DELETE FROM session WHERE sub=?", (sub,))
                 db.execute("DELETE FROM lease WHERE sub=?", (sub,))
                 db.execute("DELETE FROM oauth WHERE sub=? AND state<>?", (sub, state))
@@ -161,6 +213,10 @@ class Store:
                          (digest(token), self.now())).fetchone()
         if row is None:
             raise Denied("Session expired")
+        self.check_enabled(db, row["sub"])
+        db.execute("""INSERT INTO desktop_seen VALUES(?,?) ON CONFLICT(token) DO UPDATE
+                     SET seen=excluded.seen WHERE excluded.seen-desktop_seen.seen>=30""",
+                   (digest(token), self.now()))
         return row["sub"]
 
     def redeem(self, db, sub, token):
@@ -233,7 +289,8 @@ class Store:
                            (sub, day, requests + 1, previous + units))
         return {"state": state if allowed or state == "SUSPENDED" else "EXPIRED",
                 "seconds": int(account["remaining"]), "until": account["until"],
-                "granted": granted, "busy": occupied}
+                "granted": granted, "busy": occupied,
+                "invited": bool(account["invited"])}
 
     def audit(self, db, actor, subject, action):
         db.execute("INSERT INTO audit(actor,subject,action,created) VALUES(?,?,?,?)",

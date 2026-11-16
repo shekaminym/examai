@@ -653,6 +653,11 @@ class MainWindow(QMainWindow):
         
         self.audio_visualizer = AudioVisualizer()
         status_bar.addWidget(self.lbl_status, 1)
+        self.lbl_balance = QLabel()
+        self.lbl_balance.setObjectName("HeaderLabel")
+        self.lbl_balance.hide()
+        status_bar.addWidget(self.lbl_balance)
+        self.account_panel.balance_changed.connect(self.update_license_balance)
         status_bar.addWidget(self.audio_visualizer, alignment=Qt.AlignmentFlag.AlignVCenter)
         main_layout.addWidget(self.footer_widget)
 
@@ -1303,6 +1308,7 @@ class MainWindow(QMainWindow):
 
     def reset_settings_form(self):
         self.input_gemini_key.setText(self.config_mgr.get("gemini_api_key", ""))
+        self.remember_gemini_key.setChecked(bool(self.config_mgr.get("protected_gemini_key")))
         self.combo_gemini.setCurrentText(self.config_mgr.get("gemini_model"))
         self.save_history.setChecked(self.config_mgr.get("save_answer_history"))
         self.settings_auto_send.setChecked(self.auto_send.isChecked())
@@ -1796,8 +1802,14 @@ class MainWindow(QMainWindow):
         self.txt_answer.setFont(QFont("Segoe UI", 11))
         self.txt_question.setFont(QFont("Segoe UI", 11))
 
+    def update_license_balance(self, text):
+        self.lbl_balance.setText(text)
+        self.lbl_balance.setVisible(bool(text))
+        self.set_compact_status(self.lbl_status.text())
+
     def set_compact_status(self, text):
-        self.compact_status.setToolTip(text)
+        balance = getattr(self, "lbl_balance", None)
+        self.compact_status.setToolTip(" · ".join(filter(None, (balance.text() if balance else "", text))))
         self.refresh_compact_status()
 
     def refresh_compact_status(self):
