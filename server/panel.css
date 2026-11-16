@@ -1,0 +1,60 @@
+:root{color-scheme:dark;--bg:#121218;--panel:#1b1a24;--line:#343242;--text:#f6f4ff;--muted:#b9b3c9;--accent:#b5a0ff;--active:#30274b;--danger:#ffadb8}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 Geist,Inter,system-ui,sans-serif}
+button,input,select{font:inherit;color:inherit;border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:.58rem .8rem;min-height:42px}
+button{cursor:pointer;font-weight:600;white-space:nowrap}
+button:hover:not(:disabled){border-color:var(--accent);background:var(--active)}
+button:disabled{opacity:.6;cursor:wait}
+button.primary{color:#19142b;background:#b5a0ff;border-color:#b5a0ff}
+button.primary:hover:not(:disabled){color:#19142b;background:#c6b6ff}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+a{color:var(--accent)}
+h1,h2,p{margin:0}
+h1{font-size:clamp(1.55rem,3vw,2.1rem);letter-spacing:-.035em}
+h2{font-size:1.25rem}
+small,p{color:var(--muted)}
+.brand{display:flex;align-items:center;gap:.65rem;font-size:.95rem;font-weight:800;letter-spacing:.08em}
+.brand span{display:grid;place-items:center;width:32px;height:32px;border:1px solid #62509e;border-radius:8px;color:var(--accent);background:var(--active);font-size:1.4rem}
+.login{max-width:430px;margin:14vh auto 0;padding:2rem;border:1px solid var(--line);border-radius:20px;background:var(--panel)}
+.login h1{margin-top:1.5rem}.login button{margin-top:1.25rem}.login p:last-child{margin-top:.65rem}
+.app{display:grid;grid-template-columns:218px minmax(0,1fr);min-height:100vh}
+aside{display:flex;flex-direction:column;gap:2rem;padding:1.4rem;border-right:1px solid var(--line);background:#171620}
+nav{display:grid;gap:.3rem}nav button{text-align:left;border-color:transparent;background:transparent;color:var(--muted)}
+nav button[aria-current=page]{background:var(--active);color:var(--text);border-color:#655398}
+aside #sign-out{margin-top:auto;text-align:left}
+.workspace{padding:clamp(1rem,4vw,3.25rem);width:100%;max-width:1540px}
+header,.toolbar,footer,.actions{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}
+header{justify-content:space-between;margin-bottom:1.5rem}
+.role,.tag{display:inline-block;padding:.18rem .58rem;border-radius:30px;background:var(--active);color:#ddd1ff;font-size:.83rem;white-space:nowrap}
+.toolbar{gap:.85rem;align-items:end;margin-bottom:1.25rem}
+label{display:grid;gap:.32rem;color:var(--muted);font-size:.87rem;max-width:100%}
+label input,label select{color:var(--text);font-size:.95rem;width:100%}
+.toolbar input[type=email],.toolbar input[type=search]{min-width:min(230px,60vw)}
+.toolbar input[type=number]{width:9rem}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem}
+.metric,.empty,.report{background:var(--panel);border:1px solid var(--line);padding:1rem;border-radius:12px}
+.metric strong{display:block;font-size:2rem;letter-spacing:-.05em}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+table{width:100%;border-collapse:collapse;text-align:left}
+td,th{padding:.7rem .8rem;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--muted);font-size:.82rem;white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+td:first-child{overflow-wrap:anywhere;min-width:145px}
+td button,.report button{min-height:34px;font-size:.84rem;padding:.32rem .58rem}
+#notice{border:1px solid #645098;background:var(--active);color:var(--text);padding:.65rem 1rem;border-radius:8px;margin-bottom:1rem}
+#notice[data-error=true]{color:var(--danger);border-color:#ad6773}
+.report{margin-bottom:.75rem}.report p{white-space:pre-wrap;overflow-wrap:anywhere;margin:.7rem 0}
+dialog{color:var(--text);background:var(--panel);width:min(480px,calc(100vw - 2rem));border:1px solid #625480;border-radius:16px;padding:1.3rem}
+dialog::backdrop{background:#0b0a10bf}
+dialog #dialog-content{display:grid;gap:.75rem;margin:1rem 0;overflow-wrap:anywhere}
+dialog footer{justify-content:flex-end}
+dialog img{max-width:100%;max-height:55vh;object-fit:contain}
+@media(max-width:760px){
+.app{display:block}
+aside{padding:.75rem 1rem;gap:.7rem;border-right:0;border-bottom:1px solid var(--line)}
+nav{display:flex;overflow:auto}
+nav button{min-height:36px}
+aside #sign-out{margin:0;position:absolute;right:1rem;top:.48rem;min-height:36px}
+.login{margin:10vh 1rem 0}
+}

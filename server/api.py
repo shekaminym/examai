@@ -6,6 +6,8 @@ import logging
 import os
 import secrets
 from functools import partial
+from io import BytesIO
+from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 from threading import Event, Lock, Thread
 from uuid import UUID
@@ -16,9 +18,11 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.id_token import verify_oauth2_token
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from examai.ai.llm_engine import GenerationError, LLMEngine
+from server.admin import STATUSES, change_license, guard_target, mount_admin, record_operation
 from server.cloud_budget import CloudBudget
 from server.payments import mount as mount_payments
 from server.store import Denied, Store, digest
@@ -26,7 +30,6 @@ from server.store import Denied, Store, digest
 
 PLANS = tuple(dict(id=str(months), months=months, price_uah=price)
               for months, price in ((1, 149), (3, 399), (6, 699), (12, 1299)))
-STATUSES = {"Received", "Reviewing", "Confirmed", "Fixed", "Closed"}
 log = logging.getLogger("uvicorn.error")
 
 
@@ -69,7 +72,8 @@ class AdminAction(BaseModel):
 def create_app(path=None):
     app = FastAPI(title="EXAM AI Closed Beta")
     db = Store(path or os.getenv("EXAMAI_SERVER_DB", "examai-server.db"))
-    admins = set(filter(None, os.getenv("EXAMAI_ADMIN_SUBJECTS", "").split(",")))
+    configured_staff = dict.fromkeys(filter(None, map(str.strip, os.getenv("EXAMAI_ADMIN_SUBJECTS", "").split(","))))
+    db.bootstrap_roles(configured_staff)
     client_id = os.getenv("EXAMAI_GOOGLE_CLIENT_ID", "")
     client_secret = os.getenv("EXAMAI_GOOGLE_CLIENT_SECRET", "")
     base = os.getenv("EXAMAI_PUBLIC_URL", "").rstrip("/")
@@ -92,9 +96,18 @@ def create_app(path=None):
 
     def admin_subject(tx, token):
         sub = subject(tx, token)
-        if sub not in admins:
+        if db.role(tx, sub) == "User":
             raise HTTPException(403, "Administrator required")
         return sub
+
+    mount_admin(app, db, bearer, admin_subject)
+
+    @app.middleware("http")
+    async def prevent_admin_caching(request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith(("/admin", "/oauth/")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.post("/oauth/start")
     def oauth_start(body: Device):
@@ -140,10 +153,10 @@ def create_app(path=None):
                                  (claims["sub"], state, db.now())).rowcount
             if not changed:
                 raise HTTPException(410, "Login expired")
-            if claims.get("email_verified") is True and isinstance(claims.get("email"), str):
-                tx.execute("INSERT OR REPLACE INTO profile VALUES(?,?)",
-                           (claims["sub"], claims["email"]))
-        return "EXAM AI: sign-in confirmed. Return to the desktop app."
+            db.observe_google(tx, claims, state)
+        return HTMLResponse("EXAM AI: sign-in confirmed. Return to the application.", headers={
+            "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+        })
 
     @app.post("/oauth/claim")
     def oauth_claim(body: Claim):
@@ -225,6 +238,14 @@ def create_app(path=None):
             raise HTTPException(422, "Invalid screenshot") from None
         if screenshot and (len(screenshot) > 2_000_000 or not screenshot.startswith(b"\x89PNG\r\n\x1a\n")):
             raise HTTPException(422, "Use a PNG screenshot up to 2 MB")
+        if screenshot:
+            try:
+                with Image.open(BytesIO(screenshot), formats=["PNG"]) as picture:
+                    if picture.width * picture.height > 12_500_000:
+                        raise ValueError("Image too large")
+                    picture.verify()
+            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+                raise HTTPException(422, "Use a valid PNG screenshot up to 12.5 megapixels") from None
         with db.transaction() as tx:
             sub = subject(tx, token)
             count = tx.execute("SELECT count(*) FROM report WHERE sub=? AND created>?",
@@ -290,65 +311,48 @@ def create_app(path=None):
         sub, action = body.sub, body.action
         with db.transaction() as tx:
             actor = admin_subject(tx, token)
+            guard_target(db, tx, actor, sub)
             result = {"ok": True}
             if action in {"minutes", "days"}:
                 if body.operation_id is None:
                     raise HTTPException(422, "An operation ID is required for grants")
-                operation_id = str(body.operation_id)
-                payload = body.model_dump_json(exclude={"operation_id"})
-                previous = tx.execute("SELECT actor,payload FROM admin_operation WHERE id=?",
-                                      (operation_id,)).fetchone()
-                if previous:
-                    if (previous["actor"], previous["payload"]) != (actor, payload):
-                        raise HTTPException(409, "Operation ID already used")
+                if not record_operation(tx, actor, body.operation_id, body.model_dump_json(exclude={"operation_id"})):
                     return result
-                tx.execute("INSERT INTO admin_operation VALUES(?,?,?)", (operation_id, actor, payload))
             if action == "invite":
                 code = secrets.token_urlsafe(24)
                 tx.execute("INSERT INTO invite(code,sub) VALUES(?,?)", (digest(code), sub))
                 tx.execute("INSERT INTO invite_expiry VALUES(?,?)",
                            (digest(code), db.now() + body.invite_days * 86400))
                 result["code"] = code
-            elif action == "report" and body.status in STATUSES:
+            elif action == "report":
+                if body.status not in STATUSES:
+                    raise HTTPException(422, "Invalid report status")
                 changed = tx.execute("UPDATE report SET status=? WHERE id=? AND sub=?",
                                      (body.status, body.report_id, sub)).rowcount
                 if not changed:
                     raise HTTPException(404, "Report not found")
             else:
-                account = tx.execute("SELECT state FROM account WHERE sub=?", (sub,)).fetchone()
-                if not account:
-                    raise HTTPException(404, "Account not found")
-                db.access(tx, sub)
-                if action in {"minutes", "days"} and account["state"] == "SUSPENDED":
-                    raise HTTPException(409, "Restore access before granting time")
-                if action == "minutes" and body.amount:
-                    tx.execute("UPDATE account SET remaining=remaining+?, "
-                               "until=CASE WHEN state='ACTIVE' AND until>? THEN until ELSE NULL END, "
-                               "state=CASE WHEN state='ACTIVE' AND until>? THEN state ELSE 'BETA' END "
-                               "WHERE sub=?", (body.amount * 60, db.now(), db.now(), sub))
-                elif action == "days" and body.amount:
-                    tx.execute("UPDATE account SET state='ACTIVE', until=max(?,coalesce(until,0))+? WHERE sub=?",
-                               (db.now(), body.amount * 86400, sub))
-                elif action == "suspend":
-                    if account["state"] != "SUSPENDED":
-                        tx.execute("INSERT INTO suspended_access VALUES(?,?)", (sub, account["state"]))
-                    tx.execute("UPDATE account SET state='SUSPENDED' WHERE sub=?", (sub,))
-                    tx.execute("DELETE FROM lease WHERE sub=?", (sub,))
-                elif action == "restore" and account["state"] == "SUSPENDED":
-                    original = tx.execute("SELECT state FROM suspended_access WHERE sub=?", (sub,)).fetchone()
-                    tx.execute("UPDATE account SET state=? WHERE sub=?", (original["state"] if original else "EXPIRED", sub))
-                    tx.execute("DELETE FROM suspended_access WHERE sub=?", (sub,))
-                else:
-                    raise HTTPException(422, "Invalid admin action")
+                change_license(db, tx, sub, action, body.amount)
             db.audit(tx, actor, sub, f"{action} {body.amount} {body.report_id} {body.status}")
             return result
 
     @app.get("/admin", response_class=HTMLResponse)
     def admin_page():
-        from pathlib import Path
         return HTMLResponse(Path(__file__).with_name("admin.html").read_text(encoding="utf-8"),
                             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
-                                     "X-Frame-Options": "DENY"})
+                                     "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
+                                     "Content-Security-Policy": "default-src 'none'; script-src 'self'; "
+                                     "style-src 'self'; connect-src 'self'; img-src blob:; "
+                                     "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"})
+
+    @app.get("/admin/panel.css")
+    def admin_style():
+        return Response(Path(__file__).with_name("panel.css").read_text(encoding="utf-8"), media_type="text/css")
+
+    @app.get("/admin/panel.js")
+    def admin_script():
+        return Response(Path(__file__).with_name("panel.js").read_text(encoding="utf-8"),
+                        media_type="text/javascript")
 
     @app.post("/answer")
     def answer(body: Question, token=Depends(bearer)):
