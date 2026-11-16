@@ -560,7 +560,7 @@ async function maintainUsers(action, title) {
   };
   const list = node("ul");
   for (const account of accounts) {
-    const label = account.email || account.name || "Запис без пошти · " + account.subject.slice(-8);
+    const label = account.email || account.name || "Запис без пошти · " + account.sub.slice(-8);
     list.append(node("li", `${label} · звіти: ${account.reports}, запрошення: ${account.invitations}, сеанси: ${account.sessions}`));
   }
   dialog(title, [node("p", description[action]), list], async () => {
@@ -586,9 +586,10 @@ async function showDevices(user) {
   details.append(node("p", states[user.identity]));
   if (!devices.length) details.append(node("p", "Активних прив’язок немає."));
   const change = (action, label, session = "") => {
+    $("dialog").addEventListener("close", () => confirm(label, "На вибраних пристроях знадобиться повторний вхід.",
+      () => json(path, "POST", {action, session, confirmed: true}), result => "Завершено сеансів: " + result.count),
+      {once: true});
     $("dialog").close();
-    setTimeout(() => confirm(label, "На вибраних пристроях знадобиться повторний вхід.",
-      () => json(path, "POST", {action, session, confirmed: true}), result => "Завершено сеансів: " + result.count), 0);
   };
   devices.forEach((device, index) => {
     const row = node("p", `Пристрій ${index + 1} · ${time(device.seen)} · ${device.active ? "Зараз обробляє запит" : "Сеанс відкрито"} `);
