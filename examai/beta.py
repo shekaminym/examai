@@ -41,7 +41,12 @@ class BetaClient:
             response = httpx.request(method, self.url + route, json=body,
                                      headers=self.headers(), timeout=8)
             if not response.is_success:
-                raise GenerationError(response.json().get("detail", "EXAM AI service unavailable"))
+                detail = response.json().get("detail")
+                if route == "/invite" and response.status_code == 422:
+                    detail = "Вставте повний код запрошення (від 16 до 128 символів)."
+                elif route == "/invite" and response.status_code == 409 and detail == "Invite unavailable":
+                    detail = "Запрошення недійсне, уже використане або призначене іншому обліковому запису."
+                raise GenerationError(detail if isinstance(detail, str) else "Не вдалося виконати запит до EXAM AI.")
             return response.json()
         except (ValueError, httpx.HTTPError):
             raise GenerationError("EXAM AI service unavailable") from None

@@ -14,7 +14,9 @@ from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.id_token import verify_oauth2_token
@@ -101,6 +103,14 @@ def create_app(path=None):
         return sub
 
     mount_admin(app, db, bearer, admin_subject)
+
+    @app.exception_handler(RequestValidationError)
+    async def explain_invite_validation(request, exc):
+        if request.url.path == "/invite":
+            return JSONResponse({"detail": "Вставте повний код запрошення (від 16 до 128 символів)."}, status_code=422)
+        if request.url.path == "/admin/v2/invitations":
+            return JSONResponse({"detail": "Перевірте адресу, тривалість доступу та строк дії коду."}, status_code=422)
+        return await request_validation_exception_handler(request, exc)
 
     @app.middleware("http")
     async def prevent_admin_caching(request, call_next):
@@ -199,9 +209,9 @@ def create_app(path=None):
         with db.transaction() as tx:
             sub = subject(tx, token)
             try:
-                db.redeem(tx, sub, body.code)
+                db.redeem(tx, sub, body.code.strip())
             except Denied as exc:
-                raise HTTPException(409, str(exc)) from None
+                raise HTTPException(409, "Запрошення недійсне, уже використане або призначене іншому обліковому запису.") from None
             return db.access(tx, sub, token=digest(token))
 
     @app.post("/activity/{action}")

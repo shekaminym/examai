@@ -7,7 +7,7 @@ from time import perf_counter
 import httpx
 from google import genai
 from google.genai import errors, types
-from examai.ai.conversation import COMPARISON, CONVERSATION_HEADER, ELABORATION
+from examai.ai.conversation import COMPARISON, CONVERSATION_HEADER, ELABORATION, FOLLOW_UP
 from examai.branding import ANSWER_PREFIX
 from examai.ai.image_intent import AUTO_IMAGE, EXPLAIN_CODE
 
@@ -104,7 +104,7 @@ class LLMEngine:
         instruction = "Почни з відповіді українською. Дай 1–2 речення, до 40 слів. "
         if history.strip():
             prompt += f"\n\n{CONVERSATION_HEADER}{history}"
-            if ELABORATION.search(question):
+            if ELABORATION.search(question) or FOLLOW_UP.search(question):
                 instruction = ("Почни з відповіді українською. Розкрий тему останньої репліки "
                                "у 2–4 конкретних реченнях, до 75 слів. Якщо відомі файл і рядок, "
                                "поясни роль операторів або змінних на основі уривку. "

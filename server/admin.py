@@ -3,10 +3,11 @@ import hashlib
 import hmac
 import re
 import secrets
+from typing import Literal
 from uuid import UUID
 
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from server.store import ADMIN_INVITATION_SECONDS, Denied, digest
 
@@ -28,11 +29,27 @@ class StaffAccount(BaseModel):
     subject: str = Field(min_length=1, max_length=128)
 
 
+class StaffRole(StaffAccount):
+    email: str = Field(max_length=254)
+    role: Literal["Owner", "Admin"]
+    confirmed: Literal[True]
+
+
 class Invitation(Email):
-    kind: str = Field(pattern="^(minutes|days|unlimited)$")
-    amount: int = Field(default=0, ge=0, le=10080)
+    kind: Literal["minutes", "days", "unlimited"]
+    amount: int | None = Field(default=None, ge=0, le=10080)
     validity: int = Field(default=7, ge=1, le=30)
     operation_id: UUID
+
+    @model_validator(mode="after")
+    def validate_duration(self):
+        if self.kind == "unlimited" and self.amount in (None, 0):
+            self.amount = 0
+        elif not (self.amount and (self.kind == "minutes" or self.kind == "days" and self.amount <= 365)):
+            raise ValueError("Недійсна тривалість доступу")
+        elif self.kind == "unlimited":
+            raise ValueError("Безстроковий доступ не має тривалості")
+        return self
 
 
 class License(Email):
@@ -215,6 +232,22 @@ def mount_admin(app, store, bearer, admin_subject):
                 store.audit(tx, actor, email, "Invited administrator")
             return {"role": "Pending"}
 
+    @app.patch("/admin/v2/staff")
+    def change_staff_role(body: StaffRole, token=Depends(bearer)):
+        with store.transaction() as tx:
+            actor = owner(tx, token)
+            email = normalize_email(body.email)
+            current = store.role(tx, body.subject)
+            if current == "User" or lookup(store, tx, email) != body.subject:
+                raise HTTPException(409, "Підтверджений обліковий запис змінився. Оновіть список.")
+            if body.role != current:
+                if current == "Owner" and tx.execute("SELECT count(*) FROM staff WHERE role='Owner'").fetchone()[0] < 2:
+                    raise HTTPException(409, "Останнього власника не можна понизити.")
+                tx.execute("UPDATE staff SET role=? WHERE sub=?", (body.role, body.subject))
+                store.revoke_sessions(tx, body.subject)
+                store.audit(tx, actor, body.subject, f"Role {current} → {body.role}")
+            return {"role": body.role}
+
     @app.delete("/admin/v2/staff")
     def remove_admin(body: StaffAccount, token=Depends(bearer)):
         with store.transaction() as tx:
@@ -245,10 +278,6 @@ def mount_admin(app, store, bearer, admin_subject):
             sub = lookup(store, tx, email)
             if sub:
                 guard_target(store, tx, actor, sub)
-            if not (body.kind == "unlimited" and body.amount == 0
-                    or body.kind == "days" and 1 <= body.amount <= 365
-                    or body.kind == "minutes" and body.amount > 0):
-                raise HTTPException(422, "Check the license amount")
             invite_id = str(body.operation_id)
             code = invitation_code(tx, invite_id)
             if record_operation(tx, actor, body.operation_id, "invite:" + body.model_dump_json()):

@@ -80,6 +80,8 @@ function errorText(error) {
 
 function auditLabel(action) {
   if (Object.hasOwn(auditLabels, action)) return auditLabels[action];
+  const role = /^Role (Owner|Admin) → (Owner|Admin)$/.exec(action);
+  if (role) return "Змінено роль: " + display(role[1]) + " → " + display(role[2]);
   const license = /^(?:License )?(minutes|remove|days|suspend|restore|revoke|invite) (\d+)(?: \d+\s*)?$/.exec(action);
   if (license) {
     const [, kind, count] = license;
@@ -297,17 +299,26 @@ function render() {
     }), "Запрошень ще немає.");
 
   table("staff", ["Обліковий запис Google", "Роль", "Дії"], data.staff.map(member => {
-    let action = "";
+    const actions = node("div", null, "actions");
     if (data.role === "Owner" && member.role !== "Owner") {
       const pending = ["Pending", "Expired"].includes(member.role);
-      action = button(pending ? "Скасувати запит" : "Забрати права адміністратора", () => confirm(
+      actions.append(button(pending ? "Скасувати запит" : "Забрати права адміністратора", () => confirm(
         pending ? "Скасувати запит на права адміністратора" : "Забрати права адміністратора",
         "Забрати права адміністратора для " + (member.email || "цього облікового запису Google") + "?",
         () => pending ? json("/admin/v2/pending-staff", "DELETE", {email: member.email})
           : json("/admin/v2/staff", "DELETE", {subject: member.sub}),
-        "Список адміністраторів оновлено."));
+        "Список адміністраторів оновлено.")));
     }
-    return [member.email || "Обліковий запис Google", node("span", display(member.role), "tag"), action];
+    const canDemote = member.role === "Owner" && data.staff.filter(row => row.role === "Owner").length > 1;
+    if (data.role === "Owner" && member.email && (member.role === "Admin" || canDemote)) {
+      const role = member.role === "Admin" ? "Owner" : "Admin";
+      const title = role === "Owner" ? "Призначити власником" : "Призначити адміністратором";
+      actions.append(button(title, () => confirm(title,
+        member.email + " · Google ID " + member.sub + ". Усі чинні сеанси цього облікового запису буде завершено.",
+        () => json("/admin/v2/staff", "PATCH", {email: member.email, subject: member.sub, role, confirmed: true}),
+        "Роль оновлено.")));
+    }
+    return [member.email || "Обліковий запис Google", node("span", display(member.role), "tag"), actions];
   }));
 
   table("activity", ["Час", "Дія", "Хто виконав", "Обліковий запис"], data.audit.map(entry => [
@@ -456,9 +467,12 @@ inviteForm.kind.addEventListener("change", () => {
 });
 let inviteDraft;
 form("invite-form", async ({email, kind, validity, minutes: custom}) => {
-  const days = kind.endsWith("d");
-  const amount = kind === "unlimited" ? 0 : Number(kind === "custom" ? custom : kind.replace(/d$/, ""));
-  const body = {email, kind: days ? "days" : kind === "unlimited" ? kind : "minutes", amount, validity: Number(validity)};
+  const access = {
+    "30": {kind: "minutes", amount: 30}, "60": {kind: "minutes", amount: 60},
+    custom: {kind: "minutes", amount: Number(custom)}, "7d": {kind: "days", amount: 7},
+    "30d": {kind: "days", amount: 30}, unlimited: {kind: "unlimited"},
+  };
+  const body = {email, ...access[kind], validity: Number(validity)};
   const payload = JSON.stringify(body);
   if (inviteDraft?.payload !== payload) inviteDraft = {payload, id: crypto.randomUUID()};
   const invite = await json("/admin/v2/invitations", "POST", {...body, operation_id: inviteDraft.id});
