@@ -16,6 +16,16 @@ Register the ASGI command `/bin/sh /home/<username>/exam-ai/server/deploy/python
 
 If the free ASGI worker does not inherit the outbound proxy, set `HTTPS_PROXY=http://proxy.server:3128` and `https_proxy=http://proxy.server:3128` in its private environment file. Verify access to both the Google token and signing-certificate endpoints with a real sign-in before opening invitations. [PythonAnywhere outbound proxy](https://help.pythonanywhere.com/pages/403ForbiddenError/)
 
+## Admin Panel 2.0
+
+Before rollout, take a private SQLite online backup and run `PRAGMA integrity_check` on it. Rehearse startup on a separate copy of that backup. Compare the existing account and session counts, saved license states, and owner assignment without printing account identifiers. The upgrade adds tables and seeds the first configured subject as Owner and any remaining configured subjects as Admin on the first successful bootstrap. Keep the existing owner first in the configuration for that migration. Later starts use the persisted roles. Existing desktop sessions and unredeemed legacy invitations still work.
+
+Install the server requirements and retain a copy of the previous application release. Verify `/health`, `/ready`, unauthorized admin responses, and a real owner sign-in after the reload. To roll back the application, restore the previous server files and reload while keeping the current database. New administrator assignments, pending invitations, and new report metadata are available again when 3.3.1 is redeployed. Keep the pre-upgrade database snapshot private and use it only for recovery from database damage.
+
+Use **Administrators** to grant or revoke access by verified Google email. A pending administrator request expires after seven days. A role change invalidates existing sessions of the affected account, so they sign in again. Invitations are tied to the stable Google account once verified. Copy the code and send it privately. The panel does not send mail. Google OAuth test-user enrollment remains in Google Auth Platform.
+
+The panel uses a bearer token in page memory and never sends cookies with administrative requests. Search terms are sent in JSON bodies. For existing Gmail profiles the migration can use the signed, verified email already on file. Workspace addresses are eligible for automatic matching when Google confirms their hosted domain during sign-in.
+
 ## Budget and abuse limits
 
 For public Cloud Gemini, the server requires the following settings:

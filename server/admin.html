@@ -1,107 +1,92 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>EXAM AI beta administration</title>
-<style>body{color:#f0efff;background:#15131c;font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,select,button{font:inherit;padding:8px;background:#242030;color:inherit;border:1px solid #71618b;border-radius:6px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#211c2b;padding:16px}form{display:flex;gap:8px;flex-wrap:wrap}</style>
-<h1>EXAM AI beta administration</h1>
-<p>Sign in using an authorized Google account. The session stays in this page.</p>
-<button id="sign-in">Continue with Google</button><button id="sign-out">Sign out</button><input id="query" placeholder="Email or Google subject">
-<button id="load">Load users and reports</button>
-<h2>Account action</h2>
-<form id="action"><input name="sub" required placeholder="Google account subject"><select name="action">
-<option>invite</option><option>minutes</option><option>days</option><option>suspend</option><option>restore</option><option>report</option>
-</select><input name="amount" type="number" min="0" max="365" placeholder="Minutes or days">
-<label>Invite validity (days) <input name="invite_days" type="number" min="1" max="30" value="7" required></label>
-<input name="report_id" type="number" min="0" placeholder="Report ID"><select name="status">
-<option>Received</option><option>Reviewing</option><option>Confirmed</option><option>Fixed</option><option>Closed</option></select>
-<button>Apply</button></form>
-<p><button data-minutes="10">+10 min</button> <button data-minutes="30">+30 min</button>
-<button data-minutes="60">+60 min</button> <button data-days="7">+7 days</button>
-<button data-days="30">+30 days</button></p><pre id="result" aria-live="polite"></pre>
-<form id="attachment"><input name="report_id" type="number" min="1" required placeholder="Report ID">
-<select name="kind"><option>screenshot</option><option>diagnostics</option></select>
-<button>Download attachment</button></form>
-<script>
-let token = '';
-let device = localStorage.getItem('examaiAdminDevice') || crypto.randomUUID();
-localStorage.setItem('examaiAdminDevice', device);
-const post = (path, data) => fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
-document.getElementById('sign-in').onclick = async () => {
- const popup = window.open('about:blank', '_blank');
- if (!popup) return;
- try {
-  const response = await post('/oauth/start', {device});
-  if (!response.ok) throw Error();
-  const auth = await response.json();
-  const url = new URL(auth.url);
-  if (url.origin !== 'https://accounts.google.com') throw Error();
-  popup.opener = null;
-  popup.location = url.href;
-  for (let i=0; i<120; i++) {
-   await new Promise(resolve => setTimeout(resolve, 2000));
-   const claim = await post('/oauth/claim', {claim:auth.claim});
-   if (!claim.ok) throw Error();
-   const value = await claim.json();
-   if (value.token) { token=value.token; await call('/admin/data'); return; }
-  }
-  throw Error();
- } catch (_) { popup.close(); document.getElementById('result').textContent='Sign-in failed or expired.'; }
-};
-document.getElementById('sign-out').onclick = async () => {
- try { await fetch('/logout', {method:'POST', headers:{Authorization:'Bearer '+token}}); }
- finally { token=''; document.getElementById('result').textContent='Signed out.'; }
-};
-async function call(path, body) {
- const result = document.getElementById('result');
- try {
-  const response = await fetch(path, {method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
-  result.textContent = JSON.stringify(await response.json(), null, 2);
-  return response.status;
- } catch (_) { result.textContent = 'Request failed. Apply again to retry.'; return 0; }
-}
-document.getElementById('load').onclick = () => call('/admin/data?q='+encodeURIComponent(document.getElementById('query').value));
-const form = document.getElementById('action');
-document.getElementById('attachment').onsubmit = async e => {
- e.preventDefault();
- const fields = new FormData(e.target);
- const id = Number(fields.get('report_id'));
- const kind = fields.get('kind');
- try {
-  const response = await fetch(`/admin/reports/${id}/${kind}`, {headers:{Authorization:'Bearer '+token}});
-  if (!response.ok) throw Error();
-  const url = URL.createObjectURL(await response.blob());
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = kind === 'screenshot' ? 'screenshot.png' : 'diagnostics.txt';
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
- } catch (_) { document.getElementById('result').textContent = 'Attachment unavailable.'; }
-};
-for (const button of document.querySelectorAll('[data-minutes], [data-days]')) {
- button.onclick = () => {
-  const action = button.dataset.minutes ? 'minutes' : 'days';
-  form.elements.action.value = action;
-  form.elements.amount.value = button.dataset[action];
- };
-}
-let pendingGrant;
-form.onsubmit = async e => {
- e.preventDefault();
- const apply = form.querySelector('button');
- if (apply.disabled) return;
- const body = Object.fromEntries(new FormData(form));
- for (const field of ['amount', 'invite_days', 'report_id']) body[field] = Number(body[field]);
- if (['minutes', 'days'].includes(body.action)) {
-  const payload = JSON.stringify(body);
-  if (pendingGrant && pendingGrant.payload !== payload) {
-   document.getElementById('result').textContent = 'Retry the previous grant before submitting another.';
-   return;
-  }
-  pendingGrant ??= {payload, id:crypto.randomUUID()};
-  body.operation_id = pendingGrant.id;
- }
- apply.disabled = true;
- try {
-  const status = await call('/admin/action', body);
-  if (body.operation_id && status >= 200 && status < 500) pendingGrant = undefined;
- } finally { apply.disabled = false; }
-};
-</script></html>
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EXAM AI · Адміністрування</title>
+  <link rel="stylesheet" href="/admin/panel.css">
+  <script defer src="/admin/panel.js"></script>
+</head>
+<body>
+  <main id="login" class="login">
+    <div class="brand"><span aria-hidden="true">ϟ</span> EXAM AI</div>
+    <h1>Керування бета-тестуванням</h1>
+    <p>Увійдіть до облікового запису Google з правами адміністратора.</p>
+    <button class="primary" id="sign-in">Увійти через Google</button>
+    <p id="login-status" role="status"></p>
+  </main>
+  <div id="app" class="app" hidden>
+    <aside>
+      <div class="brand"><span aria-hidden="true">ϟ</span> EXAM AI</div>
+      <nav aria-label="Адміністрування">
+        <button data-view="dashboard">Огляд</button><button data-view="users">Користувачі</button>
+        <button data-view="invitations">Запрошення</button><button data-view="licenses">Ліцензії</button>
+        <button data-view="reports">Звіти про помилки</button><button data-view="staff">Адміністратори</button>
+        <button data-view="activity">Журнал дій</button>
+      </nav>
+      <button id="sign-out">Вийти</button>
+    </aside>
+    <main class="workspace">
+      <header><h1 id="heading"></h1><span class="role" id="actor"></span></header>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <section data-page="dashboard"><div id="summary" class="metrics"></div></section>
+      <section data-page="users" hidden>
+        <form id="search-form" class="toolbar">
+          <label>Пошук за електронною поштою<input type="search" name="search" placeholder="Електронна пошта Google" maxlength="254"></label>
+          <button>Знайти</button>
+        </form>
+        <div id="users"></div>
+      </section>
+      <section data-page="invitations" hidden>
+        <form id="invite-form" class="toolbar">
+          <label>Електронна пошта Google<input type="email" name="email" maxlength="254" required></label>
+          <label>Доступ<select name="kind">
+            <option value="30">30 хвилин</option><option value="60">60 хвилин</option>
+            <option value="custom">Інша кількість хвилин</option><option value="7d">7 днів</option>
+            <option value="30d">30 днів</option><option value="unlimited">Без обмежень</option>
+          </select></label>
+          <label id="custom-amount" hidden>Хвилини<input type="number" name="minutes" min="1" max="10080" value="30"></label>
+          <label>Строк дії коду (дні)<input type="number" name="validity" min="1" max="30" value="7" required></label>
+          <button class="primary">Створити запрошення</button>
+        </form>
+        <div id="invitations"></div>
+      </section>
+      <section data-page="licenses" hidden>
+        <form id="license-form" class="toolbar">
+          <label>Електронна пошта Google<input type="email" name="email" maxlength="254" required></label>
+          <label>Дія<select name="action">
+            <option value="minutes">Додати хвилини</option><option value="remove">Списати хвилини</option>
+            <option value="days">Продовжити доступ</option><option value="suspend">Призупинити доступ</option>
+            <option value="restore">Відновити доступ</option><option value="revoke">Відкликати ліцензію</option>
+          </select></label>
+          <label id="license-amount"><span id="amount-label">Хвилини</span>
+            <input type="number" name="amount" min="1" max="10080" value="30" required>
+          </label>
+          <button class="primary">Перевірити зміну</button>
+        </form>
+        <div id="licenses"></div>
+      </section>
+      <section data-page="reports" hidden>
+        <form id="reports-form" class="toolbar">
+          <label>Статус<select name="status"><option value="">Усі статуси</option></select></label>
+          <label>Електронна пошта автора<input type="email" name="email" maxlength="254" placeholder="Усі користувачі"></label>
+          <button>Застосувати фільтр</button>
+        </form>
+        <div id="reports"></div>
+      </section>
+      <section data-page="staff" hidden>
+        <form id="staff-form" class="toolbar" hidden>
+          <label>Електронна пошта Google<input type="email" name="email" maxlength="254" required></label>
+          <button class="primary">Додати адміністратора</button>
+        </form>
+        <div id="staff"></div>
+      </section>
+      <section data-page="activity" hidden><div id="activity"></div></section>
+    </main>
+  </div>
+  <dialog id="dialog"><form id="dialog-form">
+    <h2 id="dialog-title"></h2><div id="dialog-content"></div>
+    <footer><button type="button" id="dialog-close">Скасувати</button><button class="primary" id="dialog-submit">Підтвердити</button></footer>
+  </form></dialog>
+</body>
+</html>

@@ -3,3 +3,4 @@ uvicorn==0.44.0
 httpx
 google-auth[requests]
 google-genai==2.33.0
+Pillow
