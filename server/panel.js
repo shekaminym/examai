@@ -102,9 +102,8 @@ function auditLabel(action) {
   }
   return action;
 }
-let token = "";
-let device = localStorage.getItem("examaiAdminDevice") || crypto.randomUUID();
-localStorage.setItem("examaiAdminDevice", device);
+const selectedUsers = new Set();
+let balanceRequest = false;
 let data;
 let confirmAction;
 let imageUrl;
@@ -143,11 +142,10 @@ function time(value) {
 }
 
 async function api(path, method = "GET", body) {
-  const headers = {};
-  if (token) headers.Authorization = "Bearer " + token;
+  const headers = {"X-ExamAI-Request": "admin"};
   if (body) headers["Content-Type"] = "application/json";
   const response = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : undefined,
-    credentials: "omit", cache: "no-store", redirect: "error"});
+    credentials: "same-origin", cache: "no-store", redirect: "error"});
   if (!response.ok) {
     const failure = await response.json().catch(() => ({}));
     const error = new Error(typeof failure.detail === "string" ? failure.detail : "Не вдалося виконати запит. Спробуйте ще раз.");
@@ -162,7 +160,7 @@ async function json(path, method, body) {
 }
 
 function signInScreen(message = "") {
-  token = "";
+  selectedUsers.clear();
   data = undefined;
   refreshSequence++;
   if ($("dialog").open) $("dialog").close();
@@ -227,6 +225,7 @@ function table(id, columns, rows, empty = "Записів немає.") {
 
 function view(name) {
   currentView = name;
+  if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
   for (const element of document.querySelectorAll("[data-page]")) element.hidden = element.dataset.page !== name;
   for (const link of document.querySelectorAll("[data-view]")) {
     if (link.dataset.view === name) {
@@ -270,7 +269,8 @@ async function refresh() {
 function render() {
   $("actor").textContent = display(data.role);
   $("staff-form").hidden = data.role !== "Owner";
-  $("qa-purge").hidden = data.role !== "Owner";
+  $("user-selection").hidden = data.role !== "Owner";
+  updateSelection();
   $("audit-form").hidden = data.role !== "Owner";
   $("summary").replaceChildren(...[
     ["Зареєстровані користувачі", "users"], ["Очікують активації", "pending"],
@@ -287,16 +287,29 @@ function render() {
   $("user-page").textContent = `${pagination.page} / ${pagination.pages} · Усього: ${pagination.total}`;
   $("previous-users").disabled = userPage <= 1;
   $("next-users").disabled = userPage >= pagination.pages;
-  table("users", ["Ім’я", "E-mail", "Підписка", "Запити за сьогодні", "Дії", "Хвилини"],
-    data.users.map(user => {
-      const actions = user.email ? userActions(user) : "—";
-      const subscription = node("span", "betatest", "tag");
-      subscription.title = `${display(user.state)} · ${display(user.license)}`;
-      const remaining = node("span", "betatest");
-      remaining.title = minutes(user.seconds);
-      return [user.name || "—", user.email || "Пошту не підтверджено", subscription,
-        user.requests, actions, remaining];
-    }), "За цим пошуком користувачів не знайдено.");
+  const headers = ["Ім’я", "E-mail", "Підписка", "Запити за сьогодні", "Дії", "Хвилини"];
+  if (data.role === "Owner") headers.unshift("Вибір");
+  table("users", headers, data.users.map(user => {
+    const subscription = node("span", "betatest", "tag");
+    const remaining = node("span", balanceText(user));
+    remaining.dataset.balance = user.subject;
+    const row = [user.name || "—", user.email || "Пошту не підтверджено", subscription,
+      user.requests, userActions(user), remaining];
+    if (data.role === "Owner") {
+      const check = node("input");
+      check.type = "checkbox";
+      check.setAttribute("aria-label", "Вибрати " + (user.email || user.name || "запис без пошти"));
+      check.checked = selectedUsers.has(user.subject);
+      check.disabled = user.role === "Owner";
+      check.addEventListener("change", () => {
+        if (check.checked) selectedUsers.add(user.subject);
+        else selectedUsers.delete(user.subject);
+        updateSelection();
+      });
+      row.unshift(check);
+    }
+    return row;
+  }), "За цим пошуком користувачів не знайдено.");
 
   table("invitations", ["Електронна пошта Google", "Доступ", "Статус", "Код діє до", "Дії"],
     data.invitations.map(invite => {
@@ -501,11 +514,99 @@ form("invite-form", async ({email, kind, validity, minutes: custom}) => {
   await showCode(invite.code, true);
 });
 
+function balanceText(user) {
+  if (user.disabled) return "Деактивовано";
+  if (user.state === "SUSPENDED") return "Призупинено";
+  if (user.state === "ACTIVE") return user.until == null ? "Без обмежень" : "До " + time(user.until);
+  if (["BETA", "TRIAL"].includes(user.state) && user.seconds > 0) {
+    const m = Math.floor(user.seconds / 60);
+    return m >= 60 ? Math.floor(m / 60) + " год " + m % 60 + " хв" : m + " хв " + user.seconds % 60 + " с";
+  }
+  return user.invited || user.until != null || user.seconds > 0 ? "Закінчився" : "Не активовано";
+}
+
+async function pollBalances() {
+  if (!data?.users.length || currentView !== "users" || document.hidden || balanceRequest) return;
+  const snapshot = data;
+  balanceRequest = true;
+  try {
+    const current = await json("/admin/v2/users/balances", "POST", {subjects: data.users.map(user => user.subject)});
+    if (snapshot !== data || currentView !== "users") return;
+    for (const cell of $("users").querySelectorAll("[data-balance]")) {
+      const user = data.users.find(row => row.subject === cell.dataset.balance);
+      const balance = current[cell.dataset.balance];
+      if (user && balance) cell.textContent = balanceText({...user, ...balance});
+    }
+  } finally {
+    balanceRequest = false;
+  }
+}
+setInterval(() => recover(pollBalances), 5000);
+document.addEventListener("visibilitychange", () => recover(pollBalances));
+
+function updateSelection() {
+  const count = selectedUsers.size;
+  for (const id of ["delete-users", "disable-users", "enable-users"]) $(id).disabled = !count;
+  $("selection-count").textContent = count ? "Вибрано: " + count : "";
+}
+
+async function maintainUsers(action, title) {
+  const subjects = [...selectedUsers];
+  const {accounts} = await json("/admin/v2/users/preview", "POST", {subjects});
+  const description = {
+    delete: "Перед видаленням створимо резервну копію. Записи, ліцензії, пов’язані запрошення, звіти та сесії буде видалено. Аудит збережеться.",
+    disable: "Сеанси завершаться. Ліцензії, запрошення та звіти збережуться.",
+    enable: "Вибрані користувачі знову зможуть увійти.",
+  };
+  const list = node("ul");
+  for (const account of accounts) {
+    const label = account.email || account.name || "Запис без пошти · " + account.subject.slice(-8);
+    list.append(node("li", `${label} · звіти: ${account.reports}, запрошення: ${account.invitations}, сеанси: ${account.sessions}`));
+  }
+  dialog(title, [node("p", description[action]), list], async () => {
+    const done = await json("/admin/v2/users/maintenance", "POST", {subjects, action, confirmed: true});
+    selectedUsers.clear();
+    $("dialog").close();
+    await refresh();
+    notice("Оброблено записів: " + done.count);
+  });
+}
+
+async function showDevices(user) {
+  const path = "/admin/v2/devices/" + encodeURIComponent(user.subject);
+  const {devices} = await json(path);
+  const details = node("div");
+  details.append(node("p", user.email || user.name || "Запис без пошти · " + user.subject.slice(-8)));
+  const states = {
+    confirmed: "Google підтвердив цю пошту.",
+    legacy_email: "Пошту збережено, окремого підтвердження Google в базі немає.",
+    missing_email: "Google ID є, але підтвердженої пошти в базі немає.",
+    legacy_record: "Старий запис без Google ID та підтвердженої пошти. Джерело не зафіксоване.",
+  };
+  details.append(node("p", states[user.identity]));
+  if (!devices.length) details.append(node("p", "Активних прив’язок немає."));
+  const change = (action, label, session = "") => {
+    $("dialog").close();
+    setTimeout(() => confirm(label, "На вибраних пристроях знадобиться повторний вхід.",
+      () => json(path, "POST", {action, session, confirmed: true}), result => "Завершено сеансів: " + result.count), 0);
+  };
+  devices.forEach((device, index) => {
+    const row = node("p", `Пристрій ${index + 1} · ${time(device.seen)} · ${device.active ? "Зараз обробляє запит" : "Сеанс відкрито"} `);
+    row.append(button("Відв’язати", () => change("unbind", "Відв’язати пристрій?", device.id)));
+    details.append(row);
+  });
+  if (devices.length) {
+    details.append(button("Відкликати старі сеанси", () => change("stale", "Відкликати неактивні сеанси?")),
+      button("Скинути прив’язки", () => change("reset", "Скинути всі прив’язки?")));
+  }
+  dialog("Пристрої та стан акаунта", [details], null);
+}
+
 function userActions(user) {
   const select = document.createElement("select");
   select.setAttribute("aria-label", "Дії для " + user.email);
   select.add(new Option("Дії…", ""));
-  if (user.role !== "Owner" || data.role === "Owner") {
+  if (user.email && (user.role !== "Owner" || data.role === "Owner")) {
     for (const [action, label] of [
       ["minutes", "Додати хвилини"], ["remove", "Списати хвилини"], ["days", "Продовжити доступ"],
       ["suspend", "Призупинити доступ"], ["unlimited", "Надати доступ назавжди"],
@@ -514,12 +615,16 @@ function userActions(user) {
       if (action !== "unlimited" || data.role === "Owner") select.add(new Option(label, action));
     }
   }
-  select.add(new Option("Переглянути звіти", "reports"));
+  if (user.email) select.add(new Option("Переглянути звіти", "reports"));
+  if (data.role === "Owner") select.add(new Option("Пристрої та стан акаунта", "devices"));
+  if (select.options.length === 1) return "—";
   select.addEventListener("change", () => {
     const action = select.value;
     const title = select.selectedOptions[0].text;
     select.selectedIndex = 0;
-    if (action === "reports") {
+    if (action === "devices") {
+      recover(() => showDevices(user));
+    } else if (action === "reports") {
       $("reports-form").elements.email.value = user.email;
       $("reports-form").elements.status.value = "";
       view("reports");
@@ -557,20 +662,18 @@ form("staff-form", ({email}) => confirm("Додати адміністратор
   () => json("/admin/v2/staff", "POST", {email}),
   result => result.role === "Pending" ? "Очікується перший підтверджений вхід через Google." : "Список адміністраторів оновлено."));
 
-$("qa-purge").addEventListener("click", () => recover(async () => {
-  const preview = await json("/admin/v2/qa/preview");
-  confirm("Безповоротно видалити тестові записи?",
-    `Буде видалено ${preview.accounts} облікових записів @example.test і ${preview.invitations} запрошень, а також пов'язані дані. Цю дію неможливо скасувати.`,
-    () => json("/admin/v2/qa/purge", "POST", {confirmed: true}),
-    result => `Видалено ${result.accounts} тестових облікових записів і ${result.invitations} запрошень.`);
-}));
+for (const [action, id, label] of [
+  ["delete", "delete-users", "Видалити вибрані акаунти?"],
+  ["disable", "disable-users", "Деактивувати вибрані акаунти?"],
+  ["enable", "enable-users", "Відновити вибрані акаунти?"],
+]) $(id).addEventListener("click", () => recover(() => maintainUsers(action, label)));
 
 form("audit-form", async ({period}) => {
   const label = $("audit-form").elements.period.selectedOptions[0].textContent;
   const preview = await json(`/admin/v2/audit/preview?period=${encodeURIComponent(period)}`);
-  confirm("Очистити журнал дій?", `За останні ${label.toLowerCase()} буде видалено ${preview.count} записів. Цю дію неможливо скасувати.`,
+  confirm("Очистити журнал дій?", `За останні ${label.toLowerCase()} буде приховано ${preview.count} записів із цієї таблиці. Серверний аудит збережеться.`,
     () => json("/admin/v2/audit/clear", "POST", {period, confirmed: true}),
-    result => `Видалено ${result.deleted} записів журналу.`);
+    result => `Приховано записів журналу: ${result.deleted}.`);
 });
 
 $("sign-in").addEventListener("click", async () => {
@@ -582,20 +685,19 @@ $("sign-in").addEventListener("click", async () => {
   $("sign-in").disabled = true;
   $("login-status").textContent = "Очікуємо на вхід через Google…";
   try {
-    const auth = await json("/oauth/start", "POST", {device});
+    const formerDevice = localStorage.getItem("examaiAdminDevice") || "";
+    const validDevice = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(formerDevice);
+    const auth = await json("/admin/session/start", "POST", {previous: validDevice ? formerDevice : ""});
     const url = new URL(auth.url);
     if (url.origin !== "https://accounts.google.com") throw new Error("Неочікувана адреса входу Google.");
     popup.opener = null;
     popup.location = url.href;
     for (let attempt = 0; attempt < 120; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 2000));
-      const claim = await json("/oauth/claim", "POST", {claim: auth.claim});
-      if (claim.token) {
-        token = claim.token;
-        await refresh();
-        $("login").hidden = true;
-        $("app").hidden = false;
-        view(currentView || "dashboard");
+      const claim = await json("/admin/session/claim", "POST", {claim: auth.claim});
+      if (claim.ok) {
+        localStorage.removeItem("examaiAdminDevice");
+        await openPanel();
         popup.close();
         return;
       }
@@ -603,7 +705,6 @@ $("sign-in").addEventListener("click", async () => {
     }
     throw new Error("Час очікування входу минув.");
   } catch (error) {
-    if (token) await api("/logout", "POST").catch(() => {});
     signInScreen(errorText(error));
     popup.close();
   } finally {
@@ -613,9 +714,29 @@ $("sign-in").addEventListener("click", async () => {
 
 $("sign-out").addEventListener("click", async () => {
   try {
-    await api("/logout", "POST");
+    await api("/admin/session/logout", "POST", {});
     signInScreen("Ви вийшли з облікового запису.");
   } catch (error) {
-    signInScreen(error.status === 401 ? "Ви вийшли з облікового запису." : "Ви вийшли з панелі. Серверний сеанс не вдалося завершити.");
+    notice("Не вдалося завершити серверний сеанс. Спробуйте ще раз.", true);
   }
 });
+
+async function openPanel() {
+  const target = location.hash.slice(1);
+  const pages = ["dashboard", "users", "reports", "staff", "activity"];
+  view(pages.includes(target) ? target : "dashboard");
+  await refresh();
+  $("login").hidden = true;
+  $("app").hidden = false;
+}
+
+async function restorePanel() {
+  try {
+    await api("/admin/session");
+    await openPanel();
+  } catch (error) {
+    const signedOut = error.status === 401;
+    signInScreen(signedOut ? "" : errorText(error));
+  }
+}
+restorePanel();

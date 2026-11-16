@@ -14,6 +14,7 @@ from threading import Event, Lock, Thread
 from uuid import UUID
 
 import httpx
+from fastapi import Request as FastAPIRequest
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -25,6 +26,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from examai.ai.llm_engine import GenerationError, LLMEngine
+from server.store import ADMIN_SESSION_SECONDS
 from server.admin import STATUSES, change_license, guard_target, mount_admin, record_operation
 from server.cloud_budget import CloudBudget
 from server.payments import mount as mount_payments
@@ -40,8 +42,13 @@ class Device(BaseModel):
     device: str = Field(min_length=16, max_length=128)
 
 
+class BrowserDevice(BaseModel):
+    previous: str = Field(default="", pattern=r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?$")
+
+
 class Claim(BaseModel):
     claim: str = Field(min_length=32, max_length=128)
+    replace: bool = False
 
 
 class AccountName(BaseModel):
@@ -101,13 +108,37 @@ def create_app(path=None):
         except Denied as exc:
             raise HTTPException(401, str(exc)) from None
 
-    def admin_subject(tx, token):
-        sub = subject(tx, token)
+    cookie_name = "__Host-examai-admin"
+    admin_device_prefix = "admin-cookie:"
+
+    def csrf(request):
+        if request.headers.get("origin") != base or request.headers.get("x-examai-request") != "admin":
+            raise HTTPException(403, "Origin not allowed")
+
+    def admin_credentials(request: FastAPIRequest, authorization: str = Header(default="")):
+        if authorization:
+            return "desktop", bearer(authorization)
+        token = request.cookies.get(cookie_name, "")
+        if not 32 <= len(token) <= 128:
+            raise HTTPException(401, "Sign in to EXAM AI")
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            csrf(request)
+        return "browser", token
+
+    def admin_subject(tx, credentials):
+        kind, token = credentials
+        if kind == "browser":
+            try:
+                sub = db.authenticate_admin(tx, token)
+            except Denied as exc:
+                raise HTTPException(401, str(exc)) from None
+        else:
+            sub = subject(tx, token)
         if db.role(tx, sub) == "User":
             raise HTTPException(403, "Administrator required")
         return sub
 
-    mount_admin(app, db, bearer, admin_subject)
+    mount_admin(app, db, admin_credentials, admin_subject)
 
     @app.exception_handler(RequestValidationError)
     async def explain_invite_validation(request, exc):
@@ -126,6 +157,16 @@ def create_app(path=None):
 
     @app.post("/oauth/start")
     def oauth_start(body: Device):
+        if body.device.startswith(admin_device_prefix):
+            raise HTTPException(422, "Invalid device")
+        return start_flow(body.device)
+
+    @app.post("/admin/session/start")
+    def browser_oauth_start(body: BrowserDevice, request: FastAPIRequest):
+        csrf(request)
+        return start_flow(admin_device_prefix + body.previous)
+
+    def start_flow(device):
         if not client_id or not client_secret or urlsplit(base).scheme != "https":
             raise HTTPException(503, "Google Sign-In is not configured on the server")
         state, verifier, nonce, claim = (secrets.token_urlsafe(32) for _ in range(4))
@@ -135,10 +176,10 @@ def create_app(path=None):
             if tx.execute("SELECT count(*) FROM oauth").fetchone()[0] >= 256:
                 raise HTTPException(429, "Too many sign-in attempts. Try again shortly.")
             tx.execute("INSERT INTO oauth VALUES (?,?,?,?,?,?,NULL)",
-                       (state, verifier, nonce, digest(claim), body.device, db.now() + 300))
+                       (state, verifier, nonce, digest(claim), device, db.now() + 300))
         query = urlencode(dict(client_id=client_id, redirect_uri=redirect, response_type="code",
                                scope="openid email", state=state, nonce=nonce, code_challenge=challenge,
-                               code_challenge_method="S256"))
+                               code_challenge_method="S256", prompt="select_account"))
         return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + query, "claim": claim}
 
     @app.get("/oauth/callback", response_class=HTMLResponse)
@@ -172,6 +213,10 @@ def create_app(path=None):
         except (httpx.HTTPError, ValueError, KeyError):
             raise HTTPException(400, "Google authentication failed") from None
         with db.transaction() as tx:
+            try:
+                db.check_enabled(tx, claims["sub"])
+            except Denied as exc:
+                raise HTTPException(403, str(exc)) from None
             changed = tx.execute("UPDATE oauth SET sub=? WHERE state=? AND until>?",
                                  (claims["sub"], state, db.now())).rowcount
             if not changed:
@@ -181,21 +226,66 @@ def create_app(path=None):
             "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
         })
 
+    def claim_row(tx, claim, *, browser):
+        row = tx.execute("SELECT * FROM oauth WHERE claim=? AND until>?",
+                         (digest(claim), db.now())).fetchone()
+        if not row or row["device"].startswith(admin_device_prefix) != browser:
+            raise HTTPException(410, "Login expired")
+        return row
+
     @app.post("/oauth/claim")
     def oauth_claim(body: Claim):
         with db.transaction() as tx:
-            row = tx.execute("SELECT * FROM oauth WHERE claim=? AND until>?",
-                             (digest(body.claim), db.now())).fetchone()
-            if not row:
-                raise HTTPException(410, "Login expired")
+            row = claim_row(tx, body.claim, browser=False)
             if not row["sub"]:
                 return {"pending": True}
             try:
-                token = db.issue(tx, row["sub"], row["device"])
+                token = db.issue(tx, row["sub"], row["device"], replace=body.replace)
             except Denied as exc:
                 raise HTTPException(409, str(exc)) from None
-            tx.execute("DELETE FROM oauth WHERE claim=?", (digest(body.claim),))
+            tx.execute("DELETE FROM oauth WHERE state=?", (row["state"],))
             return {"token": token}
+
+    @app.post("/admin/session/claim")
+    def browser_oauth_claim(body: Claim, request: FastAPIRequest, response: Response):
+        csrf(request)
+        with db.transaction() as tx:
+            row = claim_row(tx, body.claim, browser=True)
+            if not row["sub"]:
+                return {"pending": True}
+            if db.role(tx, row["sub"]) == "User":
+                raise HTTPException(403, "Administrator required")
+            try:
+                token = db.issue_admin(tx, row["sub"], request.cookies.get(cookie_name, ""))
+                legacy_device = row["device"][len(admin_device_prefix):]
+                if legacy_device:
+                    old = tx.execute("SELECT token FROM session WHERE sub=? AND device=?",
+                                     (row["sub"], legacy_device)).fetchone()
+                    if old:
+                        db.end_device(tx, row["sub"], old["token"])
+                        db.audit(tx, row["sub"], row["sub"], "Migrated legacy browser session")
+            except Denied as exc:
+                raise HTTPException(403, str(exc)) from None
+            tx.execute("DELETE FROM oauth WHERE state=?", (row["state"],))
+        response.set_cookie(cookie_name, token, max_age=ADMIN_SESSION_SECONDS,
+                            httponly=True, secure=True, samesite="strict", path="/")
+        return {"ok": True}
+
+    @app.get("/admin/session")
+    def browser_session(credentials=Depends(admin_credentials)):
+        with db.transaction() as tx:
+            sub = admin_subject(tx, credentials)
+            return {"role": db.role(tx, sub)}
+
+    @app.post("/admin/session/logout")
+    def browser_logout(request: FastAPIRequest, response: Response):
+        csrf(request)
+        token = request.cookies.get(cookie_name, "")
+        if token:
+            with db.transaction() as tx:
+                tx.execute("DELETE FROM admin_session WHERE token=?", (digest(token),))
+        response.delete_cookie(cookie_name, path="/", httponly=True, secure=True, samesite="strict")
+        return {"ok": True}
 
     @app.post("/logout")
     def logout(token=Depends(bearer)):
@@ -217,6 +307,8 @@ def create_app(path=None):
             account["plan"] = {"BETA": "Closed Beta", "TRIAL": "Trial",
                                "ACTIVE": "Granted access"}.get(account["state"])
             account["auto_renew"] = False
+            account["profile_id"] = digest(sub)
+            account["role"] = db.role(tx, sub)
             return account
 
     @app.put("/account/name")
@@ -307,7 +399,7 @@ def create_app(path=None):
                 "SELECT id,kind,status,created FROM report WHERE sub=? ORDER BY id DESC LIMIT 100", (sub,))]
 
     @app.get("/admin/data")
-    def admin_data(q: str = "", token=Depends(bearer)):
+    def admin_data(q: str = "", token=Depends(admin_credentials)):
         with db.transaction() as tx:
             admin_subject(tx, token)
             return {
@@ -329,7 +421,7 @@ def create_app(path=None):
             }
 
     @app.get("/admin/reports/{report_id}/{kind}")
-    def report_attachment(report_id: int, kind: str, token=Depends(bearer)):
+    def report_attachment(report_id: int, kind: str, token=Depends(admin_credentials)):
         with db.transaction() as tx:
             admin_subject(tx, token)
             row = tx.execute("SELECT content FROM report_attachment WHERE report_id=? AND kind=?",
@@ -343,7 +435,7 @@ def create_app(path=None):
         })
 
     @app.post("/admin/action")
-    def admin_action(body: AdminAction, token=Depends(bearer)):
+    def admin_action(body: AdminAction, token=Depends(admin_credentials)):
         sub, action = body.sub, body.action
         with db.transaction() as tx:
             actor = admin_subject(tx, token)
