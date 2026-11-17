@@ -1092,12 +1092,11 @@ class MainWindow(QMainWindow):
         model_controls.addWidget(self.combo_whisper, 1)
         layout.addLayout(model_controls)
         self.combo_stt_language = MinimalComboBox()
-        for label, code in (("Українська · Gemini Live / Whisper", "uk"),
-                            ("Русский · Whisper", "ru"), ("English · Whisper", "en"),
-                            ("Auto · Whisper", "auto")):
+        for label, code in (("Auto · Whisper", "auto"), ("Українська · Gemini Live / Whisper", "uk"),
+                            ("Русский · Whisper", "ru"), ("English · Whisper", "en")):
             self.combo_stt_language.addItem(label, code)
         self.combo_stt_language.setCurrentIndex(max(
-            0, self.combo_stt_language.findData(self.config_mgr.get("whisper_language", "uk"))
+            0, self.combo_stt_language.findData(self.config_mgr.get("whisper_language", "auto"))
         ))
         layout.addWidget(self.combo_stt_language)
 

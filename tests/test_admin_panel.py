@@ -131,7 +131,10 @@ def test_revoked_invites_and_report_assignment_with_bonus(beta):
         **report, "screenshot": base64.b64encode(png.getvalue()).decode()}).json()["id"]
     route = f"/admin/reports/{report_id}/screenshot"
     assert client.get(route, headers=user).status_code == 403
-    assert client.get(route, headers=owner).content == png.getvalue()
+    assert client.get(route).status_code == 401
+    with Image.open(BytesIO(client.get(route, headers=owner).content)) as saved:
+        assert saved.format == "PNG" and saved.size == (2, 2)
+        assert saved.getpixel((0, 0)) == (0, 0, 0)
     action = dict(status="Reviewing", assignee="owner@gmail.com", bonus=10, operation_id=str(uuid4()))
     for _ in range(2):
         assert client.post(f"/admin/v2/reports/{report_id}", headers=owner, json=action).is_success
@@ -205,3 +208,34 @@ def test_invite_duration_and_safe_validation(beta, kind, amount):
         assert grant["seconds"] == amount * 60
     else:
         assert grant["state"] == "ACTIVE" and grant["until"] is None
+
+
+@pytest.mark.parametrize("source_format", ["PNG", "JPEG", "WEBP", "BMP", "GIF"])
+def test_report_attachments_normalize_actual_format_and_protect_download(beta, source_format):
+    client, _store, owner, _user, _monkeypatch = beta
+    user = sign_in(beta, "format-test", "format-test@gmail.com")
+    blob = BytesIO()
+    frames = {"save_all": True, "append_images": [Image.new("RGB", (12, 8), "blue")]} if source_format == "GIF" else {}
+    Image.new("RGB", (12, 8), "red").save(blob, source_format, **frames)
+    payload = {"kind": "Bug", "description": "Report attachment format",
+               "screenshot": base64.b64encode(blob.getvalue()).decode()}
+    assert client.post("/reports", json=payload).status_code == 401
+    response = client.post("/reports", headers=user, json=payload)
+    assert response.status_code == 200
+    route = f"/admin/reports/{response.json()['id']}/screenshot"
+    assert client.get(route, headers=user).status_code == 403
+    with Image.open(BytesIO(client.get(route, headers=owner).content)) as image:
+        assert image.format == "PNG" and image.size == (12, 8)
+        assert image.n_frames == 1
+        red, green, blue = image.getpixel((0, 0))
+        assert red > 240 and green < 10 and blue < 10
+
+
+def test_report_rejects_image_dimensions_and_unapproved_codec():
+    from examai.report_images import normalize_report_image
+
+    for size, fmt in [((4097, 1), "PNG"), ((1, 1), "TIFF")]:
+        blob = BytesIO()
+        Image.new("RGB", size).save(blob, fmt)
+        with pytest.raises(ValueError):
+            normalize_report_image(blob.getvalue())

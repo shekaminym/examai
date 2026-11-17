@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QLabe
 
 from examai.beta import BetaClient, distribution_url
 from examai.branding import VERSION
+from examai.report_images import IMAGE_ERROR, MAX_IMAGE_BYTES, normalize_report_image
 from examai.windows.credentials import protect, reveal
 from examai.ui.settings_window import SettingsWindow
 
@@ -719,19 +720,19 @@ class AccountPanel(QWidget):
 
         def select_screenshot():
             nonlocal screenshot_data
-            name, _ = QFileDialog.getOpenFileName(panel, "Select screenshot", "", "PNG (*.png)")
+            name, _ = QFileDialog.getOpenFileName(
+                panel, "Select screenshot", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"
+            )
             if not name:
                 return
             try:
                 with Path(name).open("rb") as file:
-                    data = file.read(2_000_001)
-                if len(data) > 2_000_000 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
-                    raise ValueError
+                    data = normalize_report_image(file.read(MAX_IMAGE_BYTES + 1))
                 preview = QPixmap()
                 if not preview.loadFromData(data, "PNG"):
-                    raise ValueError
+                    raise ValueError(IMAGE_ERROR)
             except (OSError, ValueError):
-                status.setText("Choose a valid PNG screenshot up to 2 MB.")
+                status.setText(IMAGE_ERROR)
                 return
             screenshot_data = data
             screenshot.setPixmap(preview.scaled(320, 180, Qt.AspectRatioMode.KeepAspectRatio,
@@ -747,7 +748,7 @@ class AccountPanel(QWidget):
             screenshot.hide()
             remove.hide()
 
-        self.button(layout, "Attach PNG screenshot", select_screenshot)
+        self.button(layout, "Attach image", select_screenshot)
         layout.addWidget(screenshot)
         remove = self.button(layout, "Remove screenshot", clear_screenshot)
         remove.hide()

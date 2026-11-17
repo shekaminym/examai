@@ -343,7 +343,7 @@ class AudioWorker(QThread):
                 auto_language = False
             started = perf_counter()
             try:
-                text, _ = self.stt.transcribe_chunk(
+                text, detected_language = self.stt.transcribe_chunk(
                     utterance.audio,
                     language="auto" if auto_language else self.language,
                     sample_rate=utterance.sample_rate,
@@ -359,7 +359,8 @@ class AudioWorker(QThread):
                         self._trace_id(utterance.utterance_id), utterance.is_final, (started - utterance.queued_at) * 1000,
                         (perf_counter() - started) * 1000,
                         len(utterance.audio) / utterance.sample_rate * 1000)
-            text = self.corrector.correct(text)
+            if detected_language == "uk" and not has_non_ukrainian_cyrillic(text):
+                text = self.corrector.correct(text)
             if not text:
                 continue
             # A preview that finished after its final chunk was queued is stale.
@@ -877,15 +878,17 @@ class MainController(QObject):
         self._question_aggregator = QuestionAggregator(mode=pace_mode)
         self._recent_voice_item = None
         index = self.config.get("audio_device_index")
-        settings = tuple(self.config.get(name) for name in (
-            "whisper_model_size", "whisper_device", "whisper_compute_type", "whisper_noise_reduction",
-        ))
+        language = self.config.get("whisper_language", "auto")
+        if language not in {"uk", "ru", "en", "auto"}:
+            language = "auto"
+        model = self.config.get("whisper_model_size")
+        if language != "en":
+            model = model.removesuffix(".en")
+        settings = (model, self.config.get("whisper_device"), self.config.get("whisper_compute_type"),
+                    self.config.get("whisper_noise_reduction"))
         if settings != self.stt_settings:
             self.stt = STTEngine(*settings)
             self.stt_settings = settings
-        language = self.config.get("whisper_language", "uk")
-        if language not in {"uk", "ru", "en", "auto"}:
-            language = "uk"
         self.audio = AudioWorker(
             self.stt,
             language,
@@ -1242,6 +1245,7 @@ class MainController(QObject):
                     request_id, conversation_id, len(prior), (perf_counter() - memory_started) * 1000)
         memory_generation = self.conversation.generation
 
+        answer_language = "en" if self.ui.tr.current_lang == "ENG" else "uk"
         refresh_interval = 0.12 if self.ui.profile == "eco" else 0.05
 
         def task():
@@ -1304,7 +1308,7 @@ class MainController(QObject):
             try:
                 if not has_image:
                     answer = llm.generate_answer(provider_question, context, on_text=on_text,
-                                                 mode=mode, request_id=request_id)
+                                                 mode=mode, request_id=request_id, language=answer_language)
                 else:
                     encode_started = perf_counter()
                     try:
@@ -1331,6 +1335,7 @@ class MainController(QObject):
                         prepared_bytes, prepared_mime, on_text=on_text,
                         mode=mode, request_id=request_id, user_instruction=image_instruction,
                         context=image_context, intent=intent, cancelled=cancelled.is_set,
+                        language=answer_language,
                     )
             except GenerationError:
                 if latest_text and not cancelled.is_set():
@@ -1583,6 +1588,7 @@ class MainController(QObject):
         self.ui.txt_docs_result.setPlainText("Створення автоконспекту…")
 
         rag = self.rag
+        answer_language = "en" if self.ui.tr.current_lang == "ENG" else "uk"
         cancelled = threading.Event()
 
         def task():
@@ -1592,8 +1598,8 @@ class MainController(QObject):
             if cancelled.is_set():
                 raise GenerationError("Запит скасовано.")
             if isinstance(llm, CloudEngine):
-                return llm.generate_summary(context, cancelled=cancelled.is_set)
-            return llm.generate_summary(context)
+                return llm.generate_summary(context, cancelled=cancelled.is_set, language=answer_language)
+            return llm.generate_summary(context, language=answer_language)
 
         worker = TaskWorker(task, "Помилка обробки запиту AI.")
         worker.cancel_answer = cancelled

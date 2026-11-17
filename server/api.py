@@ -7,11 +7,11 @@ import os
 import secrets
 from unicodedata import category
 from functools import partial
-from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 from threading import Event, Lock, Thread
 from uuid import UUID
+from typing import Literal
 
 import httpx
 from fastapi import Request as FastAPIRequest
@@ -22,10 +22,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.id_token import verify_oauth2_token
-from PIL import Image
 from pydantic import BaseModel, Field
 
 from examai.ai.llm_engine import GenerationError, LLMEngine
+from examai.report_images import normalize_report_image
 from server.store import ADMIN_SESSION_SECONDS
 from server.admin import STATUSES, change_license, guard_target, mount_admin, record_operation
 from server.cloud_budget import CloudBudget
@@ -70,6 +70,7 @@ class Question(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     context: str = Field(default="", max_length=3500)
     image: str = Field(default="", max_length=3_500_000)
+    language: Literal["uk", "en"] = "uk"
     mime: str = Field(default="image/png", pattern="^image/(png|jpeg)$")
 
 
@@ -360,20 +361,14 @@ def create_app(path=None):
 
     @app.post("/reports")
     def report(body: Problem, token=Depends(bearer)):
+        with db.transaction() as tx:
+            subject(tx, token)
         try:
             screenshot = base64.b64decode(body.screenshot, validate=True)
-        except ValueError:
-            raise HTTPException(422, "Invalid screenshot") from None
-        if screenshot and (len(screenshot) > 2_000_000 or not screenshot.startswith(b"\x89PNG\r\n\x1a\n")):
-            raise HTTPException(422, "Use a PNG screenshot up to 2 MB")
-        if screenshot:
-            try:
-                with Image.open(BytesIO(screenshot), formats=["PNG"]) as picture:
-                    if picture.width * picture.height > 12_500_000:
-                        raise ValueError("Image too large")
-                    picture.verify()
-            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
-                raise HTTPException(422, "Use a valid PNG screenshot up to 12.5 megapixels") from None
+            if screenshot:
+                screenshot = normalize_report_image(screenshot)
+        except ValueError as exc:
+            raise HTTPException(422, "Use a valid PNG, JPEG, WebP, BMP or GIF up to 2 MB and 12.5 megapixels") from exc
         with db.transaction() as tx:
             sub = subject(tx, token)
             count = tx.execute("SELECT count(*) FROM report WHERE sub=? AND created>?",
@@ -527,9 +522,9 @@ def create_app(path=None):
                     if picture:
                         final = engine.generate_image_answer(
                             picture, body.mime, on_text=progress, user_instruction=body.question,
-                            context=body.context, cancelled=cancelled.is_set)
+                            context=body.context, cancelled=cancelled.is_set, language=body.language)
                     else:
-                        final = engine.generate_answer(body.question, body.context, on_text=progress)
+                        final = engine.generate_answer(body.question, body.context, on_text=progress, language=body.language)
                 finally:
                     engine.close()
                 terminal = {"final": final}

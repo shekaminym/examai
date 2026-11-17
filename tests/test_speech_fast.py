@@ -200,3 +200,16 @@ class FastSpeechTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_speech_language_migration_enables_auto_and_preserves_current_choices(tmp_path):
+    from examai.config import ConfigManager
+
+    path = tmp_path / "config.json"
+    assert ConfigManager(path).get("whisper_language") == "auto"
+    path.write_text('{"whisper_language":"uk"}', encoding="utf-8")
+    config = ConfigManager(path)
+    assert config.get("whisper_language") == "auto"
+    for mode in ("uk", "ru", "en", "auto"):
+        config.set("whisper_language", mode)
+        assert ConfigManager(path).get("whisper_language") == mode

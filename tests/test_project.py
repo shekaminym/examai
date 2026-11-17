@@ -650,7 +650,7 @@ class QtTests(unittest.TestCase):
             task = worker.task
             self.assertEqual(task(), ("відповідь", "Готово"))
             controller.get_llm.return_value.generate_answer.assert_called_once_with(
-                "Що таке радіус-вектор?", "", on_text=ANY, mode="fast", request_id=ANY
+                "Що таке радіус-вектор?", "", on_text=ANY, mode="fast", request_id=ANY, language="uk"
             )
             controller.api = MagicMock()
             controller.submit_question("розшифровка", manual=False)
@@ -665,7 +665,7 @@ class QtTests(unittest.TestCase):
             second, _ = controller.start_api.call_args.args
             second.task()
             controller.get_llm.return_value.generate_answer.assert_called_with(
-                "виправлене питання", "", on_text=ANY, mode="fast", request_id=ANY
+                "виправлене питання", "", on_text=ANY, mode="fast", request_id=ANY, language="uk"
             )
             self.assertEqual(controller.db.get_history(), [])
             app.aboutToQuit.disconnect(controller.shutdown)
@@ -737,7 +737,7 @@ class QtTests(unittest.TestCase):
             controller.config.set("save_answer_history", True)
             engine = MagicMock(used_model="synthetic")
 
-            def answer(question, context, *, on_text, mode, request_id):
+            def answer(question, context, *, on_text, mode, request_id, language):
                 if question == "slow":
                     on_text("partial")
                     release.wait(4)
@@ -793,7 +793,7 @@ class QtTests(unittest.TestCase):
             release = threading.Event()
             engine = MagicMock(used_model="synthetic")
 
-            def answer(question, context, *, on_text, mode, request_id):
+            def answer(question, context, *, on_text, mode, request_id, language):
                 time.sleep(2.15)
                 on_text("First")
                 if not release.wait(3):
