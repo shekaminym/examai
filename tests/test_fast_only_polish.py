@@ -52,7 +52,7 @@ def test_retired_mode_argument_keeps_original_fast_prompt_and_budget():
     engine = LLMEngine("synthetic")
     with patch.object(engine, "_generate", return_value="ok") as generate:
         engine.generate_answer("Що таке граф?", "", mode="smart")
-    assert generate.call_args.args[0].startswith("Почни з відповіді українською")
+    assert "Answer in Ukrainian" in generate.call_args.args[0]
     assert generate.call_args.args[2] == 140
     with patch.object(engine, "_generate", return_value="ok") as generate:
         engine.generate_image_answer(b"image", "image/png", mode="smart")
@@ -181,3 +181,26 @@ def test_system_reduce_motion_forces_off_without_touching_speech():
         assert manager.duration(200) == 0
     finally:
         manager.restore()
+
+
+def test_reply_language_is_selected_per_call_without_rewriting_current_question():
+    from unittest.mock import patch
+    from examai.ai.llm_engine import LLMEngine
+    from examai.ai.conversation import CONVERSATION_HEADER
+
+    question = "Что такое антоним? Ответь одним словом."
+    history = CONVERSATION_HEADER + "Питання: Відповідай українською."
+    engine = LLMEngine()
+    with patch.object(engine, "_generate") as stream:
+        engine.generate_answer(question, history, language="en")
+        system, prompt, _budget = stream.call_args.args
+        assert "one-word answer, still uses English" in system
+        assert question in prompt and "Питання: Відповідай українською." in prompt
+        engine.generate_answer(question, history, language="uk")
+        assert "response language is Ukrainian" in stream.call_args.args[0]
+        engine.generate_answer(question + " Ответь по-русски.", history, language="en")
+        assert stream.call_args.args[0].startswith("Write the answer in Russian")
+        engine.generate_image_answer(b"image", "image/png", language="en", user_instruction="Answer in Russian")
+        assert stream.call_args.args[0].startswith("Write the answer in Russian")
+        engine.generate_summary("Term", language="en")
+        assert "response language is English" in stream.call_args.args[0]

@@ -22,12 +22,13 @@ DEFAULT_CONFIG = {
     "whisper_model_size": "base",
     "whisper_device": "cpu",
     "whisper_compute_type": "int8",
-    "whisper_language": "uk",
+    "whisper_language": "auto",
     "whisper_previews": True,
     "whisper_neural_vad": False,
     "whisper_noise_reduction": False,
     "whisper_end_silence_ms": 550,
     "speech_auto_language": False,
+    "speech_language_version": 1,
     "local_previews": False,
     "vad_mode": "auto",
     "speech_end_silence_ms": 420,
@@ -84,6 +85,10 @@ class ConfigManager:
             value = data.get(name)
             if type(value) is type(default):
                 config[name] = value
+        if data.get("speech_language_version") != 1 and config["whisper_language"] == "uk":
+            # Older releases persisted Ukrainian even when the user never chose it.
+            config["whisper_language"] = "auto"
+        config["speech_language_version"] = 1
         config["system_blur"] = False
         # SMART is retired. Keep the persisted field for old configs, but it
         # must never affect the active answer pipeline.

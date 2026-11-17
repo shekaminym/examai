@@ -99,8 +99,8 @@ class SlowSpeechReplayTests(unittest.TestCase):
         engine._generate = MagicMock(return_value="ok")
         engine.generate_answer("Джі, якщо було княста ф", "")
         instruction = engine._generate.call_args.args[0]
-        self.assertIn("Не вгадуй нерозбірливі слова", instruction)
-        self.assertNotIn("Виправ очевидну помилку розшифровки", instruction)
+        self.assertIn("Do not guess unclear words", instruction)
+        self.assertNotIn("correct obvious transcription mistakes", instruction)
 
 
 if __name__ == "__main__":

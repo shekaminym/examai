@@ -15,8 +15,8 @@ def _colorref(color):
 class SettingsWindow(QDialog):
     _caption = None
 
-    def set_caption_colors(self, background, foreground, dark):
-        self._caption = background, foreground, dark
+    def set_caption_colors(self, background, foreground, dark, *, border=None):
+        self._caption = background, foreground, dark, border
         self._apply_caption()
 
     def event(self, event):
@@ -36,7 +36,7 @@ class SettingsWindow(QDialog):
             set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
         except (AttributeError, OSError):
             return
-        background, foreground, dark = self._caption
+        background, foreground, dark, border = self._caption
         enabled = ctypes.c_int(dark)
         result = set_attribute(hwnd, 20, ctypes.byref(enabled), ctypes.sizeof(enabled))
         build = sys.getwindowsversion().build
@@ -44,6 +44,8 @@ class SettingsWindow(QDialog):
             # Early Windows 10 builds used attribute 19.
             set_attribute(hwnd, 19, ctypes.byref(enabled), ctypes.sizeof(enabled))
         if build >= 22000:
-            for attribute, color in ((35, background), (36, foreground)):
+            for attribute, color in ((34, border), (35, background), (36, foreground)):
+                if color is None:
+                    continue
                 value = ctypes.c_uint(_colorref(color))
                 set_attribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value))

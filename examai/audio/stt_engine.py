@@ -1,9 +1,10 @@
 """Local Whisper decoding for responsive previews and accurate final text."""
 import os
+from dataclasses import replace
 from math import gcd
 
 import numpy as np
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel as BaseWhisperModel
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import istft, resample_poly, stft
 
@@ -15,6 +16,22 @@ ACADEMIC_PROMPT = (
     "диз’юнкція, кон’юнкція, об’єднання, комп’ютер, зв’язок, "
     "рекурсивний метод, ітеративний метод."
 )
+
+
+class WhisperModel(BaseWhisperModel):
+    def detect_language(self, *args, **kwargs):
+        language, probability, probabilities = super().detect_language(*args, **kwargs)
+        if language not in {"uk", "ru", "en"}:
+            language, probability = next((item for item in probabilities if item[0] in {"uk", "ru", "en"}),
+                                         (language, probability))
+        return language, probability, probabilities
+
+    def generate_segments(self, features, tokenizer, options, log_progress, encoder_output=None):
+        # Language selection already happened in transcribe(). Use the Ukrainian
+        # academic prompt only when that language was actually selected.
+        if tokenizer.language_code == "uk" and not options.initial_prompt:
+            options = replace(options, initial_prompt=ACADEMIC_PROMPT)
+        return super().generate_segments(features, tokenizer, options, log_progress, encoder_output)
 
 
 def reduce_stationary_noise(audio, sample_rate):

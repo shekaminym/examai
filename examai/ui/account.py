@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QLabe
 
 from examai.beta import BetaClient, distribution_url
 from examai.branding import VERSION
+from examai.report_images import IMAGE_ERROR, MAX_IMAGE_BYTES, normalize_report_image
 from examai.windows.credentials import protect, reveal
 from examai.ui.settings_window import SettingsWindow
 
@@ -62,17 +63,18 @@ class WelcomeDialog(SettingsWindow):
         self.account = account
         self.setWindowTitle("EXAM AI · Вхід")
         self.setWindowFlag(Qt.WindowType.Window, True)
-        self.setModal(True)
-        self.set_caption_colors("#191824", "#eeeaf7", True)
+        self.set_caption_colors("#191824", "#eeeaf7", True, border="#302c41")
         self.setFixedWidth(440)
         self.setStyleSheet('''
             QDialog { background: #191824; }
             QLabel { color: #eeeaf7; background: transparent; font-size: 14px; }
             QLabel#WelcomeBrand { font-size: 23px; font-weight: 700; }
+            QLineEdit, QPushButton { outline: 0; }
             QLineEdit { color: #fff; background: #252335; border: 1px solid #45415b;
                         border-radius: 10px; padding: 10px; }
             QPushButton { color: #f8f5ff; background: #302949; border: 1px solid #50466b;
                           border-radius: 10px; padding: 10px; }
+            QLineEdit:focus, QPushButton:focus { border-color: #a596e9; }
             QPushButton#WelcomeGoogle { background: #644bb5; font-weight: 600; }
             QPushButton:disabled { color: #b4abc9; background: #373049; }
         ''')
@@ -94,7 +96,7 @@ class WelcomeDialog(SettingsWindow):
         layout.addWidget(QLabel("Увійти за допомогою"))
         self.google = account.button(layout, "Увійти через Google", account.sign_in)
         self.google.setObjectName("WelcomeGoogle")
-        self.cancel = account.button(layout, "Скасувати вхід", self.reject)
+        self.cancel = account.button(layout, "Скасувати вхід", self.cancel_attempt)
         self.replace_device = account.button(layout, "Завершити старий сеанс", account.replace_device)
         self.feedback = QLabel()
         self.feedback.setTextFormat(Qt.TextFormat.PlainText)
@@ -119,11 +121,12 @@ class WelcomeDialog(SettingsWindow):
         self.cancel.setVisible(busy)
         self.replace_device.setVisible(bool(self.account.device_limit and not busy))
 
+    def cancel_attempt(self):
+        self.account.cancel_login()
+        self.feedback.setText("Вхід скасовано. Можна повторити спробу.")
+
     def reject(self):
-        if self.account.job is not None or self.account.timer.isActive():
-            self.account.cancel_login()
-            self.feedback.setText("Вхід скасовано. Можна повторити спробу.")
-            return
+        self.account.cancel_login()
         super().reject()
 
     def use_byok(self):
@@ -147,10 +150,12 @@ class AccountPanel(QWidget):
         self.closing = False
         self.claim = ""
         self.device_limit = False
+        self.provisional_client = None
         self.profile_id = ""
         self.balance_job = None
         self.login_attempt = 0
         self.welcome = None
+        self.welcome_resume = None
         self.startup_ready = None
         self.startup_exit = None
         self.available_plans = {}
@@ -293,18 +298,36 @@ class AccountPanel(QWidget):
                 self.welcome.name.setText(reveal(self.config.get("account_name")))
             except (ValueError, OSError):
                 pass
-        self.welcome.show()
+        if parent.isVisible():
+            # Windows must not keep the always-on-top main window above the sign-in form.
+            self.welcome_resume = parent
+            parent.hide()
+        self.welcome.showNormal()
+        self.focus_welcome()
+        self.welcome.name.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def focus_welcome(self):
+        if not self.welcome or not self.welcome.isVisible():
+            return False
+        if self.welcome.isMinimized():
+            self.welcome.showNormal()
         self.welcome.raise_()
         self.welcome.activateWindow()
+        return True
 
     def welcome_finished(self, result):
         ready, self.startup_ready = self.startup_ready, None
         close, self.startup_exit = self.startup_exit, None
+        resume, self.welcome_resume = self.welcome_resume, None
         if ready is not None:
             if result == QDialog.DialogCode.Accepted:
                 ready()
             else:
                 close()
+        elif resume is not None and not self.closing:
+            resume.show()
+            resume.raise_()
+            resume.activateWindow()
 
     def remember_name(self, name):
         if name:
@@ -355,8 +378,18 @@ class AccountPanel(QWidget):
         self.timer.stop()
         self.claim = ""
         self.device_limit = False
+        if self.provisional_client is not None:
+            abandoned, self.provisional_client = self.provisional_client, None
+            self.client = BetaClient(abandoned.url)
+            self.revoke_abandoned_session(abandoned)
         if self.welcome:
             self.welcome.update_controls()
+
+    def revoke_abandoned_session(self, client):
+        # Run independently of the login worker. Its result cannot change the active account.
+        worker = NetworkJob(lambda: client.request("POST", "/logout"), self)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def sign_in(self):
         if self.job is not None or self.timer.isActive():
@@ -431,22 +464,23 @@ class AccountPanel(QWidget):
         if monotonic() >= self.timeout:
             self.login_failed(attempt, "Login expired")
             return
-        claim = self.claim
+        claim, client = self.claim, self.client
 
         def completed(result):
             if result.get("pending"):
                 return
             if attempt != self.login_attempt:
-                abandoned = BetaClient(self.client.url, result["token"])
-                self.launch(lambda: abandoned.request("POST", "/logout"), lambda _result: None)
+                abandoned = BetaClient(client.url, result["token"])
+                self.revoke_abandoned_session(abandoned)
                 return
             self.timer.stop()
             self.claim = ""
             self.device_limit = False
             self.client.token = result["token"]
+            self.provisional_client = self.client
             self.complete_profile(self.welcome.name.text().strip())
 
-        self.launch(lambda: self.client.request("POST", "/oauth/claim", {"claim": claim, "replace": replace}),
+        self.launch(lambda: client.request("POST", "/oauth/claim", {"claim": claim, "replace": replace}),
                     completed, on_error=lambda error: self.login_failed(attempt, error))
 
     def complete_profile(self, name):
@@ -456,6 +490,7 @@ class AccountPanel(QWidget):
         def saved(account):
             if attempt != self.login_attempt:
                 return
+            self.provisional_client = None
             self.update_controls()
             self.url.setReadOnly(True)
             try:
@@ -685,19 +720,19 @@ class AccountPanel(QWidget):
 
         def select_screenshot():
             nonlocal screenshot_data
-            name, _ = QFileDialog.getOpenFileName(panel, "Select screenshot", "", "PNG (*.png)")
+            name, _ = QFileDialog.getOpenFileName(
+                panel, "Select screenshot", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"
+            )
             if not name:
                 return
             try:
                 with Path(name).open("rb") as file:
-                    data = file.read(2_000_001)
-                if len(data) > 2_000_000 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
-                    raise ValueError
+                    data = normalize_report_image(file.read(MAX_IMAGE_BYTES + 1))
                 preview = QPixmap()
                 if not preview.loadFromData(data, "PNG"):
-                    raise ValueError
+                    raise ValueError(IMAGE_ERROR)
             except (OSError, ValueError):
-                status.setText("Choose a valid PNG screenshot up to 2 MB.")
+                status.setText(IMAGE_ERROR)
                 return
             screenshot_data = data
             screenshot.setPixmap(preview.scaled(320, 180, Qt.AspectRatioMode.KeepAspectRatio,
@@ -713,7 +748,7 @@ class AccountPanel(QWidget):
             screenshot.hide()
             remove.hide()
 
-        self.button(layout, "Attach PNG screenshot", select_screenshot)
+        self.button(layout, "Attach image", select_screenshot)
         layout.addWidget(screenshot)
         remove = self.button(layout, "Remove screenshot", clear_screenshot)
         remove.hide()

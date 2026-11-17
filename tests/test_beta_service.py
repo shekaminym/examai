@@ -187,7 +187,7 @@ def test_cloud_requires_lease_and_streams_once(tmp_path, monkeypatch):
         def close(self):
             pass
 
-        def generate_answer(self, question, context, on_text):
+        def generate_answer(self, question, context, on_text, *, language="uk"):
             calls.append((question, context))
             on_text("First fragment")
             return "First fragment and rest"
@@ -227,7 +227,7 @@ def test_cloud_budget_meters_tokens_and_stops_before_next_provider_request(tmp_p
         def close(self):
             pass
 
-        def generate_answer(self, question, context, on_text):
+        def generate_answer(self, question, context, on_text, *, language="uk"):
             Engine.calls += 1
             self.usage_callback(4, 4)
             return "Done"

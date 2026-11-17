@@ -80,20 +80,20 @@ class CloudEngine:
     def close(self):
         pass
 
-    def generate_answer(self, question, context, *, on_text=None, request_id="-", **_kwargs):
-        return self._stream({"question": question[:4000], "context": context[:3500]}, on_text, request_id)
+    def generate_answer(self, question, context, *, on_text=None, request_id="-", language="uk", **_kwargs):
+        return self._stream({"question": question[:4000], "context": context[:3500], "language": language}, on_text, request_id)
 
     def generate_image_answer(self, image, mime, *, on_text=None, user_instruction="", context="",
-                              request_id="-", cancelled=None, **_kwargs):
+                              request_id="-", cancelled=None, language="uk", **_kwargs):
         if not image or len(image) > 2_625_000 or mime not in {"image/png", "image/jpeg"}:
             raise GenerationError("Зображення завелике або пошкоджене. Виділіть меншу область.")
         return self._stream({"question": user_instruction[:4000] or "Проаналізуй зображення",
-                             "context": context[:3500], "mime": mime,
+                             "context": context[:3500], "mime": mime, "language": language,
                              "image": base64.b64encode(image).decode()}, on_text, request_id, cancelled)
 
-    def generate_summary(self, context, *, cancelled=None):
+    def generate_summary(self, context, *, cancelled=None, language="uk"):
         return self._stream({"question": "Склади короткий конспект за наданим текстом.",
-                             "context": context[:3500]}, None, "-", cancelled)
+                             "context": context[:3500], "language": language}, None, "-", cancelled)
 
     def _stream(self, body, on_text, request_id="-", cancelled=None):
         started = perf_counter()

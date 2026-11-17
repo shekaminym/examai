@@ -74,6 +74,58 @@ def test_startup_opens_google_login_with_name_field(tmp_path):
     app.processEvents()
 
 
+def test_switch_account_replaces_the_topmost_window_until_login_is_closed(tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    from examai.config import ConfigManager
+    from examai.database import DatabaseManager
+    from examai.ui.ui_main import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(ConfigManager(tmp_path / "config.json"),
+                        DatabaseManager(tmp_path / "notes.db"), startup_devices=[])
+    panel = window.account_panel
+    panel.client.url = "http://127.0.0.1:8000"
+    panel.client.token = "previous-session"
+    window.show()
+    window.account_window.show()
+    calls = []
+    monkeypatch.setattr(panel.client, "request",
+                        lambda method, path: calls.append((method, path)) or {"ok": True})
+
+    panel.sign_out(switch=True)
+    for _ in range(100):
+        if panel.welcome and panel.welcome.isVisible():
+            break
+        QTest.qWait(10)
+    assert calls == [("POST", "/logout")]
+    assert not panel.client.token
+    assert window.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+    assert not window.isVisible()
+    assert not window.account_window.isVisible()
+    assert panel.welcome.isVisible()
+    assert panel.welcome.windowModality() == Qt.WindowModality.NonModal
+
+    QTest.keyClicks(panel.welcome.name, "Second account")
+    assert panel.welcome.google.isEnabled()
+    panel.timer.start()
+    panel.welcome.update_controls()
+    QTest.mouseClick(panel.welcome.cancel, Qt.MouseButton.LeftButton)
+    assert panel.welcome.isVisible()
+    assert not panel.timer.isActive()
+    # Even while waiting on Google, the title-bar Close action can leave the form.
+    panel.timer.start()
+    panel.welcome.close()
+    app.processEvents()
+    assert not panel.welcome.isVisible()
+    assert not panel.timer.isActive()
+    assert window.isVisible()
+    assert not window.account_window.isVisible()
+    window.hide()
+    panel.stop_jobs()
+
+
 def test_users_search_by_unicode_name_and_returns_real_sorted_usage(tmp_path, monkeypatch):
     client, store, headers = prepared(tmp_path, monkeypatch)
     assert client.put("/account/name", headers=headers["qa"], json={"name": "Ївга"}).status_code == 200
