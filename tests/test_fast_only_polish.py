@@ -52,7 +52,7 @@ def test_retired_mode_argument_keeps_original_fast_prompt_and_budget():
     engine = LLMEngine("synthetic")
     with patch.object(engine, "_generate", return_value="ok") as generate:
         engine.generate_answer("Що таке граф?", "", mode="smart")
-    assert generate.call_args.args[0].startswith("Answer in Ukrainian by default")
+    assert generate.call_args.args[0].startswith("Write your answer in Ukrainian.")
     assert generate.call_args.args[2] == 140
     with patch.object(engine, "_generate", return_value="ok") as generate:
         engine.generate_image_answer(b"image", "image/png", mode="smart")
@@ -194,12 +194,12 @@ def test_reply_language_is_selected_per_call_without_rewriting_current_question(
     with patch.object(engine, "_generate") as stream:
         engine.generate_answer(question, history, language="en")
         system, prompt, _budget = stream.call_args.args
-        assert system.startswith("Answer in English by default")
-        assert "current user explicitly requests" in system
-        assert question in prompt and history in prompt
+        assert system.startswith("Write your answer in English.")
+        assert "current user explicitly names" in system
+        assert question in prompt and "Питання: Відповідай українською." in prompt
         engine.generate_answer(question, history, language="uk")
-        assert stream.call_args.args[0].startswith("Answer in Ukrainian by default")
+        assert stream.call_args.args[0].startswith("Write your answer in Ukrainian.")
         engine.generate_image_answer(b"image", "image/png", language="en")
-        assert stream.call_args.args[0].startswith("Answer in English by default")
+        assert stream.call_args.args[0].startswith("Write your answer in English.")
         engine.generate_summary("Term", language="en")
-        assert stream.call_args.args[0].startswith("Answer in English by default")
+        assert stream.call_args.args[0].startswith("Write your answer in English.")

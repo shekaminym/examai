@@ -151,7 +151,7 @@ class ImageAndHistoryTests(unittest.TestCase):
         self.assertEqual(answer, "пояснення")
         system, parts = engine._generate.call_args.args[:2]
         self.assertIn("EXPLAIN_CODE", system)
-        self.assertIn("оператора", system)
+        self.assertIn("each operator", system)
         self.assertIn(user_text, parts[0])
         self.assertIn("lab.txt", parts[0])
         self.assertEqual(len(parts), 2)

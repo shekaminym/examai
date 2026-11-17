@@ -322,7 +322,7 @@ class APITests(unittest.TestCase):
         payload = json.loads(request.content)
         self.assertNotIn("thinkingConfig", payload["generationConfig"])
         text = payload["contents"][0]["parts"][0]["text"]
-        self.assertIn("Довідкові уривки з конспектів", text)
+        self.assertIn("Reference excerpts from Notes", text)
 
 
     def test_gemini_recovers_from_rejected_parameters_and_reuses_basic_request(self):
@@ -341,7 +341,7 @@ class APITests(unittest.TestCase):
                 }})
             self.assertEqual(set(body), {"contents"})
             prompt = body["contents"][0]["parts"][0]["text"]
-            self.assertIn("Запитання:", prompt)
+            self.assertIn("Current user question:", prompt)
             chunk = {"candidates": [{"content": {"parts": [{"text": "Answer"}]},
                                      "finishReason": "STOP"}]}
             return httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\n")
@@ -421,10 +421,10 @@ class APITests(unittest.TestCase):
             payload = json.loads(request.content)
             system = payload["systemInstruction"]["parts"][0]["text"]
             self.assertIn("Формола, радіус-вектор", system)
-            self.assertIn("коротко попроси уточнити", system)
-            self.assertIn("застосування називай прикладами", system)
+            self.assertIn("ask a brief clarifying question", system)
+            self.assertIn("applications as examples", system)
             text = payload["contents"][0]["parts"][0]["text"]
-            self.assertEqual(text, "Запитання:\nФормола, радіус-вектор.")
+            self.assertEqual(text, "Current user question:\nФормола, радіус-вектор.")
         engine.generate_answer("Що таке матриця?", "")
         self.assertEqual(len(requests), 3)
         self.assertIn("/models/gemini-3.1-flash-lite:", requests[2].url.path)
