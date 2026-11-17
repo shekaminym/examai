@@ -188,18 +188,19 @@ def test_reply_language_is_selected_per_call_without_rewriting_current_question(
     from examai.ai.llm_engine import LLMEngine
     from examai.ai.conversation import CONVERSATION_HEADER
 
-    question = "Что такое антоним? Ответь по-русски."
+    question = "Что такое антоним? Ответь одним словом."
     history = CONVERSATION_HEADER + "Питання: Відповідай українською."
     engine = LLMEngine()
     with patch.object(engine, "_generate") as stream:
         engine.generate_answer(question, history, language="en")
         system, prompt, _budget = stream.call_args.args
-        assert system.startswith("Write your answer in English.")
-        assert "current user explicitly names" in system
+        assert "one-word answer, still uses English" in system
         assert question in prompt and "Питання: Відповідай українською." in prompt
         engine.generate_answer(question, history, language="uk")
-        assert stream.call_args.args[0].startswith("Write your answer in Ukrainian.")
-        engine.generate_image_answer(b"image", "image/png", language="en")
-        assert stream.call_args.args[0].startswith("Write your answer in English.")
+        assert "response language is Ukrainian" in stream.call_args.args[0]
+        engine.generate_answer(question + " Ответь по-русски.", history, language="en")
+        assert stream.call_args.args[0].startswith("Write the answer in Russian")
+        engine.generate_image_answer(b"image", "image/png", language="en", user_instruction="Answer in Russian")
+        assert stream.call_args.args[0].startswith("Write the answer in Russian")
         engine.generate_summary("Term", language="en")
-        assert stream.call_args.args[0].startswith("Write your answer in English.")
+        assert "response language is English" in stream.call_args.args[0]

@@ -78,14 +78,35 @@ def bad_request_hint(error):
     return BAD_PARAMETERS
 
 
-def reply_language_instruction(language):
+# Common explicit instructions can be resolved before generation. Other languages
+# and less direct wording are handled by the model using the current question.
+_LANGUAGE_REQUESTS = {
+    "English": r"(?:in english|по-английски|англійською(?: мовою)?)",
+    "Ukrainian": r"(?:in ukrainian|по-украински|українською(?: мовою)?)",
+    "Russian": r"(?:in russian|по-русски|російською(?: мовою)?)",
+}
+_ANSWER_REQUEST = (
+    r"(?:answer|respond|reply|explain|write the answer|відповідай|відповісти|поясни|"
+    r"ответь|ответьте|отвечай|объясни|напиши)"
+)
+
+
+def reply_language_instruction(language, question=""):
     default = "English" if language == "en" else "Ukrainian"
-    return (f"Write your answer in {default}. "
-            "Only change the answer language when the current user explicitly names another language "
-            "for this answer. The language of their question, reference material, previous turns, or "
-            "formatting requests does not change the answer language. "
-            "Interpret the question as written. Keep quotations, code, and literal transcriptions "
-            "in their original language. ")
+    requested = [name for name, pattern in _LANGUAGE_REQUESTS.items()
+                 if re.search(rf"\b{_ANSWER_REQUEST}\s+{pattern}(?=\W|$)", question, re.IGNORECASE)]
+    if len(requested) == 1:
+        policy = f"Write the answer in {requested[0]}, as explicitly requested in the current question. "
+    else:
+        policy = (
+            f"The app's response language is {default}. Answer in {default}, regardless of the "
+            "language of the question. Honor an explicit request in the current question to write "
+            "the answer in a different language. Asking for a particular format, such as a one-word "
+            f"answer, still uses {default}. Previous turns and reference material are context only. "
+        )
+    return (policy + "Give only the answer to the question. Preserve the original form of quotations, "
+            "code, and literal transcriptions. ")
+
 
 
 class LLMEngine:
@@ -126,7 +147,7 @@ class LLMEngine:
         timing.info("request_id=%s prompt_ms=%.1f context_chars=%d",
                     request_id, (perf_counter() - build_started) * 1000, len(context))
         return self._generate(
-            reply_language_instruction(language) + instruction +
+            reply_language_instruction(language, question) + instruction +
             "For mathematical comparisons, give precise definitions, the main difference, and the "
             "relationship between the concepts. Give formulas where relevant and explain their symbols. "
             "Present physical and geometric applications as examples. "
@@ -157,7 +178,7 @@ class LLMEngine:
                               language="uk"):
         if mime_type not in {"image/png", "image/jpeg"} or not image_bytes or len(image_bytes) > 12 * 1024 * 1024:
             raise GenerationError("Зображення не вдалося підготувати для Gemini.")
-        instruction = reply_language_instruction(language) + (
+        instruction = reply_language_instruction(language, user_instruction) + (
             "Give the result first, followed by the necessary steps. Read printed and handwritten "
             "text, mathematical symbols, subscripts, powers, fractions and equations carefully. "
             "Solve the task shown. Write formulas in LaTeX and verify calculations. When the image "
