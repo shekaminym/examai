@@ -10,7 +10,6 @@ from google.genai import types
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtTest import QTest
 
-from examai.ai.conversation import CONVERSATION_HEADER
 from examai.ai.llm_engine import LLMEngine
 from tests.test_context_stability import controller
 
@@ -113,18 +112,19 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
             released.set()
         return posted[-1]["contents"][0]["parts"][0]["text"]
 
+    history_label = "Previous conversation (context only):"
     try:
         for question in ("Інтеграл", "Що таке Диференціювання?"):
             send(question, voice=cloud)
         payload = send("В чому різниця між ними?", voice=cloud)
-        current_question, memory = payload.split(CONVERSATION_HEADER, 1)
+        current_question, memory = payload.split(history_label, 1)
         assert "Інтеграл" in current_question and "Диференціювання" in current_question
         assert "Інтеграл" in memory and "Диференціювання" in memory
         ctl.on_clear_all()
         for question in ("Що таке диз'юнкція?", "Що таке кон'юнкція?"):
             send(question)
         payload = send("Чим вони відрізняються?")
-        assert CONVERSATION_HEADER in payload and "диз'юнкція" in payload and "кон'юнкція" in payload
+        assert history_label in payload and "диз'юнкція" in payload and "кон'юнкція" in payload
         ctl.on_clear_all()
         names = ["пряма рекурсія", "взаємна рекурсія", "хвостова рекурсія"]
         for name in names:
@@ -135,8 +135,8 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
             if followup.startswith("У"):
                 assert all(name in payload for name in names)
             else:
-                assert CONVERSATION_HEADER in payload
-        assert CONVERSATION_HEADER not in send("Як створити таблицю в SQLite?")
+                assert history_label in payload
+        assert history_label not in send("Як створити таблицю в SQLite?")
         ctl.on_clear_all()
         from pathlib import Path
         ctl.rag.index_file_sync(Path(__file__).parent / "fixtures" / "code.txt")
@@ -144,7 +144,7 @@ def test_fast_sdk_payload_and_first_chunk(tmp_path, monkeypatch, cloud):
         assert "58:" in payload and "double" in payload
         for followup in ("Детальніше розкажи", "А для чого потрібна ця змінна?"):
             payload = send(followup)
-            assert all(anchor in payload for anchor in (CONVERSATION_HEADER, "code.txt", "58:", "double"))
+            assert all(anchor in payload for anchor in (history_label, "code.txt", "58:", "double"))
     finally:
         ctl.audio = None
         ctl.shutdown()

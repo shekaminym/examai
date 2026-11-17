@@ -102,7 +102,7 @@ class ScreenSelectionTests(unittest.TestCase):
         self.assertEqual(inline.get("mimeType", inline.get("mime_type")), "image/png")
         encoded = inline["data"]
         self.assertEqual(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)), image_bytes)
-        self.assertIn("рукописний", payload["systemInstruction"]["parts"][0]["text"])
+        self.assertIn("printed and handwritten", payload["systemInstruction"]["parts"][0]["text"])
 
     def test_gemini_400_basic_retry_keeps_image(self):
         bodies = []
