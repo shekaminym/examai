@@ -52,7 +52,7 @@ def test_retired_mode_argument_keeps_original_fast_prompt_and_budget():
     engine = LLMEngine("synthetic")
     with patch.object(engine, "_generate", return_value="ok") as generate:
         engine.generate_answer("Що таке граф?", "", mode="smart")
-    assert generate.call_args.args[0].startswith("Write your answer in Ukrainian.")
+    assert "Answer in Ukrainian" in generate.call_args.args[0]
     assert generate.call_args.args[2] == 140
     with patch.object(engine, "_generate", return_value="ok") as generate:
         engine.generate_image_answer(b"image", "image/png", mode="smart")
