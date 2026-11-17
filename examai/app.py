@@ -713,6 +713,8 @@ class MainController(QObject):
 
     @Slot()
     def recover_window(self):
+        if not self.closing and self.ui.account_panel.focus_welcome():
+            return
         if not self.closing:
             self._restore_fully_transparent_window()
             if self._sharing_minimized:
