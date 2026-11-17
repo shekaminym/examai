@@ -62,16 +62,18 @@ class WelcomeDialog(SettingsWindow):
         self.account = account
         self.setWindowTitle("EXAM AI · Вхід")
         self.setWindowFlag(Qt.WindowType.Window, True)
-        self.set_caption_colors("#191824", "#eeeaf7", True)
+        self.set_caption_colors("#191824", "#eeeaf7", True, border="#302c41")
         self.setFixedWidth(440)
         self.setStyleSheet('''
             QDialog { background: #191824; }
             QLabel { color: #eeeaf7; background: transparent; font-size: 14px; }
             QLabel#WelcomeBrand { font-size: 23px; font-weight: 700; }
+            QLineEdit, QPushButton { outline: 0; }
             QLineEdit { color: #fff; background: #252335; border: 1px solid #45415b;
                         border-radius: 10px; padding: 10px; }
             QPushButton { color: #f8f5ff; background: #302949; border: 1px solid #50466b;
                           border-radius: 10px; padding: 10px; }
+            QLineEdit:focus, QPushButton:focus { border-color: #a596e9; }
             QPushButton#WelcomeGoogle { background: #644bb5; font-weight: 600; }
             QPushButton:disabled { color: #b4abc9; background: #373049; }
         ''')
