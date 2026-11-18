@@ -1,3 +1,7 @@
 EXAM AI Closed Beta
 
-This pre-release may change or become unavailable. Use the application only with permission to process the audio, screen content and documents you submit. Online functions send the relevant inputs to the selected service. Bug reports are submitted only when you choose to send them.
+This pre-release may change or become unavailable. Use the application only with permission to process the audio, screen content and documents you submit.
+
+For an AI answer, EXAM AI may send your question, selected screen image and relevant text from imported files or earlier messages to Google Gemini. EXAM AI Cloud sends these inputs through the EXAM AI server. If you use your own Gemini API key, the client sends them to Gemini directly. Avoid submitting passwords, private records or material you lack permission to share.
+
+Bug reports and their attachments are sent to EXAM AI only when you submit them. Authorized beta administrators can read them.

@@ -14,19 +14,23 @@ class CloudBudget:
                 all(rate.is_finite() and rate > 0 for rate in (self.input_rate, self.output_rate))):
             raise ValueError("Configure positive Cloud reservation, daily budget and token rates")
 
-    def reserve(self, tx, request_id, day):
+    def estimate(self, input_tokens, output_tokens):
+        return int((self.input_rate * input_tokens + self.output_rate * output_tokens)
+                   .to_integral_value(rounding=ROUND_CEILING))
+
+    def reserve(self, tx, request_id, day, *, amount=None):
+        amount = self.reservation if amount is None else amount
         reserved = tx.execute("SELECT coalesce(sum(micro_usd),0) FROM cloud_charge WHERE day=?",
                               (day,)).fetchone()[0]
-        if reserved + self.reservation > self.cap:
+        if reserved + amount > self.cap:
             return False
         tx.execute("INSERT INTO cloud_charge(id,day,micro_usd) VALUES (?,?,?)",
-                   (request_id, day, self.reservation))
+                   (request_id, day, amount))
         return True
 
     def settle(self, tx, request_id, input_tokens, output_tokens, complete, metered):
         # USD per million tokens is numerically equal to micro-USD per token.
-        actual = int((self.input_rate * input_tokens + self.output_rate * output_tokens)
-                     .to_integral_value(rounding=ROUND_CEILING))
-        charge = actual if complete and metered else max(actual, self.reservation)
-        tx.execute("UPDATE cloud_charge SET input_tokens=?,output_tokens=?,micro_usd=? WHERE id=?",
-                   (input_tokens, output_tokens, charge, request_id))
+        actual = self.estimate(input_tokens, output_tokens)
+        tx.execute("""UPDATE cloud_charge SET input_tokens=?,output_tokens=?,
+            micro_usd=CASE WHEN ? THEN ? ELSE max(micro_usd,?) END WHERE id=?""",
+                   (input_tokens, output_tokens, complete and metered, actual, actual, request_id))

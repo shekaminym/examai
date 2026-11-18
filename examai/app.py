@@ -562,6 +562,7 @@ class TaskWorker(QThread):
     result = Signal(object, str)
     progress = Signal(str, float)
     answer_ready = Signal(str)
+    cloud_status = Signal(object)
 
     def __init__(self, task, failure_message, *, request_id="-"):
         super().__init__()
@@ -822,21 +823,23 @@ class MainController(QObject):
     def _run_listen_lease(self, client, action):
         from examai.ui.account import NetworkJob
         def perform():
+            if action == "acquire" and client.has_answer_queue():
+                return "local_audio"
             if action == "renew":
                 if not client.request("POST", "/activity/start")["granted"]:
                     raise GenerationError("Beta access expired.")
             else:
                 getattr(client, action)()
         job = self._lease_worker = NetworkJob(perform, self)
-        def result(_value, error):
+        def result(value, error):
             if self.closing:
-                if action == "acquire" and not error:
+                if action == "acquire" and not error and value != "local_audio":
                     self._cloud_listening = client
                 return
             if action == "acquire":
                 self.ui.btn_toggle_listen.setEnabled(True)
             if action != "release" and client is not self.ui.account_panel.client:
-                if action == "acquire" and not error:
+                if action == "acquire" and not error and value != "local_audio":
                     self._cloud_listening = client
                 return
             if error:
@@ -845,8 +848,9 @@ class MainController(QObject):
                     self.audio.requestInterruption()
                 return
             if action == "acquire":
-                self._cloud_listening = client
-                self._lease_timer.start()
+                if value != "local_audio":
+                    self._cloud_listening = client
+                    self._lease_timer.start()
                 self._start_audio()
         job.result.connect(result, Qt.ConnectionType.QueuedConnection)
         job.finished.connect(self._lease_done)
@@ -1204,7 +1208,8 @@ class MainController(QObject):
             self.ui.lbl_status.setText("Мережа затримує попередні запити. Повторіть спробу.")
             return
         llm = self.get_llm(mode)
-        self._cancel_vision_shortcut.setEnabled(has_image)
+        cloud_answer = isinstance(llm, CloudEngine)
+        self._cancel_vision_shortcut.setEnabled(has_image or cloud_answer)
         self._dev_request_started_at = submitted
         self._answer_request_id = request_id
         self._current_question = question
@@ -1306,9 +1311,13 @@ class MainController(QObject):
                         request_id, conversation_id, len(prior), len(context),
                         "cloud" if isinstance(llm, CloudEngine) else "byok")
             try:
+                cloud_status = {"on_status": worker.cloud_status.emit} if cloud_answer else {}
                 if not has_image:
+                    if cloud_answer:
+                        cloud_status["cancelled"] = cancelled.is_set
                     answer = llm.generate_answer(provider_question, context, on_text=on_text,
-                                                 mode=mode, request_id=request_id, language=answer_language)
+                                                 mode=mode, request_id=request_id, language=answer_language,
+                                                 **cloud_status)
                 else:
                     encode_started = perf_counter()
                     try:
@@ -1335,7 +1344,7 @@ class MainController(QObject):
                         prepared_bytes, prepared_mime, on_text=on_text,
                         mode=mode, request_id=request_id, user_instruction=image_instruction,
                         context=image_context, intent=intent, cancelled=cancelled.is_set,
-                        language=answer_language,
+                        language=answer_language, **cloud_status,
                     )
             except GenerationError:
                 if latest_text and not cancelled.is_set():
@@ -1360,6 +1369,7 @@ class MainController(QObject):
         worker.memory_question = question
         worker.memory_evidence = ""
         worker.progress.connect(self.on_answer_progress)
+        worker.cloud_status.connect(self._on_cloud_status)
         worker.answer_ready.connect(self._answer_ready)
         self.start_api(worker, self.on_answer)
 
@@ -1367,6 +1377,19 @@ class MainController(QObject):
     def _show_answer_delay(self):
         if not self.closing and not self._answer_cleared and not self.answer_started:
             self.ui.lbl_status.setText("Відповідь затримується…")
+
+    @Slot(object)
+    def _on_cloud_status(self, position):
+        if self.closing or self.sender() is not self.api:
+            return
+        self._answer_hint_timer.stop()
+        english = self.ui.tr.current_lang == "ENG"
+        if position is None:
+            label = "Generating answer… Esc to cancel" if english else "Готуємо відповідь… Esc — скасувати"
+        else:
+            label = (f"Queue position: {position} · Esc to cancel" if english
+                     else f"Місце в черзі: {position} · Esc — скасувати")
+        self.ui.lbl_status.setText(label)
 
     def _cancel_active_answer(self):
         worker = self.api
@@ -1383,10 +1406,14 @@ class MainController(QObject):
 
     @Slot()
     def _cancel_vision_answer(self):
+        cloud = isinstance(self.llm, CloudEngine)
         self._cancel_active_answer()
         self._answer_hint_timer.stop()
         self.ui.live_cards.clear()
-        self.ui.lbl_status.setText("Аналіз зображення скасовано.")
+        if cloud:
+            self.ui.lbl_status.setText("Request cancelled." if self.ui.tr.current_lang == "ENG" else "Запит скасовано.")
+        else:
+            self.ui.lbl_status.setText("Аналіз зображення скасовано.")
         self._sync_history_controls()
         self._start_pending_answer()
 

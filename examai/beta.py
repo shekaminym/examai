@@ -33,6 +33,7 @@ class BetaClient:
         self.token = token
         self.lock = threading.Lock()
         self.users = 0
+        self._answer_queue = None
 
     def request(self, method, route, body=None):
         if not self.url:
@@ -53,6 +54,16 @@ class BetaClient:
 
     def headers(self):
         return {"Authorization": "Bearer " + self.token} if self.token else {}
+
+    def has_answer_queue(self):
+        if self._answer_queue is None:
+            try:
+                self._answer_queue = bool(self.request("GET", "/cloud/capabilities").get("answer_queue"))
+            except GenerationError as exc:
+                if str(exc) != "Not Found":
+                    raise
+                self._answer_queue = False
+        return self._answer_queue
 
     def acquire(self):
         with self.lock:
@@ -80,24 +91,30 @@ class CloudEngine:
     def close(self):
         pass
 
-    def generate_answer(self, question, context, *, on_text=None, request_id="-", language="uk", **_kwargs):
-        return self._stream({"question": question[:4000], "context": context[:3500], "language": language}, on_text, request_id)
+    def generate_answer(self, question, context, *, on_text=None, request_id="-", language="uk",
+                        cancelled=None, on_status=None, **_kwargs):
+        return self._stream({"question": question[:4000], "context": context[:3500], "language": language},
+                            on_text, request_id, cancelled, on_status)
 
     def generate_image_answer(self, image, mime, *, on_text=None, user_instruction="", context="",
-                              request_id="-", cancelled=None, language="uk", **_kwargs):
+                              request_id="-", cancelled=None, language="uk", on_status=None, **_kwargs):
         if not image or len(image) > 2_625_000 or mime not in {"image/png", "image/jpeg"}:
             raise GenerationError("Зображення завелике або пошкоджене. Виділіть меншу область.")
         return self._stream({"question": user_instruction[:4000] or "Проаналізуй зображення",
                              "context": context[:3500], "mime": mime, "language": language,
-                             "image": base64.b64encode(image).decode()}, on_text, request_id, cancelled)
+                             "image": base64.b64encode(image).decode()}, on_text, request_id, cancelled, on_status)
 
     def generate_summary(self, context, *, cancelled=None, language="uk"):
         return self._stream({"question": "Склади короткий конспект за наданим текстом.",
                              "context": context[:3500], "language": language}, None, "-", cancelled)
 
-    def _stream(self, body, on_text, request_id="-", cancelled=None):
+    def _stream(self, body, on_text, request_id="-", cancelled=None, on_status=None):
         started = perf_counter()
-        self.client.acquire()
+        server_queue = self.client.has_answer_queue()
+        if server_queue:
+            body["queue"] = True
+        else:
+            self.client.acquire()
         timing = logging.getLogger("phantom.timing")
         timing.info("request_id=%s cloud_lease_ms=%.2f", request_id, (perf_counter() - started) * 1000)
         sent = perf_counter()
@@ -110,8 +127,10 @@ class CloudEngine:
                         break
                 except GenerationError:
                     break
-        worker = threading.Thread(target=heartbeat, daemon=True)
-        worker.start()
+        worker = None
+        if not server_queue:
+            worker = threading.Thread(target=heartbeat, daemon=True)
+            worker.start()
         try:
             if cancelled and cancelled():
                 raise GenerationError("Запит скасовано.")
@@ -124,6 +143,8 @@ class CloudEngine:
                     if cancelled and cancelled():
                         raise GenerationError("Запит скасовано.")
                     event = json.loads(line)
+                    if on_status and ("queued" in event or "started" in event):
+                        on_status(event.get("queued"))
                     if "text" in event and on_text:
                         if first:
                             timing.info("request_id=%s cloud_ttft_ms=%.2f", request_id, (perf_counter() - sent) * 1000)
@@ -132,11 +153,34 @@ class CloudEngine:
                     if "final" in event:
                         return event["final"]
                     if "error" in event:
+                        language = body.get("language")
+                        if event.get("error_code") == "queue_timeout":
+                            raise GenerationError("The queue wait expired. Send your question again." if language == "en"
+                                                  else "Час очікування в черзі вичерпано. Надішліть запитання ще раз.")
+                        if event["error"] == "Gemini quota temporarily unavailable":
+                            raise GenerationError("Gemini is at its free quota. Try again later." if language == "en"
+                                                  else "Квоту Gemini вичерпано. Спробуйте пізніше.")
                         raise GenerationError(event["error"])
         except httpx.ReadTimeout:
             raise GenerationError("EXAM AI Cloud затримав відповідь. Спробуйте ще раз.") from None
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            english = body.get("language") == "en"
+            if status == 409:
+                detail = exc.response.read()
+                if b"other client" in detail:
+                    raise GenerationError("Stop the active session on your other device." if english else
+                                          "Зупиніть активний сеанс на іншому пристрої.") from None
+                raise GenerationError("Your request is already queued or running." if english else
+                                      "Ваш запит уже в черзі або обробляється.") from None
+            if status == 429 and server_queue:
+                detail = exc.response.read()
+                if b"queue is full" in detail:
+                    raise GenerationError("The queue is full. Try again shortly." if english else
+                                          "Черга заповнена. Спробуйте за кілька секунд.") from None
+                if b"Too many submissions" in detail:
+                    raise GenerationError("Wait a moment before sending a new request." if english else
+                                          "Зачекайте кілька секунд перед новим запитом.") from None
             if status in (401, 403, 429):
                 message = {401: "Увійдіть в EXAM AI Cloud ще раз.",
                            403: "Доступ до EXAM AI Cloud або ліміт використання вичерпано.",
@@ -150,5 +194,6 @@ class CloudEngine:
             def cleanup():
                 worker.join()
                 self.client.release()
-            threading.Thread(target=cleanup, daemon=True, name="examai-cloud-release").start()
+            if worker is not None:
+                threading.Thread(target=cleanup, daemon=True, name="examai-cloud-release").start()
         raise GenerationError("EXAM AI Cloud ended without a complete answer.")

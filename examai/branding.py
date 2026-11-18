@@ -1,7 +1,7 @@
 """Application identity and compatibility with answers saved before 2.3."""
 import re
 
-VERSION = "3.4.4"
+VERSION = "3.4.6"
 REPOSITORY = "https://github.com/shekaminym/examai"
 ANSWER_PREFIX = "⚡ EXAM AI — "
 _LEGACY_PREFIX = re.compile(r"^\s*(?:⚡\s*)?\[Gemini\]\s*", re.IGNORECASE)

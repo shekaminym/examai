@@ -3,6 +3,7 @@ import hashlib
 import secrets
 import sqlite3
 import time
+from threading import Lock
 from contextlib import closing, contextmanager
 
 BETA_SECONDS = 1800
@@ -45,6 +46,21 @@ CREATE TABLE IF NOT EXISTS beta_invitation (id TEXT PRIMARY KEY, code TEXT UNIQU
     sub TEXT, kind TEXT NOT NULL CHECK(kind IN ('minutes','days','unlimited')), amount INTEGER NOT NULL,
     created REAL NOT NULL, expires REAL NOT NULL, activated REAL, revoked REAL);
 CREATE INDEX IF NOT EXISTS beta_invitation_pending ON beta_invitation(email, sub);
+CREATE TABLE IF NOT EXISTS beta_group_invitation (
+    id TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL, label TEXT NOT NULL,
+    max_uses INTEGER NOT NULL CHECK (max_uses BETWEEN 1 AND 100),
+    created REAL NOT NULL, expires REAL NOT NULL, revoked REAL
+);
+CREATE TABLE IF NOT EXISTS beta_group_redemption (
+    invite_id TEXT NOT NULL, sub TEXT NOT NULL, activated REAL NOT NULL,
+    PRIMARY KEY (invite_id, sub)
+);
+CREATE TABLE IF NOT EXISTS cloud_admission (id TEXT PRIMARY KEY, admitted REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS cloud_provider_usage (
+    id TEXT PRIMARY KEY, model TEXT NOT NULL, day INTEGER NOT NULL, admitted REAL NOT NULL, input_tokens INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cloud_provider_day ON cloud_provider_usage(day,model);
+CREATE TABLE IF NOT EXISTS cloud_provider_pause (model TEXT PRIMARY KEY, until REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS google_identity (sub TEXT PRIMARY KEY, email TEXT NOT NULL, seen REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS google_identity_email ON google_identity(email);
 CREATE TABLE IF NOT EXISTS account_activity (sub TEXT PRIMARY KEY, seen REAL NOT NULL);
@@ -66,20 +82,34 @@ class Denied(ValueError):
     pass
 
 
+class StoreBusy(RuntimeError):
+    pass
+
+
 class Store:
     def __init__(self, path, now=time.time):
         self.path = path
         self.now = now
-        with closing(sqlite3.connect(path)) as db:
-            db.execute("PRAGMA journal_mode=WAL")
+        self.write_lock = Lock()
+        with closing(sqlite3.connect(path, timeout=10)) as db:
+            # The hosted database is on a network filesystem. Do not create
+            # WAL shared-memory state that a console on another host cannot share.
+            mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            if mode != "delete":
+                raise sqlite3.OperationalError("Could not enable rollback journaling")
             db.executescript(SCHEMA)
 
     @contextmanager
     def transaction(self):
-        with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
-            db.row_factory = sqlite3.Row
-            db.execute("BEGIN IMMEDIATE")
-            yield db
+        try:
+            with self.write_lock, closing(sqlite3.connect(self.path, timeout=5)) as db, db:
+                db.row_factory = sqlite3.Row
+                db.execute("BEGIN IMMEDIATE")
+                yield db
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", 0) & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise StoreBusy("The server database is busy. Try again shortly.") from exc
+            raise
 
     def issue(self, db, sub, device, *, replace=False):
         now = self.now()
@@ -220,7 +250,11 @@ class Store:
         return row["sub"]
 
     def redeem(self, db, sub, token):
-        modern = db.execute("SELECT * FROM beta_invitation WHERE code=?", (digest(token),)).fetchone()
+        hashed = digest(token)
+        group = db.execute("SELECT * FROM beta_group_invitation WHERE code=?", (hashed,)).fetchone()
+        if group:
+            return self.redeem_group_invite(db, sub, group)
+        modern = db.execute("SELECT * FROM beta_invitation WHERE code=?", (hashed,)).fetchone()
         if modern:
             return self.redeem_email_invite(db, sub, modern)
         row = db.execute(
@@ -251,6 +285,26 @@ class Store:
             until = now + invite["amount"] * 86400 if invite["kind"] == "days" else None
             db.execute("UPDATE account SET invited=1,state='ACTIVE',until=? WHERE sub=?", (until, sub))
         self.audit(db, sub, sub, "Activated beta invitation")
+
+    def redeem_group_invite(self, db, sub, invite):
+        now = self.now()
+        invite_id = invite["id"]
+        account = db.execute("SELECT invited,state FROM account WHERE sub=?", (sub,)).fetchone()
+        verified = db.execute("SELECT 1 FROM google_identity WHERE sub=?", (sub,)).fetchone()
+        if not verified or account["invited"] or account["state"] in {"ACTIVE", "SUSPENDED"}:
+            raise Denied("Invite unavailable")
+        if invite["revoked"] is not None or invite["expires"] <= now:
+            raise Denied("Invite unavailable")
+        uses = db.execute("SELECT count(*) FROM beta_group_redemption WHERE invite_id=?",
+                          (invite_id,)).fetchone()[0]
+        if uses >= invite["max_uses"] or not db.execute(
+            "INSERT INTO beta_group_redemption VALUES(?,?,?) ON CONFLICT(invite_id,sub) DO NOTHING",
+            (invite_id, sub, now),
+        ).rowcount:
+            raise Denied("Invite unavailable")
+        db.execute("UPDATE account SET invited=1,state='BETA',until=NULL,remaining=remaining+? WHERE sub=?",
+                   (BETA_SECONDS, sub))
+        self.audit(db, sub, sub, "Activated group beta invitation")
 
     def access(self, db, sub, *, token=None, lease_action=None, units=0):
         now = self.now()
