@@ -28,6 +28,16 @@ class PartialGenerationError(GenerationError):
     pass
 
 
+class ProviderRateLimit(GenerationError):
+    def __init__(self, retry_after):
+        super().__init__("Gemini rate limited")
+        self.retry_after = retry_after
+
+
+class ProviderUnavailable(GenerationError):
+    pass
+
+
 def collect_text(chunks, on_text, prefix="", *, request_id="-"):
     parts = []
     try:
@@ -120,6 +130,7 @@ class LLMEngine:
         self._model_blocked_code = {}
         self._basic_models = set()
         self.usage_callback = None
+        self.strict_model = False
 
     def close(self):
         self.clients.close()
@@ -231,7 +242,8 @@ class LLMEngine:
             primary = self.gemini_model.removeprefix("models/")
             alternate = ("gemini-3.1-flash-lite" if primary != "gemini-3.1-flash-lite"
                          else "gemini-3.5-flash-lite")
-            candidates = [name for name in dict.fromkeys((primary, alternate))
+            configured = (primary,) if self.strict_model else (primary, alternate)
+            candidates = [name for name in dict.fromkeys(configured)
                           if self._model_blocked_until.get(name, 0) <= perf_counter()]
             if not candidates:
                 codes = {self._model_blocked_code.get(name) for name in (primary, alternate)}
@@ -249,7 +261,7 @@ class LLMEngine:
                             request_id=request_id,
                         )
                     except errors.APIError as exc:
-                        if (basic or retried_basic or exc.code != 400
+                        if (self.strict_model or basic or retried_basic or exc.code != 400
                                 or bad_request_hint(exc) != BAD_PARAMETERS):
                             raise
                         retried_basic = True
@@ -280,6 +292,13 @@ class LLMEngine:
         except GenerationError:
             raise
         except errors.APIError as exc:
+            if self.strict_model and exc.code == 429:
+                response = getattr(exc, "response", None)
+                retry_after = response.headers.get("Retry-After", "") if response is not None else ""
+                raise ProviderRateLimit(max(5, int(retry_after)) if retry_after.isascii() and retry_after.isdigit()
+                                        else 60) from None
+            if self.strict_model and exc.code == 503:
+                raise ProviderUnavailable("Gemini temporarily unavailable") from None
             hint_400 = bad_request_hint(exc) if exc.code == 400 else None
             if exc.code == 400:
                 timing.info("request_id=%s llm_http=400 basic_attempted=%s", request_id, retried_basic)

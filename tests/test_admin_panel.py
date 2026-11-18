@@ -1,5 +1,9 @@
 """Exercise the administration workflow through the actual API and SQLite."""
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from io import BytesIO
+import sqlite3
+from threading import Barrier
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -57,6 +61,123 @@ def new_invite(client, owner, email, kind="minutes", amount=30):
 def change(client, actor, email, action, amount=0):
     return client.post("/admin/v2/licenses", headers=actor, json=dict(
         email=email, action=action, amount=amount, operation_id=str(uuid4())))
+
+
+def test_group_invitation_atomic_capacity_duplicate_and_individual_balance(beta):
+    client, store, owner, outsider, _ = beta
+    route = "/admin/v2/group-invitations"
+    body = dict(label="Тестова група", max_uses=3, validity=7, operation_id=str(uuid4()))
+    assert client.post(route, headers=outsider, json=body).status_code == 403
+    created = client.post(route, headers=owner, json=body).json()
+    assert client.post(route, headers=owner, json=body).json() == created
+    item = route + "/" + created["id"]
+    code = created["code"]
+    assert client.get(item + "/code", headers=owner).json() == {"code": code}
+    assert client.get(item, headers=outsider).status_code == 403
+    assert client.get(item + "/code", headers=outsider).status_code == 403
+    assert client.delete(item, headers=outsider).status_code == 403
+    views = client.post("/admin/v2/overview", headers=owner, json={}).json()
+    assert views["group_invitations"][0]["uses"] == 0
+    assert code not in str(views)
+
+    users = [sign_in(beta, f"group-{i}", f"group{i}@gmail.com") for i in range(4)]
+    unverified = sign_in(beta, "unverified-group", "unverified-group@gmail.com", verified=False)
+
+    def redeem(account):
+        return client.post("/invite", headers=account, json={"code": code})
+
+    assert redeem(unverified).status_code == 409
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(redeem, [users[0], users[0], users[1], users[2], users[3]]))
+    assert sorted(result.status_code for result in results) == [200, 200, 200, 409, 409]
+    assert all(result.json()["seconds"] == 1800 for result in results if result.is_success)
+    balances = [client.get("/account", headers=account).json()["seconds"] for account in users]
+    assert sorted(balances) == [0, 1800, 1800, 1800]
+    assert all(redeem(account).status_code == 409 for account in users)
+    details = client.get(item, headers=owner).json()
+    assert details["uses"] == 3 and details["status"] == "Exhausted"
+    assert len({entry["email"] for entry in details["activations"]}) == 3
+    assert client.get(item + "/code", headers=owner).status_code == 409
+    assert client.delete(item, headers=owner).is_success
+    assert client.get(item, headers=owner).json()["status"] == "Revoked"
+    assert [client.get("/account", headers=account).json()["seconds"] for account in users] == balances
+
+
+def test_group_invite_expiry_and_existing_invites(beta):
+    client, store, owner, _, _ = beta
+    route = "/admin/v2/group-invitations"
+    body = dict(label="Інша тестова група", max_uses=3, validity=1, operation_id=str(uuid4()))
+    first = client.post(route, headers=owner, json=body).json()
+    expired = client.post(route, headers=owner, json={**body, "operation_id": str(uuid4())}).json()
+    aid = sign_in(beta, "prior", "prior@gmail.com")
+    bid = sign_in(beta, "new", "new@gmail.com")
+    former = new_invite(client, owner, "prior@gmail.com")
+    def redeem(account, invite):
+        return client.post("/invite", headers=account, json={"code": invite["code"]})
+    assert redeem(aid, former).json()["seconds"] == 1800
+    assert redeem(aid, first).status_code == 409
+    assert redeem(bid, first).json()["seconds"] == 1800
+    second = new_invite(client, owner, "new@gmail.com")
+    assert redeem(bid, second).status_code == 409
+    with store.transaction() as tx:
+        tx.execute("UPDATE beta_group_invitation SET expires=? WHERE id=?", (store.now(), expired["id"]))
+    cid = sign_in(beta, "fresh", "fresh@gmail.com")
+    assert redeem(cid, expired).status_code == 409
+    assert client.get(route + "/" + expired["id"], headers=owner).json()["status"] == "Expired"
+
+
+def test_launch_wave_on_migrated_database_and_restore(beta, tmp_path):
+    client, store, owner, _, _ = beta
+    route = "/admin/v2/group-invitations"
+    with closing(sqlite3.connect(store.path)) as tx:
+        assert tx.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    client = TestClient(create_app(store.path))
+    with closing(sqlite3.connect(store.path)) as tx:
+        assert tx.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    payload = dict(label="QA wave", max_uses=25, validity=2, operation_id=str(uuid4()))
+    invite = client.post(route, headers=owner, json=payload).json()
+    with store.transaction() as tx:
+        tokens = []
+        for i in range(26):
+            sub = f"wave-{i}"
+            tokens.append(auth(store.issue(tx, sub, "device")))
+            tx.execute("INSERT INTO google_identity VALUES(?,?,?)", (sub, f"{sub}@example.test", store.now()))
+        payer = auth(store.issue(tx, "metering", "device"))
+        tx.execute("UPDATE account SET state='BETA',remaining=1800 WHERE sub='metering'")
+        tx.execute("INSERT INTO lease VALUES(?,?,?,?)",
+                   ("metering", digest(payer["Authorization"][7:]), store.now() - 3, store.now() + 10))
+        tx.execute("INSERT INTO report(sub,kind,description,created) VALUES(?,?,?,?)",
+                   ("metering", "Bug", "restore fixture", store.now()))
+    gate = Barrier(29)
+
+    def redeem(headers):
+        gate.wait()
+        response = client.post("/invite", headers=headers, json={"code": invite["code"]})
+        return response.status_code
+
+    def meter():
+        gate.wait()
+        return client.post("/activity/stop", headers=payer).json()["seconds"]
+
+    with ThreadPoolExecutor(max_workers=29) as pool:
+        futures = [pool.submit(redeem, entry) for entry in [*tokens, tokens[0], tokens[1]]]
+        debit = pool.submit(meter)
+        results = [entry.result(timeout=20) for entry in futures]
+        assert 0 < debit.result(timeout=20) < 1800
+    assert sorted(results) == [200] * 25 + [409] * 3
+    item = route + "/" + invite["id"]
+    assert client.delete(item, headers=owner).status_code == 200
+    backup = tmp_path / "restored.sqlite"
+    with closing(sqlite3.connect(store.path)) as source, closing(sqlite3.connect(backup)) as target:
+        source.backup(target)
+        assert target.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    restarted = TestClient(create_app(backup))
+    details = restarted.get(item, headers=owner).json()
+    assert details["uses"] == 25 and details["status"] == "Revoked"
+    checks = [restarted.get("/account", headers=user).json()["seconds"] for user in tokens]
+    assert sorted(checks) == [0] + [1800] * 25
+    assert restarted.get("/reports", headers=payer).json()[0]["kind"] == "Bug"
+    assert restarted.post("/invite", headers=tokens[0], json={"code": invite["code"]}).status_code == 409
 
 
 def test_invite_and_pending_admin_are_pinned_to_verified_google_subject(beta):

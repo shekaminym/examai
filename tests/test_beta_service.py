@@ -240,3 +240,142 @@ def test_cloud_budget_meters_tokens_and_stops_before_next_provider_request(tmp_p
     with store.transaction() as db:
         assert tuple(db.execute("SELECT input_tokens,output_tokens,micro_usd FROM cloud_charge").fetchone()) == (4, 4, 10)
         assert db.execute("SELECT requests FROM usage").fetchone()[0] == 1
+
+
+def test_cloud_rolling_limit_survives_restart_and_rejections_do_not_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXAMAI_CLOUD_GEMINI_KEY", "test-only")
+    monkeypatch.setenv("EXAMAI_CLOUD_MAX_PER_MINUTE", "2")
+    path = tmp_path / "rate.sqlite"
+    store = Store(path)
+    accounts = []
+    with store.transaction() as tx:
+        for sub in ("one", "two", "three"):
+            accounts.append(bearer(store.issue(tx, sub, "device")))
+            tx.execute("UPDATE account SET state='ACTIVE' WHERE sub=?", (sub,))
+
+    class Engine:
+        def __init__(self, key):
+            pass
+
+        def close(self):
+            pass
+
+        def generate_answer(self, question, context, on_text, *, language):
+            return "Done"
+
+    monkeypatch.setattr("server.api.LLMEngine", Engine)
+    client = TestClient(create_app(path))
+    body = {"question": "test"}
+    for headers in accounts[:2]:
+        assert client.post("/activity/start", headers=headers).json()["granted"]
+        assert client.post("/answer", headers=headers, json=body).is_success
+    restarted = TestClient(create_app(path))
+    assert restarted.post("/activity/start", headers=accounts[2]).json()["granted"]
+    denied = restarted.post("/answer", headers=accounts[2], json=body)
+    assert denied.status_code == 429
+    assert int(denied.headers["Retry-After"]) > 0
+    with store.transaction() as tx:
+        assert tx.execute("SELECT count(*) FROM usage WHERE sub='three'").fetchone()[0] == 0
+        tx.execute("UPDATE cloud_admission SET admitted=admitted-61")
+    assert restarted.post("/answer", headers=accounts[2], json=body).is_success
+
+
+@pytest.mark.parametrize("failure", [429, 503])
+def test_queued_answer_retries_another_model_without_a_second_charge(tmp_path, monkeypatch, failure):
+    from examai.ai.llm_engine import ProviderRateLimit, ProviderUnavailable
+    from server.cloud_queue import MODELS
+
+    monkeypatch.setenv("EXAMAI_CLOUD_GEMINI_KEY", "queue-fixture")
+    monkeypatch.setenv("EXAMAI_CLOUD_DAILY_BUDGET_MICROUSD", "1000000")
+    monkeypatch.setenv("EXAMAI_CLOUD_RESERVE_MICROUSD", "350000")
+    monkeypatch.setenv("EXAMAI_CLOUD_INPUT_USD_PER_MILLION", "0.30")
+    monkeypatch.setenv("EXAMAI_CLOUD_OUTPUT_USD_PER_MILLION", "2.50")
+    path = tmp_path / "queue.sqlite"
+    store = Store(path)
+    with store.transaction() as tx:
+        headers = bearer(store.issue(tx, "beta-user", "device"))
+        tx.execute("UPDATE account SET state='BETA',remaining=1800 WHERE sub='beta-user'")
+    calls = []
+
+    class Engine:
+        def __init__(self, _key):
+            pass
+
+        def close(self):
+            pass
+
+        def generate_answer(self, question, context, on_text, **kwargs):
+            calls.append(self.gemini_model)
+            if len(calls) == 1:
+                if failure == 429:
+                    raise ProviderRateLimit(60)
+                raise ProviderUnavailable("provider busy")
+            self.usage_callback(300, 12)
+            on_text("Done")
+            return "Done"
+
+    monkeypatch.setattr("server.api.LLMEngine", Engine)
+    client = TestClient(create_app(path))
+    assert client.get("/cloud/capabilities").json()["answer_queue"] is True
+    reply = client.post("/answer", headers=headers, json={"question": "test", "queue": True})
+    events = [json.loads(line) for line in reply.text.splitlines()]
+    assert events[-1] == {"final": "Done"}
+    assert sum("started" in event for event in events) == 2
+    assert calls == list(MODELS)
+    with store.transaction() as tx:
+        assert tx.execute("SELECT requests FROM usage").fetchone()[0] == 1
+        assert tx.execute("SELECT count(*),sum(micro_usd) FROM cloud_charge").fetchone()[:] == (1, 120)
+        assert tx.execute("SELECT model FROM cloud_provider_pause").fetchone()[0] == MODELS[0]
+        assert tx.execute("SELECT count(*) FROM lease").fetchone()[0] == 0
+        remaining = tx.execute("SELECT remaining FROM account").fetchone()[0]
+        assert 1799 < remaining < 1800
+
+
+def test_model_budgets_rpm_tpm_rpd_and_pacific_reset(tmp_path, monkeypatch):
+    from datetime import datetime
+    from server import cloud_queue as caps
+
+    store = Store(tmp_path / "quotas.sqlite")
+    now = datetime(2026, 11, 18, 23, 59, 58, tzinfo=caps.PACIFIC).timestamp()
+    monkeypatch.setattr(caps, "PROVIDER_RPM", 2)
+    monkeypatch.setattr(caps, "PROVIDER_TPM", 100)
+    monkeypatch.setattr(caps, "PROVIDER_RPD", 3)
+    first, second = caps.MODELS
+    with store.transaction() as tx:
+        caps.reserve(tx, "a", first, now - 2, 80)
+        assert caps.candidate(tx, now, 30)[0] == second  # first would exceed TPM
+        caps.reserve(tx, "b", second, now - 2, 10)
+        caps.reserve(tx, "c", second, now - 1, 10)
+        assert caps.candidate(tx, now, 30)[0] is None  # second would exceed RPM
+        caps.reserve(tx, "d", first, now - 180, 1)
+        caps.reserve(tx, "e", first, now - 180, 1)
+        assert caps.candidate(tx, now, 1, (second,))[0] is None  # first exceeded RPD
+        assert caps.candidate(tx, now + 3, 1, (second,))[0] == first
+
+
+def test_windows_cloud_transport_shows_queue_events_without_starting_legacy_lease(monkeypatch):
+    import httpx
+    from examai.beta import BetaClient, CloudEngine
+
+    calls = []
+    events = [{"queued": 3}, {"queued": 1}, {"started": True}, {"text": "Four"}, {"final": "Four"}]
+
+    def response(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/cloud/capabilities":
+            return httpx.Response(200, json={"answer_queue": True})
+        assert request.url.path == "/answer"
+        assert json.loads(request.content)["queue"] is True
+        return httpx.Response(200, text="\n".join(map(json.dumps, events)))
+
+    with httpx.Client(transport=httpx.MockTransport(response)) as transport:
+        monkeypatch.setattr("examai.beta.httpx.request", transport.request)
+        monkeypatch.setattr("examai.beta.httpx.stream", transport.stream)
+        client = BetaClient("https://beta.example.test", "token")
+        statuses = []
+        text = []
+        answer = CloudEngine(client).generate_answer("Two plus two?", "", on_status=statuses.append, on_text=text.append)
+        assert answer == "Four"
+        assert text == ["Four"] and statuses == [3, 1, None]
+        assert calls == [("GET", "/cloud/capabilities"), ("POST", "/answer")]
+        assert client.users == 0

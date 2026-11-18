@@ -4,3 +4,4 @@ httpx
 google-auth[requests]
 google-genai==2.33.0
 Pillow
+tzdata

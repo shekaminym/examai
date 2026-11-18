@@ -1,4 +1,5 @@
 """EXAM AI beta service. Run behind HTTPS with one persistent SQLite volume."""
+import asyncio
 import base64
 import hashlib
 import json
@@ -8,6 +9,8 @@ import secrets
 from unicodedata import category
 from functools import partial
 from pathlib import Path
+from queue import Empty, SimpleQueue
+from time import monotonic, perf_counter
 from urllib.parse import urlencode, urlsplit
 from threading import Event, Lock, Thread
 from uuid import UUID
@@ -24,13 +27,14 @@ from google.auth.transport.requests import Request
 from google.oauth2.id_token import verify_oauth2_token
 from pydantic import BaseModel, Field
 
-from examai.ai.llm_engine import GenerationError, LLMEngine
+from examai.ai.llm_engine import GenerationError, LLMEngine, ProviderRateLimit, ProviderUnavailable
 from examai.report_images import normalize_report_image
 from server.store import ADMIN_SESSION_SECONDS
 from server.admin import STATUSES, change_license, guard_target, mount_admin, record_operation
 from server.cloud_budget import CloudBudget
+from server import cloud_queue
 from server.payments import mount as mount_payments
-from server.store import Denied, Store, digest
+from server.store import Denied, Store, StoreBusy, digest
 
 
 PLANS = tuple(dict(id=str(months), months=months, price_uah=price)
@@ -71,6 +75,7 @@ class Question(BaseModel):
     context: str = Field(default="", max_length=3500)
     image: str = Field(default="", max_length=3_500_000)
     language: Literal["uk", "en"] = "uk"
+    queue: bool = False
     mime: str = Field(default="image/png", pattern="^image/(png|jpeg)$")
 
 
@@ -95,8 +100,18 @@ def create_app(path=None):
     budget = (CloudBudget() if os.getenv("EXAMAI_CLOUD_DAILY_BUDGET_MICROUSD")
               or (urlsplit(base).scheme == "https" and os.getenv("EXAMAI_CLOUD_GEMINI_KEY")) else None)
     redirect = base + "/oauth/callback"
-    inflight = set()
+    inflight = {}
+    waiting = {}
+    recent_submissions = {}
     inflight_lock = Lock()
+    cloud_parallel = min(2, int(os.getenv("EXAMAI_CLOUD_MAX_PARALLEL", "2")))
+    cloud_per_minute = int(os.getenv("EXAMAI_CLOUD_MAX_PER_MINUTE", "24"))
+    if not (cloud_parallel > 0 and cloud_per_minute > 0):
+        raise ValueError("Cloud concurrency and rate limits must be positive")
+
+    @app.get("/cloud/capabilities")
+    def cloud_capabilities():
+        return {"answer_queue": True}
 
     def bearer(authorization: str = Header(default="")):
         if not authorization.startswith("Bearer ") or not 32 <= len(authorization[7:]) <= 128:
@@ -140,6 +155,10 @@ def create_app(path=None):
         return sub
 
     mount_admin(app, db, admin_credentials, admin_subject)
+
+    @app.exception_handler(StoreBusy)
+    async def database_busy(_request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Retry-After": "2"})
 
     @app.exception_handler(RequestValidationError)
     async def explain_invite_validation(request, exc):
@@ -337,8 +356,12 @@ def create_app(path=None):
     def activity(action: str, token=Depends(bearer)):
         if action not in {"start", "stop"}:
             raise HTTPException(404)
-        with db.transaction() as tx:
-            return db.access(tx, subject(tx, token), token=digest(token), lease_action=action)
+        with inflight_lock, db.transaction() as tx:
+            sub = subject(tx, token)
+            if action == "start" and inflight.get(sub):
+                raise HTTPException(409, "Cloud generation is already metered by the server")
+            return db.access(tx, sub, token=digest(token), lease_action=action)
+
 
     checkout_enabled = mount_payments(app, db, bearer, subject, PLANS, base,
                                       os.getenv("EXAMAI_LIQPAY_SANDBOX_PUBLIC", ""),
@@ -486,74 +509,227 @@ def create_app(path=None):
             picture = base64.b64decode(body.image, validate=True) if body.image else None
         except ValueError:
             raise HTTPException(422, "Invalid image") from None
+
         request_id = secrets.token_hex(12)
-        with inflight_lock:
-            with db.transaction() as tx:
-                sub = subject(tx, token)
-                if sub in inflight:
-                    raise HTTPException(409, "A cloud request is already running")
-                active = tx.execute("SELECT until FROM lease WHERE sub=? AND token=?",
-                                    (sub, digest(token))).fetchone()
-                if not active or active[0] <= db.now():
-                    raise HTTPException(403, "Start an active beta session first")
+        request_bytes = len(picture or b"") + len(body.question.encode()) + len(body.context.encode())
+        # Bytes conservatively bound text tokens. Reserve additional capacity for
+        # system instructions and one image, then settle against provider usage.
+        estimate = len(body.question.encode()) + len(body.context.encode()) + 4096 + (4096 if picture else 0)
+        cancelled = Event()
+        deadline = monotonic() + cloud_queue.MAX_WAIT_SECONDS
+        ticket = (request_id, request_bytes)
+        used_models = set()
+        charged_units = False
+
+        def eligible(tx, sub):
+            now = db.now()
+            lease = tx.execute("SELECT token,until FROM lease WHERE sub=?", (sub,)).fetchone()
+            active = lease is not None and lease["until"] > now
+            if body.queue and active:
+                raise HTTPException(409, "Stop the active session on the other client first")
+            if not body.queue and not (active and lease["token"] == digest(token)):
+                raise HTTPException(403, "Start an active beta session first")
+            status = db.access(tx, sub, token=digest(token))
+            if not status["granted"]:
+                raise HTTPException(403, "Access or daily request limit reached")
+
+        def admit(tx, sub):
+            nonlocal charged_units
+            now = db.now()
+            pending = next(iter(waiting), None)
+            if len(inflight) >= cloud_parallel or (pending is not None and (not body.queue or pending != sub)):
+                return None, 1
+            window = now - 60
+            aggregate = tx.execute("SELECT count(*) FROM cloud_admission WHERE admitted>?", (window,)).fetchone()[0]
+            if aggregate >= cloud_per_minute:
+                return None, 1
+            model, wait = cloud_queue.candidate(tx, now, estimate, used_models)
+            if not model:
+                return None, wait
+            eligible(tx, sub)
+            attempt = request_id + "-" + str(len(used_models))
+            if budget:
+                reservation = max(1, budget.estimate(estimate, 600)) if body.queue else None
+                if not budget.reserve(tx, attempt, int(now // 86400), amount=reservation):
+                    if body.queue and inflight:
+                        return None, 1
+                    raise HTTPException(429, "Cloud daily budget reached")
+            if not charged_units:
                 status = db.access(tx, sub, token=digest(token), units=2 if picture else 1)
                 if not status["granted"]:
                     raise HTTPException(403, "Access or daily request limit reached")
-                if budget and not budget.reserve(tx, request_id, int(db.now() // 86400)):
-                    raise HTTPException(429, "Cloud daily budget reached")
-            inflight.add(sub)
-        from queue import Queue
+            cloud_queue.reserve(tx, attempt, model, now, estimate)
+            tx.execute("DELETE FROM cloud_admission WHERE admitted<=?", (window,))
+            tx.execute("INSERT INTO cloud_admission VALUES(?,?)", (attempt, now))
+            account = tx.execute("SELECT state,remaining FROM account WHERE sub=?", (sub,)).fetchone()
+            duration = min(45, account["remaining"]) if account["state"] in {"BETA", "TRIAL"} else 45
+            return (model, attempt, duration), 0
 
-        queue = Queue()
-        cancelled = Event()
-        def generate():
+        with inflight_lock:
+            with db.transaction() as tx:
+                sub = subject(tx, token)
+                if sub in waiting or sub in inflight:
+                    raise HTTPException(409, "A cloud request is already queued or running")
+                eligible(tx, sub)
+                if body.queue:
+                    now = monotonic()
+                    stale = [identity for identity, timestamp in recent_submissions.items() if timestamp <= now - 2]
+                    for identity in stale:
+                        recent_submissions.pop(identity)
+                    if sub in recent_submissions:
+                        raise HTTPException(429, "Too many submissions", headers={"Retry-After": "2"})
+                    if (len(waiting) >= cloud_queue.MAX_WAITING
+                            or sum(size for _, size in waiting.values()) + request_bytes > cloud_queue.MAX_WAITING_BYTES):
+                        raise HTTPException(429, "Cloud queue is full", headers={"Retry-After": "10"})
+                    first_admission = None
+                else:
+                    first_admission, _ = admit(tx, sub)
+                    if first_admission is None:
+                        raise HTTPException(429, "Cloud is busy", headers={"Retry-After": "5"})
+            if body.queue:
+                waiting[sub] = ticket
+                recent_submissions[sub] = now
+            else:
+                inflight[sub] = False
+
+        def queued_admission():
+            with inflight_lock:
+                position = list(waiting).index(sub) + 1
+                if position != 1 or len(inflight) >= cloud_parallel:
+                    return None, position, 1
+                with db.transaction() as tx:
+                    subject(tx, token)
+                    admission, delay = admit(tx, sub)
+                if admission is not None:
+                    waiting.pop(sub, None)
+                    inflight[sub] = True
+                position = list(waiting).index(sub) + 1 if sub in waiting else 0
+                return admission, position, delay
+
+        def generate(model, attempt, duration, events):
             usage = []
             complete = False
+            streamed = False
+            retryable = False
+            retry_after = 0
+            started = perf_counter()
             try:
                 engine = LLMEngine(api_key)
-                if budget:
-                    engine.usage_callback = lambda prompt, output: usage.append((prompt, output))
+                engine.gemini_model = model
+                engine.strict_model = True
+                engine.usage_callback = lambda prompt, output: usage.append((prompt, output))
                 try:
                     def progress(text):
+                        nonlocal streamed
+                        streamed = True
                         if cancelled.is_set():
                             raise GenerationError("Cloud request cancelled")
-                        queue.put({"text": text})
+                        events.put({"text": text})
 
+                    limits = {"deadline": started + duration} if body.queue else {}
                     if picture:
                         final = engine.generate_image_answer(
                             picture, body.mime, on_text=progress, user_instruction=body.question,
-                            context=body.context, cancelled=cancelled.is_set, language=body.language)
+                            context=body.context, cancelled=cancelled.is_set, language=body.language, **limits)
                     else:
-                        final = engine.generate_answer(body.question, body.context, on_text=progress, language=body.language)
+                        final = engine.generate_answer(body.question, body.context, on_text=progress,
+                                                       language=body.language, **limits)
                 finally:
                     engine.close()
                 terminal = {"final": final}
                 complete = True
+            except ProviderRateLimit as exc:
+                retry_after = exc.retry_after
+                retryable = not streamed
+                terminal = {"error": "Gemini quota temporarily unavailable"}
+            except ProviderUnavailable:
+                retry_after = 5
+                retryable = not streamed
+                terminal = {"error": "Gemini temporarily unavailable"}
             except GenerationError as exc:
                 terminal = {"error": str(exc)}
             except Exception as exc:
                 log.warning("Cloud generation failed: %s", type(exc).__name__)
                 terminal = {"error": "Cloud request failed"}
             finally:
-                if budget:
+                elapsed = perf_counter() - started
+                retry = body.queue and retryable and len(used_models) < len(cloud_queue.MODELS) and not cancelled.is_set()
+                with inflight_lock:
                     try:
                         with db.transaction() as tx:
-                            budget.settle(tx, request_id, sum(x for x, _ in usage),
-                                          sum(y for _, y in usage), complete, bool(usage))
+                            cloud_queue.settle(tx, attempt, model, db.now(), sum(x for x, _ in usage), retry_after)
+                            if budget:
+                                if retryable and not usage:
+                                    tx.execute("DELETE FROM cloud_charge WHERE id=?", (attempt,))
+                                else:
+                                    budget.settle(tx, attempt, sum(x for x, _ in usage),
+                                                  sum(y for _, y in usage), complete, bool(usage))
+                            if body.queue and (complete or streamed):
+                                tx.execute("""UPDATE account SET remaining=max(0,remaining-?)
+                                    WHERE sub=? AND state IN ('BETA','TRIAL')""", (min(duration, elapsed), sub))
                     except Exception as exc:
                         log.error("Cloud usage settlement failed: %s", type(exc).__name__)
-                with inflight_lock:
-                    inflight.discard(sub)
-            queue.put(terminal)
-            queue.put(None)
+                        retry = False
+                    inflight.pop(sub, None)
+                    if retry:
+                        waiting[sub] = ticket
+                events.put({"retry": True} if retry else terminal)
 
-        def stream():
-            Thread(target=generate, daemon=True).start()
+        async def stream():
+            nonlocal charged_units
+            admission = first_admission
+
+            def line(event):
+                return json.dumps(event, ensure_ascii=False) + "\n"
+
             try:
-                while (event := queue.get()) is not None:
-                    yield json.dumps(event, ensure_ascii=False) + "\n"
+                while True:
+                    if admission is None:
+                        if monotonic() >= deadline:
+                            yield line({"error_code": "queue_timeout", "error": "Cloud queue wait expired"})
+                            break
+                        try:
+                            admission, position, delay = queued_admission()
+                        except StoreBusy:
+                            await asyncio.sleep(2)
+                            continue
+                        except HTTPException as exc:
+                            yield line({"error": str(exc.detail)})
+                            break
+                        if admission is None:
+                            if delay > deadline - monotonic() and position == 1:
+                                yield line({"error_code": "quota_wait", "error": "Gemini quota temporarily unavailable"})
+                                break
+                            yield line({"queued": position})
+                            await asyncio.sleep(min(max(delay, 0.25), 2))
+                            continue
+
+                    model, attempt, duration = admission
+                    used_models.add(model)
+                    charged_units = True
+                    events = SimpleQueue()
+                    Thread(target=generate, args=(model, attempt, duration, events), daemon=True).start()
+                    if body.queue:
+                        yield line({"started": True})
+                    while True:
+                        try:
+                            event = events.get_nowait()
+                        except Empty:
+                            await asyncio.sleep(0.05)
+                            continue
+                        if "retry" in event:
+                            admission = None
+                            break
+                        yield line(event)
+                        if "final" in event or "error" in event:
+                            return
             finally:
-                cancelled.set()
-        return StreamingResponse(stream(), media_type="application/x-ndjson")
+                with inflight_lock:
+                    cancelled.set()
+                    if waiting.get(sub) == ticket:
+                        waiting.pop(sub)
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson",
+                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
     return app

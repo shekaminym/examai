@@ -57,6 +57,9 @@ const auditLabels = {
   "Revoked administrator": "Відкликано права адміністратора",
   "Cancelled administrator invitation": "Скасовано запит на права адміністратора",
   "Activated beta invitation": "Активовано запрошення до бета-тестування",
+  "Created group beta invitation": "Створено груповий бета-код",
+  "Activated group beta invitation": "Активовано груповий бета-код",
+  "Revoked group beta invitation": "Відкликано груповий бета-код",
   "redeemed beta invite": "Активовано запрошення до бета-тестування",
   "Revoked beta invitation": "Відкликано запрошення",
   "Created minutes invitation": "Створено запрошення з доступом у хвилинах",
@@ -172,7 +175,7 @@ function signInScreen(message = "") {
   $("app").hidden = true;
   $("login").hidden = false;
   $("login-status").textContent = message;
-  for (const id of ["summary", "users", "invitations", "reports", "staff", "activity"]) {
+  for (const id of ["summary", "users", "invitations", "group-invitations", "reports", "staff", "activity"]) {
     $(id).replaceChildren();
   }
 }
@@ -331,6 +334,33 @@ function render() {
       return [invite.email, access, node("span", display(invite.status), "tag"), time(invite.expires), controls];
     }), "Запрошень ще немає.");
 
+  table("group-invitations", ["Група", "Активації", "Статус", "Код діє до", "Дії"],
+    (data.group_invitations || []).map(group => {
+      const path = "/admin/v2/group-invitations/" + group.id;
+      const controls = node("div", null, "actions");
+      controls.append(button("Переглянути активації", async () => {
+        const details = await json(path);
+        const list = node("ul");
+        for (const entry of details.activations) {
+          list.append(node("li", (entry.email || "Обліковий запис недоступний") + " · " + time(entry.activated)));
+        }
+        const summary = node("p", `${details.uses} з ${details.max_uses} активацій`);
+        dialog("Активації · " + details.label,
+          [summary, details.uses ? list : node("p", "Активацій ще немає.")], null);
+      }));
+      if (group.status === "Pending") {
+        controls.append(button("Скопіювати код", async () => showCode((await json(path + "/code")).code, false, true)));
+      }
+      if (["Pending", "Exhausted"].includes(group.status)) {
+        controls.append(button("Відкликати", () => confirm("Відкликати груповий код",
+          "Нові активації стануть недоступними. Нараховані хвилини залишаться в учасників.",
+          () => json(path, "DELETE"), "Груповий код відкликано.")));
+      }
+      return [group.label, `${group.uses} / ${group.max_uses}`,
+        node("span", group.status === "Exhausted" ? "Ліміт вичерпано" :
+          group.status === "Pending" ? "Чинний" : display(group.status), "tag"), time(group.expires), controls];
+    }), "Групових кодів ще немає.");
+
   table("staff", ["Обліковий запис Google", "Роль", "Дії"], data.staff.map(member => {
     const actions = node("div", null, "actions");
     if (data.role === "Owner" && member.role !== "Owner") {
@@ -382,7 +412,7 @@ function confirm(title, message, action, success) {
   });
 }
 
-async function showCode(code, created) {
+async function showCode(code, created, group = false) {
   const input = node("input");
   input.readOnly = true;
   input.value = code;
@@ -395,8 +425,10 @@ async function showCode(code, created) {
       input.select();
     }
   });
-  dialog(created ? "Запрошення створено" : "Код запрошення",
-    [field("Передайте цей код учаснику приватно", input), copy], null);
+  const title = group ? (created ? "Груповий код створено" : "Груповий бета-код") :
+    (created ? "Запрошення створено" : "Код запрошення");
+  const instructions = group ? "Передайте код у приватному чаті групи" : "Передайте цей код учаснику приватно";
+  dialog(title, [field(instructions, input), copy], null);
   input.select();
 }
 
@@ -518,6 +550,17 @@ form("invite-form", async ({email, kind, validity, minutes: custom}) => {
   inviteDraft = undefined;
   await refresh();
   await showCode(invite.code, true);
+});
+
+let groupInviteDraft;
+form("group-invite-form", async ({label, max_uses, validity}) => {
+  const body = {label: label.trim(), max_uses: Number(max_uses), validity: Number(validity)};
+  const payload = JSON.stringify(body);
+  if (groupInviteDraft?.payload !== payload) groupInviteDraft = {payload, id: crypto.randomUUID()};
+  const group = await json("/admin/v2/group-invitations", "POST", {...body, operation_id: groupInviteDraft.id});
+  groupInviteDraft = undefined;
+  await refresh();
+  await showCode(group.code, true, true);
 });
 
 function balanceText(user) {

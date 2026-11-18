@@ -66,6 +66,15 @@
           <button class="primary">Створити запрошення</button>
         </form>
         <div id="invitations"></div>
+        <h2>Групові бета-коди</h2>
+        <form id="group-invite-form" class="toolbar">
+          <label>Назва групи<input name="label" maxlength="80" placeholder="Наприклад, КІ-62" required></label>
+          <label>Ліміт активацій<input type="number" name="max_uses" min="1" max="100" value="3" required></label>
+          <label>Строк дії коду (дні)<input type="number" name="validity" min="1" max="30" value="7" required></label>
+          <button class="primary">Створити груповий код</button>
+        </form>
+        <p>Кожен новий учасник отримує 30 хвилин активного часу після входу через Google та активації коду.</p>
+        <div id="group-invitations"></div>
       </section>
       <section data-page="reports" hidden>
         <form id="reports-form" class="toolbar">

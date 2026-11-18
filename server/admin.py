@@ -78,6 +78,13 @@ class Invitation(Email):
         return self
 
 
+class GroupInvitation(BaseModel):
+    label: str = Field(min_length=1, max_length=80, pattern=r"\S")
+    max_uses: int = Field(ge=1, le=100)
+    validity: int = Field(default=7, ge=1, le=30)
+    operation_id: UUID
+
+
 class License(Email):
     subject: str = Field(default="", max_length=255)
     action: str = Field(pattern="^(minutes|remove|days|unlimited|suspend|restore|revoke)$")
@@ -239,14 +246,27 @@ def invitation_status(row, now):
     return "Expired" if row["expires"] <= now else "Pending"
 
 
-def invitation_code(tx, invite_id):
+def invitation_code(tx, invite_id, scope="v2"):
     row = tx.execute("SELECT secret FROM invite_signing WHERE id=1").fetchone()
     if row:
         secret = row["secret"]
     else:
         secret = secrets.token_bytes(32)
         tx.execute("INSERT INTO invite_signing VALUES(1,?)", (secret,))
-    return hmac.new(secret, ("examai invite v2 " + invite_id).encode(), hashlib.sha256).hexdigest()
+    return hmac.new(secret, f"examai invite {scope} {invite_id}".encode(), hashlib.sha256).hexdigest()
+
+
+def group_invitation_status(row, now):
+    if row["revoked"] is not None:
+        return "Revoked"
+    if row["expires"] <= now:
+        return "Expired"
+    return "Exhausted" if row["uses"] >= row["max_uses"] else "Pending"
+
+
+GROUP_INVITES_QUERY = """SELECT g.id,g.label,g.max_uses,g.created,g.expires,g.revoked,
+    (SELECT count(*) FROM beta_group_redemption WHERE invite_id=g.id) AS uses
+    FROM beta_group_invitation AS g"""
 
 
 def mount_admin(app, store, bearer, admin_subject):
@@ -392,7 +412,10 @@ def mount_admin(app, store, bearer, admin_subject):
                           (SELECT coalesce(sum(requests),0) FROM usage WHERE day=?) AS requests,
                           (SELECT count(*) FROM report WHERE status NOT IN ('Fixed','Closed')) AS reports""",
                 (now, day)).fetchone())
+            groups = [dict(row, status=group_invitation_status(row, now)) for row in tx.execute(
+                GROUP_INVITES_QUERY + " ORDER BY created DESC, id LIMIT 100")]
             return dict(role=store.role(tx, actor), summary=summary, users=users, invitations=invites,
+                        group_invitations=groups,
                         staff=staff, reports=reports, audit=audit,
                         user_pagination=dict(page=page, pages=pages, total=count))
 
@@ -590,6 +613,58 @@ def mount_admin(app, store, bearer, admin_subject):
             guard_target(store, tx, actor, row["sub"])
             tx.execute("UPDATE beta_invitation SET revoked=? WHERE id=?", (store.now(), str(invite_id)))
             store.audit(tx, actor, row["sub"] or row["email"], "Revoked beta invitation")
+            return {"ok": True}
+
+    @app.post("/admin/v2/group-invitations")
+    def make_group_invitation(body: GroupInvitation, token=Depends(bearer)):
+        with store.transaction() as tx:
+            actor = admin_subject(tx, token)
+            invite_id = str(body.operation_id)
+            code = invitation_code(tx, invite_id, scope="group")
+            if record_operation(tx, actor, body.operation_id, "group invite:" + body.model_dump_json()):
+                now = store.now()
+                tx.execute("INSERT INTO beta_group_invitation VALUES(?,?,?,?,?,?,NULL)",
+                           (invite_id, digest(code), body.label.strip(), body.max_uses, now,
+                            now + body.validity * 86400))
+                store.audit(tx, actor, body.label.strip(), "Created group beta invitation")
+            return {"id": invite_id, "code": code}
+
+    @app.get("/admin/v2/group-invitations/{invite_id}")
+    def group_invitation_uses(invite_id: UUID, token=Depends(bearer)):
+        with store.transaction() as tx:
+            admin_subject(tx, token)
+            row = tx.execute(GROUP_INVITES_QUERY + " WHERE g.id=?", (str(invite_id),)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Групове запрошення не знайдено.")
+            activations = [dict(entry) for entry in tx.execute("""SELECT i.email,r.activated
+                FROM beta_group_redemption AS r LEFT JOIN google_identity AS i USING(sub)
+                WHERE r.invite_id=? ORDER BY r.activated DESC, r.sub""", (str(invite_id),))]
+            return dict(row, status=group_invitation_status(row, store.now()), activations=activations)
+
+    @app.get("/admin/v2/group-invitations/{invite_id}/code")
+    def copy_group_invitation(invite_id: UUID, token=Depends(bearer)):
+        with store.transaction() as tx:
+            admin_subject(tx, token)
+            row = tx.execute(GROUP_INVITES_QUERY + " WHERE g.id=?", (str(invite_id),)).fetchone()
+            if not row or group_invitation_status(row, store.now()) != "Pending":
+                raise HTTPException(409, "Скопіювати можна лише чинний груповий код із вільними місцями.")
+            code = invitation_code(tx, str(invite_id), scope="group")
+            saved = tx.execute("SELECT code FROM beta_group_invitation WHERE id=?", (str(invite_id),)).fetchone()
+            if not hmac.compare_digest(digest(code), saved["code"]):
+                raise HTTPException(409, "Не вдалося відновити код для копіювання.")
+            return {"code": code}
+
+    @app.delete("/admin/v2/group-invitations/{invite_id}")
+    def revoke_group_invitation(invite_id: UUID, token=Depends(bearer)):
+        with store.transaction() as tx:
+            actor = admin_subject(tx, token)
+            row = tx.execute("SELECT label,expires,revoked FROM beta_group_invitation WHERE id=?",
+                             (str(invite_id),)).fetchone()
+            now = store.now()
+            if not row or row["revoked"] is not None or row["expires"] <= now:
+                raise HTTPException(409, "Відкликати можна лише чинний груповий код.")
+            tx.execute("UPDATE beta_group_invitation SET revoked=? WHERE id=?", (now, str(invite_id)))
+            store.audit(tx, actor, row["label"], "Revoked group beta invitation")
             return {"ok": True}
 
     @app.post("/admin/v2/licenses")
